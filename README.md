@@ -1,9 +1,10 @@
-# undo — filesystem history for your working directory
+# Undo 
+
+Filesystem history for your working directory
 
 **See what changed. Diff it. Restore it. No git commit required.**
 
-undo gives your project a local timeline.
-It watches your working directory, records every file change, and lets you see exactly what changed, when it changed, and restore files from minutes ago.
+undo gives your project a local timeline. It watches your working directory, records every file change, and lets you see exactly what changed, when it changed, and restore files from minutes ago.
 
 Think of it as:
 
@@ -229,4 +230,4 @@ Files larger than **5 MB** are tracked (events recorded) but not snapshotted.
 
 ## License
 
-MIT
+[FSL-1.1-MIT](LICENSE)

@@ -25,10 +25,21 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
 
     let event = match db.get_event_at_time(project.id, &abs_path_str, target_time)? {
         Some(e) => e,
-        None => {
-            println!("No snapshot found for this file at that time.");
-            return Ok(());
-        }
+        None => match db.get_oldest_event(project.id, &abs_path_str)? {
+            Some(e) => {
+                let age = Utc::now().timestamp() - e.timestamp;
+                println!(
+                    "No snapshot from {} ago — falling back to earliest available (from {}).",
+                    duration_str,
+                    duration::format_elapsed(age)
+                );
+                e
+            }
+            None => {
+                println!("No snapshots found for this file.");
+                return Ok(());
+            }
+        },
     };
 
     let hash = match &event.current_hash {

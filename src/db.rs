@@ -238,6 +238,29 @@ impl Database {
             .context("failed to query event at time")
     }
 
+    /// Find the oldest non-DELETE event for a file (the earliest known state).
+    pub fn get_oldest_event(
+        &self,
+        project_id: i64,
+        path: &str,
+    ) -> Result<Option<FileEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND path = ?2
+                   AND event_type != 'DELETED'
+                 ORDER BY timestamp ASC
+                 LIMIT 1",
+                params![project_id, path],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query oldest event")
+    }
+
     pub fn count_events(&self, project_id: i64) -> Result<i64> {
         self.conn
             .query_row(
