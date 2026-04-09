@@ -12,6 +12,7 @@ mod ignore;
 mod models;
 mod restore;
 mod snapshots;
+mod update;
 mod watcher;
 
 // ── ANSI colors ─────────────────────────────────────────────────────
@@ -82,6 +83,7 @@ fn main() {
         cli::Command::Restore { path, duration } => restore::cmd_restore(&path, &duration),
         cli::Command::Status => daemon::cmd_status(),
         cli::Command::Stop => daemon::cmd_stop(),
+        cli::Command::Update => update::cmd_update(),
     };
 
     if let Err(e) = result {

@@ -1,10 +1,8 @@
 # Undo 
 
-Filesystem history for your working directory
+**Filesystem history for your working directory. See what changed. Diff it. Restore it. No git commit required.**
 
-**See what changed. Diff it. Restore it. No git commit required.**
-
-undo gives your project a local timeline. It watches your working directory, records every file change, and lets you see exactly what changed, when it changed, and restore files from minutes ago.
+Undo gives your project a local timeline. It watches your working directory, records every file change, and lets you see exactly what changed, when it changed, and restore files from minutes ago.
 
 Think of it as:
 
@@ -221,7 +219,7 @@ undo automatically ignores noisy directories:
 - `.DS_Store`
 - `__pycache__/`
 
-Files larger than **5 MB** are tracked (events recorded) but not snapshotted.
+Files larger than **100 MB** are tracked (events recorded) but not snapshotted.
 
 ## Platform support
 

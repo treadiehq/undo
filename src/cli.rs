@@ -52,4 +52,7 @@ pub enum Command {
 
     /// Stop the daemon
     Stop,
+
+    /// Update undo to the latest release
+    Update,
 }

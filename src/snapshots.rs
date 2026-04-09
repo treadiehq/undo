@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-pub const MAX_SNAPSHOT_SIZE: usize = 5 * 1024 * 1024; // 5 MB
+pub const MAX_SNAPSHOT_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 
 fn snapshot_dir(project_id: i64) -> Result<PathBuf> {
     let dir = crate::backtrack_dir()?
