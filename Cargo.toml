@@ -1,0 +1,18 @@
+[package]
+name = "backtrack"
+version = "0.1.0"
+edition = "2021"
+description = "Filesystem history for your working directory"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+notify = "6"
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+flate2 = "1"
+chrono = { version = "0.4", features = ["clock"] }
+walkdir = "2"
+similar = "2"
+signal-hook = "0.3"
+dirs = "5"
+anyhow = "1"
