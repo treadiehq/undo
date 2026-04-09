@@ -29,7 +29,7 @@ pub const RESET: &str = "\x1b[0m";
 pub fn backtrack_dir() -> Result<std::path::PathBuf> {
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
-        .join(".backtrack");
+        .join(".undo");
     std::fs::create_dir_all(&dir)?;
     std::fs::create_dir_all(dir.join("snapshots"))?;
     Ok(dir)
@@ -38,7 +38,7 @@ pub fn backtrack_dir() -> Result<std::path::PathBuf> {
 pub fn find_project(db: &db::Database, cwd: &Path) -> Result<models::WatchedProject> {
     db.find_project_for_path(cwd)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no project is being watched for this directory.\nRun `backtrack start` first."
+            "no project is being watched for this directory.\nRun `undo start` first."
         )
     })
 }
@@ -104,7 +104,7 @@ fn cmd_timeline(limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}Backtrack{} — recent activity", BOLD, RESET);
+    println!("{}undo{} — recent activity", BOLD, RESET);
     println!();
 
     for event in &events {

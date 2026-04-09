@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "backtrack",
-    about = "Backtrack — filesystem history for your working directory",
+    name = "undo",
+    about = "undo — filesystem history for your working directory",
     long_about = "See what changed. Diff it. Restore it. No git commit required."
 )]
 pub struct Cli {

@@ -2,7 +2,7 @@
 set -e
 
 REPO="treadiehq/undo"
-BINARY="backtrack"
+BINARY="undo"
 
 # Detect platform
 OS=$(uname -s)
@@ -70,4 +70,4 @@ fi
 echo ""
 "${INSTALL_DIR}/${BINARY}" --help | head -1
 echo ""
-echo "Run 'backtrack start' in any project directory to begin."
+echo "Run 'undo start' in any project directory to begin."

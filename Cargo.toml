@@ -1,5 +1,5 @@
 [package]
-name = "backtrack"
+name = "undo"
 version = "0.1.0"
 edition = "2021"
 description = "Filesystem history for your working directory"

@@ -17,7 +17,7 @@ pub fn cmd_start(verbose: bool) -> Result<()> {
             if let Some(pid) = contents.lines().next().and_then(|s| s.parse::<u32>().ok()) {
                 if is_pid_running(pid) {
                     let project = contents.lines().nth(1).unwrap_or("unknown");
-                    println!("Backtrack is already running (PID {}).", pid);
+                    println!("undo is already running (PID {}).", pid);
                     println!("Watching: {}", project);
                     return Ok(());
                 }
@@ -38,7 +38,7 @@ pub fn cmd_start(verbose: bool) -> Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
 
-    println!("{}Backtrack{} — filesystem history", BOLD, RESET);
+    println!("{}undo{} — filesystem history", BOLD, RESET);
     println!("Watching: {}", cwd.display());
     println!("Recording changes...");
     println!();
@@ -47,7 +47,7 @@ pub fn cmd_start(verbose: bool) -> Result<()> {
     watcher::watch_directory(&db, &project, &cwd, shutdown, verbose)?;
 
     let _ = std::fs::remove_file(&pid_path);
-    eprintln!("\nBacktrack stopped.");
+    eprintln!("\nundo stopped.");
 
     Ok(())
 }
@@ -57,7 +57,7 @@ pub fn cmd_stop() -> Result<()> {
     let pid_path = bt_dir.join("pid");
 
     if !pid_path.exists() {
-        println!("No Backtrack daemon is running.");
+        println!("No undo daemon is running.");
         return Ok(());
     }
 
@@ -84,7 +84,7 @@ pub fn cmd_stop() -> Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(500));
     let _ = std::fs::remove_file(&pid_path);
 
-    println!("Backtrack daemon stopped (PID {}).", pid);
+    println!("undo daemon stopped (PID {}).", pid);
     Ok(())
 }
 
@@ -93,7 +93,7 @@ pub fn cmd_status() -> Result<()> {
     let db = Database::open()?;
     let cwd = std::env::current_dir()?.canonicalize()?;
 
-    println!("{}Backtrack{} — status", BOLD, RESET);
+    println!("{}undo{} — status", BOLD, RESET);
     println!();
 
     match db.find_project_for_path(&cwd)? {
@@ -134,7 +134,7 @@ pub fn cmd_status() -> Result<()> {
         None => {
             println!("No project being watched for this directory.");
             println!(
-                "Run {}backtrack start{} to begin watching.",
+                "Run {}undo start{} to begin watching.",
                 BOLD, RESET
             );
         }

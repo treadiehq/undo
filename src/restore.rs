@@ -49,7 +49,7 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
             .unwrap_or_else(|| "file".to_string());
         let ts = Utc::now().timestamp();
         let backup_path = PathBuf::from(format!(
-            "/tmp/backtrack-restore-{}-{}.bak",
+            "/tmp/undo-restore-{}-{}.bak",
             filename, ts
         ));
         std::fs::copy(&abs_path, &backup_path)?;

@@ -28,7 +28,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
 
     if event.event_type == "DELETED" {
         println!(
-            "File was deleted. Use {}backtrack restore{} to recover it.",
+            "File was deleted. Use {}undo restore{} to recover it.",
             BOLD, RESET
         );
         return Ok(());

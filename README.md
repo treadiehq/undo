@@ -1,8 +1,8 @@
-# Backtrack — filesystem history for your working directory
+# undo — filesystem history for your working directory
 
 **See what changed. Diff it. Restore it. No git commit required.**
 
-Backtrack gives your project a local timeline.
+undo gives your project a local timeline.
 It watches your working directory, records every file change, and lets you see exactly what changed, when it changed, and restore files from minutes ago.
 
 Think of it as:
@@ -19,7 +19,7 @@ Because you've been there:
 - You want to undo a change but haven't committed anything
 - You need a safety net while prototyping
 
-Backtrack runs quietly in the background and gives you instant answers.
+undo runs quietly in the background and gives you instant answers.
 
 ## Install
 
@@ -40,7 +40,7 @@ Prebuilt binaries for macOS (ARM + Intel) and Linux (x86_64) are available on th
 git clone https://github.com/treadiehq/undo.git
 cd undo
 cargo build --release
-cp target/release/backtrack /usr/local/bin/
+cp target/release/undo /usr/local/bin/
 ```
 
 ### Requirements
@@ -54,13 +54,13 @@ cp target/release/backtrack /usr/local/bin/
 
 ```bash
 cd your-project/
-backtrack start
+undo start
 ```
 
 Output:
 
 ```
-Backtrack — filesystem history
+undo — filesystem history
 Watching: /Users/me/my-project
 Recording changes...
 ```
@@ -68,15 +68,15 @@ Recording changes...
 The daemon runs in the foreground. Use `Ctrl+C` to stop, or run it in the background:
 
 ```bash
-backtrack start &
+undo start &
 ```
 
 ### See what changed
 
 ```bash
-backtrack what-changed 5m
-backtrack what-changed 2h
-backtrack what-changed 1d
+undo what-changed 5m
+undo what-changed 2h
+undo what-changed 1d
 ```
 
 Output:
@@ -98,14 +98,14 @@ DELETED
 ### View timeline
 
 ```bash
-backtrack timeline
-backtrack timeline --limit 50
+undo timeline
+undo timeline --limit 50
 ```
 
 Output:
 
 ```
-Backtrack — recent activity
+undo — recent activity
 
 12:31 MODIFIED src/server.rs
 12:30 CREATED logs/debug.log
@@ -116,7 +116,7 @@ Backtrack — recent activity
 ### Diff a file
 
 ```bash
-backtrack diff src/server.rs
+undo diff src/server.rs
 ```
 
 Shows a unified diff between the current file and the latest captured snapshot.
@@ -124,13 +124,13 @@ Shows a unified diff between the current file and the latest captured snapshot.
 ### Restore a file
 
 ```bash
-backtrack restore src/server.rs 10m
+undo restore src/server.rs 10m
 ```
 
 Output:
 
 ```
-Backup of current file saved to /tmp/backtrack-restore-server.rs-1713200000.bak
+Backup of current file saved to /tmp/undo-restore-server.rs-1713200000.bak
 Restored src/server.rs from snapshot captured 9 minute(s) ago.
 ```
 
@@ -139,17 +139,17 @@ A safety backup is always created before overwriting.
 ### Check status
 
 ```bash
-backtrack status
+undo status
 ```
 
 Output:
 
 ```
-Backtrack — status
+undo — status
 
 Project:   /Users/me/my-project
 Daemon:    running (PID 12345)
-Database:  /Users/me/.backtrack/database.db (24.0 KB)
+Database:  /Users/me/.undo/database.db (24.0 KB)
 Events:    142
 Snapshots: 87
 ```
@@ -157,15 +157,15 @@ Snapshots: 87
 ### Stop the daemon
 
 ```bash
-backtrack stop
+undo stop
 ```
 
 ## Demo
 
 ```
 $ cd my-project/
-$ backtrack start &
-Backtrack — filesystem history
+$ undo start &
+undo — filesystem history
 Watching: /Users/me/my-project
 Recording changes...
 
@@ -173,7 +173,7 @@ $ echo "hello" > test.txt
 $ echo "world" >> test.txt
 $ rm old-file.txt
 
-$ backtrack what-changed 1m
+$ undo what-changed 1m
 
 Changes in last 1m
 
@@ -183,23 +183,23 @@ MODIFIED
 DELETED
   - old-file.txt
 
-$ backtrack restore old-file.txt 2m
-Backup of current file saved to /tmp/backtrack-restore-old-file.txt-1713200100.bak
+$ undo restore old-file.txt 2m
+Backup of current file saved to /tmp/undo-restore-old-file.txt-1713200100.bak
 Restored old-file.txt from snapshot captured 2 minute(s) ago.
 ```
 
 ## How it works
 
-Backtrack runs a lightweight daemon that watches your project directory using OS-native file watching (FSEvents on macOS, inotify on Linux).
+undo runs a lightweight daemon that watches your project directory using OS-native file watching (FSEvents on macOS, inotify on Linux).
 
-When files change, Backtrack:
+When files change, undo:
 
 1. Hashes the file content (SHA-256)
 2. Compares against the last known hash
 3. Saves a compressed snapshot if the content changed
 4. Records the event in a local SQLite database
 
-All data is stored locally at `~/.backtrack/`:
+All data is stored locally at `~/.undo/`:
 
 | Path | Purpose |
 |------|---------|
@@ -209,7 +209,7 @@ All data is stored locally at `~/.backtrack/`:
 
 ## Ignored paths
 
-Backtrack automatically ignores noisy directories:
+undo automatically ignores noisy directories:
 
 - `.git/`
 - `node_modules/`
@@ -230,4 +230,3 @@ Files larger than **5 MB** are tracked (events recorded) but not snapshotted.
 ## License
 
 MIT
-
