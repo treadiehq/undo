@@ -112,3 +112,27 @@ fn print_unified_diff(old: &str, new: &str, path: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_binary_detects_nul_byte() {
+        assert!(is_binary(b"hello\x00world"));
+    }
+
+    #[test]
+    fn is_binary_returns_false_for_plain_text() {
+        assert!(!is_binary(b"fn main() {\n    println!(\"hello\");\n}\n"));
+    }
+
+    #[test]
+    fn is_binary_ignores_nul_beyond_8192_bytes() {
+        // A NUL at position 8192 (0-indexed) is outside the 8 KiB inspection
+        // window, so the content should be treated as text.
+        let mut data = vec![b'a'; 8193];
+        data[8192] = 0;
+        assert!(!is_binary(&data));
+    }
+}

@@ -71,4 +71,24 @@ mod tests {
     fn parse_zero_is_rejected() {
         assert!(parse_duration("0m").is_err());
     }
+
+    #[test]
+    fn format_elapsed_under_a_minute() {
+        assert_eq!(format_elapsed(45), "45 second(s) ago");
+    }
+
+    #[test]
+    fn format_elapsed_minutes() {
+        assert_eq!(format_elapsed(120), "2 minute(s) ago");
+    }
+
+    #[test]
+    fn format_elapsed_hours() {
+        assert_eq!(format_elapsed(7200), "2 hour(s) ago");
+    }
+
+    #[test]
+    fn format_elapsed_days() {
+        assert_eq!(format_elapsed(172_800), "2 day(s) ago");
+    }
 }

@@ -618,6 +618,9 @@ mod tests {
 
     #[test]
     fn initial_scan_rejects_directory_over_file_limit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
         let dir = tempfile::tempdir().unwrap();
         for i in 0..10 {
             std::fs::write(dir.path().join(format!("file_{}.txt", i)), "data").unwrap();
@@ -634,6 +637,9 @@ mod tests {
 
     #[test]
     fn initial_scan_accepts_directory_under_file_limit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
         let dir = tempfile::tempdir().unwrap();
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("file_{}.txt", i)), "data").unwrap();
@@ -648,6 +654,9 @@ mod tests {
 
     #[test]
     fn initial_scan_force_bypasses_file_limit() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
         let dir = tempfile::tempdir().unwrap();
         for i in 0..10 {
             std::fs::write(dir.path().join(format!("file_{}.txt", i)), "data").unwrap();

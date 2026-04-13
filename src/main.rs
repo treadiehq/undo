@@ -28,8 +28,40 @@ pub const RESET: &str = "\x1b[0m";
 
 // ── helpers ─────────────────────────────────────────────────────────
 
+// ── test isolation ───────────────────────────────────────────────────
+//
+// Tests that exercise code paths touching `backtrack_dir()` (snapshots,
+// retention, watcher) would otherwise write into the real ~/.undo directory.
+// Setting a thread-local override redirects all such writes to a tempdir,
+// giving each test its own isolated storage that is cleaned up on drop.
+
+#[cfg(test)]
+thread_local! {
+    static TEST_DATA_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Redirect `backtrack_dir()` to `path` for the duration of the current test.
+/// Call at the top of any test that exercises snapshot or retention I/O.
+#[cfg(test)]
+pub fn set_test_data_dir(path: std::path::PathBuf) {
+    TEST_DATA_DIR.with(|d| *d.borrow_mut() = Some(path));
+}
+
 pub fn backtrack_dir() -> Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
+
+    // In test builds, honour the per-thread override so snapshot and retention
+    // I/O lands in a tempdir rather than ~/.undo.
+    #[cfg(test)]
+    {
+        let test_dir = TEST_DATA_DIR.with(|d| d.borrow().clone());
+        if let Some(dir) = test_dir {
+            std::fs::create_dir_all(&dir)?;
+            return Ok(dir);
+        }
+    }
+
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".undo");

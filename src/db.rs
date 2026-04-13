@@ -79,6 +79,24 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Insert an event with an explicit timestamp. Test-only helper used by
+    /// retention tests that need to seed events at controlled points in time.
+    #[cfg(test)]
+    pub fn insert_event_at(
+        &self,
+        project_id: i64,
+        path: &str,
+        event_type: &str,
+        ts: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_events (project_id, timestamp, path, event_type)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, ts, path, event_type],
+        )?;
+        Ok(())
+    }
+
     // ── project operations ──────────────────────────────────────────
 
     pub fn get_or_create_project(&self, root_path: &Path) -> Result<WatchedProject> {

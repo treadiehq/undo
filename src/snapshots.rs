@@ -87,3 +87,43 @@ pub fn count(project_id: i64) -> Result<usize> {
     }
     Ok(fs::read_dir(dir)?.filter_map(|e| e.ok()).count())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let content = b"hello, snapshot world\n";
+        save(1, "roundtrip_hash", content).unwrap();
+        let loaded = load(1, "roundtrip_hash").unwrap();
+        assert_eq!(loaded, content);
+    }
+
+    #[test]
+    fn save_is_idempotent_for_same_hash() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let content = b"duplicate content to save twice";
+        save(1, "dedup_hash", content).unwrap();
+        // Second call must succeed — path.exists() guard skips the write.
+        save(1, "dedup_hash", content).unwrap();
+        let loaded = load(1, "dedup_hash").unwrap();
+        assert_eq!(loaded, content);
+    }
+
+    #[test]
+    fn load_nonexistent_hash_returns_error() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let result = load(1, "this_hash_does_not_exist_xyz");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("snapshot not found"), "got: {}", msg);
+    }
+}
