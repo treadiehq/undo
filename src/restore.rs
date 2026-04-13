@@ -11,13 +11,16 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
 
-    let abs_path = cwd.join(path_str);
-    let abs_path = if abs_path.exists() {
-        abs_path.canonicalize()?
-    } else {
-        abs_path
-    };
+    let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;
     let abs_path_str = abs_path.to_string_lossy().to_string();
+
+    // Refuse to write through symlinks — prevent overwriting files outside the project.
+    if abs_path.exists() && abs_path.symlink_metadata()?.file_type().is_symlink() {
+        anyhow::bail!(
+            "refusing to restore through symlink '{}'",
+            path_str,
+        );
+    }
 
     let target_time = Utc::now().timestamp() - secs;
 
@@ -54,15 +57,22 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     // Stored in ~/.undo/backups/ rather than /tmp so it survives a reboot —
     // /tmp is cleared on restart, which would defeat the purpose of the backup.
     if abs_path.exists() {
+        use std::os::unix::fs::PermissionsExt;
         let filename = abs_path
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
         let ts = Utc::now().timestamp();
         let backups_dir = crate::backtrack_dir()?.join("backups");
-        std::fs::create_dir_all(&backups_dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(&backups_dir)?;
+        // Restrict backups dir to owner-only
+        let _ = std::fs::set_permissions(&backups_dir, std::fs::Permissions::from_mode(0o700));
         let backup_path = backups_dir.join(format!("{}_{}.bak", filename, ts));
         std::fs::copy(&abs_path, &backup_path)?;
+        // Restrict backup file to owner-only
+        let _ = std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o600));
         println!("Backup of current file saved to {}", backup_path.display());
     }
 

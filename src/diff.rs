@@ -16,12 +16,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
 
-    let abs_path = cwd.join(path_str);
-    let abs_path = if abs_path.exists() {
-        abs_path.canonicalize()?
-    } else {
-        abs_path
-    };
+    let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;
     let abs_path_str = abs_path.to_string_lossy().to_string();
 
     let event = match db.get_latest_event(project.id, &abs_path_str)? {

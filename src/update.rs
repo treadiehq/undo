@@ -31,10 +31,9 @@ pub fn cmd_update() -> Result<()> {
 
     println!("Downloading undo {} for {}...", latest_tag, target);
 
-    let tmpdir = std::env::temp_dir().join(format!("undo-update-{}", std::process::id()));
-    std::fs::create_dir_all(&tmpdir)?;
+    let tmpdir = tempfile::TempDir::new().context("failed to create temp directory")?;
 
-    let tarball = tmpdir.join("undo.tar.gz");
+    let tarball = tmpdir.path().join("undo.tar.gz");
 
     let dl_status = Command::new("curl")
         .args(["-fsSL", &url, "-o"])
@@ -43,7 +42,6 @@ pub fn cmd_update() -> Result<()> {
         .context("failed to run curl — is it installed?")?;
 
     if !dl_status.success() {
-        std::fs::remove_dir_all(&tmpdir).ok();
         anyhow::bail!(
             "download failed (HTTP error). Check that release {} exists for {}.",
             latest_tag,
@@ -55,18 +53,16 @@ pub fn cmd_update() -> Result<()> {
         .args(["xzf"])
         .arg(&tarball)
         .arg("-C")
-        .arg(&tmpdir)
+        .arg(tmpdir.path())
         .status()
         .context("failed to extract archive")?;
 
     if !tar_status.success() {
-        std::fs::remove_dir_all(&tmpdir).ok();
         anyhow::bail!("failed to extract downloaded archive");
     }
 
-    let new_binary = tmpdir.join("undo");
+    let new_binary = tmpdir.path().join("undo");
     if !new_binary.exists() {
-        std::fs::remove_dir_all(&tmpdir).ok();
         anyhow::bail!("extracted archive does not contain 'undo' binary");
     }
 
@@ -78,14 +74,12 @@ pub fn cmd_update() -> Result<()> {
         .context("failed to replace binary — try running with sudo")?;
 
     if let Err(e) = std::fs::rename(&new_binary, &current_exe) {
-        // Roll back if the move fails.
         std::fs::rename(&backup, &current_exe).ok();
-        std::fs::remove_dir_all(&tmpdir).ok();
         return Err(e).context("failed to install new binary");
     }
 
     std::fs::remove_file(&backup).ok();
-    std::fs::remove_dir_all(&tmpdir).ok();
+    // tmpdir auto-cleans on drop
 
     println!(
         "\n{}Updated{} undo from v{} to {}.",

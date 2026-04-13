@@ -1,6 +1,6 @@
 [package]
 name = "undo"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Filesystem history for your working directory"
 
@@ -20,6 +20,4 @@ libc = "0.2"
 ignore = "0.4.25"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
 tempfile = "3"

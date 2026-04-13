@@ -175,6 +175,10 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     // Write PID file: line 1 = pid, line 2 = project root
     let pid = std::process::id();
     std::fs::write(&pid_path, format!("{}\n{}", pid, cwd.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     // Catch SIGINT / SIGTERM so we clean up the PID file.
     let shutdown = Arc::new(AtomicBool::new(false));

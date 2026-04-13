@@ -15,9 +15,16 @@ const IGNORED_NAMES: &[&str] = &[
     ".vscode",
     ".backtrack",
     ".undo",
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".ssh",
 ];
 
-/// Check if a path component matches one of the hardcoded ignore names.
+const IGNORED_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "keystore"];
+
+/// Check if a path component matches one of the hardcoded ignore names,
+/// or the file has a sensitive extension.
 fn matches_builtin(path: &Path, project_root: &Path) -> bool {
     let rel = path.strip_prefix(project_root).unwrap_or(path);
     for component in rel.components() {
@@ -26,6 +33,11 @@ fn matches_builtin(path: &Path, project_root: &Path) -> bool {
             if IGNORED_NAMES.iter().any(|&ignored| ignored == name_str.as_ref()) {
                 return true;
             }
+        }
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if IGNORED_EXTENSIONS.iter().any(|&e| e == ext) {
+            return true;
         }
     }
     false
@@ -60,18 +72,21 @@ pub fn init(project_root: &Path) {
 }
 
 /// Returns true if the path should be excluded from watching.
+/// Negation patterns in `.undoignore` (e.g. `!build/`) override the builtin list.
 pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
-    if matches_builtin(path, project_root) {
-        return true;
-    }
-
     if let Some(gi) = CUSTOM_IGNORE.get() {
         let rel = path.strip_prefix(project_root).unwrap_or(path);
         let is_dir = path.is_dir();
-        gi.matched(rel, is_dir).is_ignore()
-    } else {
-        false
+        let m = gi.matched(rel, is_dir);
+        if m.is_whitelist() {
+            return false; // negation pattern explicitly includes this path
+        }
+        if m.is_ignore() {
+            return true;
+        }
     }
+
+    matches_builtin(path, project_root)
 }
 
 #[cfg(test)]
@@ -148,5 +163,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gi = build_custom_ignore(dir.path());
         assert!(!gi.matched("anything.rs", false).is_ignore());
+    }
+
+    #[test]
+    fn negation_pattern_whitelists_builtin_ignored_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".undoignore"), "!build/\n").unwrap();
+
+        let gi = build_custom_ignore(root);
+        let m = gi.matched("build", true);
+        assert!(
+            m.is_whitelist(),
+            "!build/ in .undoignore should whitelist the build directory"
+        );
+    }
+
+    #[test]
+    fn negation_pattern_whitelists_builtin_ignored_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".undoignore"), "!.env\n").unwrap();
+
+        let gi = build_custom_ignore(root);
+        let m = gi.matched(".env", false);
+        assert!(
+            m.is_whitelist(),
+            "!.env in .undoignore should whitelist .env files"
+        );
     }
 }

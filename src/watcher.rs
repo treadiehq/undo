@@ -103,7 +103,7 @@ fn initial_scan_with_limit(
             Err(_) => continue,
         };
 
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() || entry.path_is_symlink() {
             continue;
         }
 
@@ -120,9 +120,9 @@ fn initial_scan_with_limit(
         let path_str = path.to_string_lossy().to_string();
         seen_paths.insert(path_str.clone());
 
-        let content = match std::fs::read(path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let content = match read_if_within_limit(path) {
+            Ok(Some(c)) => c,
+            _ => continue,
         };
 
         let hash = compute_hash(&content);
@@ -134,11 +134,7 @@ fn initial_scan_with_limit(
             }
             Some(ref state) => {
                 let prev_hash = state.latest_hash.as_deref();
-                let snap = if content.len() <= snapshots::MAX_SNAPSHOT_SIZE {
-                    Some(snapshots::save(project.id, &hash, &content)?)
-                } else {
-                    None
-                };
+                let snap = Some(snapshots::save(project.id, &hash, &content)?);
                 db.insert_event(
                     project.id,
                     &path_str,
@@ -159,11 +155,7 @@ fn initial_scan_with_limit(
                 }
             }
             None => {
-                let snap = if content.len() <= snapshots::MAX_SNAPSHOT_SIZE {
-                    Some(snapshots::save(project.id, &hash, &content)?)
-                } else {
-                    None
-                };
+                let snap = Some(snapshots::save(project.id, &hash, &content)?);
                 db.insert_event(
                     project.id,
                     &path_str,
@@ -405,13 +397,36 @@ fn process_event(
 
 // ── per-event handlers ──────────────────────────────────────────────
 
+/// Read a file only if its on-disk size is within `MAX_SNAPSHOT_SIZE`.
+/// Returns None (skip) for files that are too large, avoiding multi-GB allocations.
+fn read_if_within_limit(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > snapshots::MAX_SNAPSHOT_SIZE as u64 {
+        return Ok(None);
+    }
+    std::fs::read(path).map(Some)
+}
+
+/// Returns true if the path is a symlink (not a regular file).
+fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn handle_create(
     db: &Database,
     project: &WatchedProject,
     path: &Path,
     verbose: bool,
 ) -> Result<()> {
-    let content = std::fs::read(path)?;
+    if is_symlink(path) {
+        return Ok(());
+    }
+    let content = match read_if_within_limit(path)? {
+        Some(c) => c,
+        None => return Ok(()), // too large, skip
+    };
     let hash = compute_hash(&content);
     let path_str = path.to_string_lossy().to_string();
 
@@ -423,11 +438,7 @@ fn handle_create(
         }
     }
 
-    let snap = if content.len() <= snapshots::MAX_SNAPSHOT_SIZE {
-        Some(snapshots::save(project.id, &hash, &content)?)
-    } else {
-        None
-    };
+    let snap = Some(snapshots::save(project.id, &hash, &content)?);
 
     // macOS FSEvents can report overwrites as CREATE events.
     // If the file is already tracked and alive, record MODIFIED instead.
@@ -465,9 +476,12 @@ fn handle_modify(
     path: &Path,
     verbose: bool,
 ) -> Result<()> {
-    let content = match std::fs::read(path) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
+    if is_symlink(path) {
+        return Ok(());
+    }
+    let content = match read_if_within_limit(path) {
+        Ok(Some(c)) => c,
+        _ => return Ok(()),
     };
     let hash = compute_hash(&content);
     let path_str = path.to_string_lossy().to_string();
@@ -480,11 +494,7 @@ fn handle_modify(
                 return Ok(());
             }
 
-            let snap = if content.len() <= snapshots::MAX_SNAPSHOT_SIZE {
-                Some(snapshots::save(project.id, &hash, &content)?)
-            } else {
-                None
-            };
+            let snap = Some(snapshots::save(project.id, &hash, &content)?);
 
             db.insert_event(
                 project.id,
@@ -558,12 +568,15 @@ fn handle_rename(
     new_path: &Path,
     verbose: bool,
 ) -> Result<()> {
+    if is_symlink(new_path) {
+        return Ok(());
+    }
     let old_str = old_path.to_string_lossy().to_string();
     let new_str = new_path.to_string_lossy().to_string();
 
-    let content = match std::fs::read(new_path) {
-        Ok(c) => c,
-        Err(_) => return Ok(()),
+    let content = match read_if_within_limit(new_path) {
+        Ok(Some(c)) => c,
+        _ => return Ok(()),
     };
     let hash = compute_hash(&content);
 
@@ -571,11 +584,7 @@ fn handle_rename(
         .get_file_state(project.id, &old_str)?
         .and_then(|s| s.latest_hash);
 
-    let snap = if content.len() <= snapshots::MAX_SNAPSHOT_SIZE {
-        Some(snapshots::save(project.id, &hash, &content)?)
-    } else {
-        None
-    };
+    let snap = Some(snapshots::save(project.id, &hash, &content)?);
 
     db.insert_event(
         project.id,

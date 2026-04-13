@@ -281,12 +281,14 @@ Temporarily overrides the configured retention period for this prune run.
 
 ## Ignored Paths
 
-undo automatically ignores noisy directories and files:
+undo automatically ignores noisy and sensitive paths:
 
 - `.git/`, `.undo/`
 - `node_modules/`, `__pycache__/`
 - `target/`, `dist/`, `build/`, `.next/`
-- `.DS_Store`
+- `.DS_Store`, `.idea/`, `.vscode/`
+- `.env`, `.env.local`, `.env.production`, `.ssh/`
+- `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`
 
 ### Custom ignore patterns
 
@@ -299,6 +301,18 @@ tmp/
 ```
 
 If a `.gitignore` file exists, undo respects it too. `.undoignore` patterns take precedence.
+
+### Overriding the defaults
+
+If a default-ignored path is actually something you want tracked, use a negation pattern in `.undoignore`:
+
+```
+!build/
+!.env
+!dist/
+```
+
+Negation patterns override the builtin ignore list. This is useful when a default like `build/` or `dist/` is actually source code in your project, or when you intentionally want to track `.env` changes.
 
 ### Large files
 

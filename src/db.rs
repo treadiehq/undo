@@ -60,11 +60,14 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 
 impl Database {
     pub fn open() -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
         let dir = crate::backtrack_dir()?;
         let db_path = dir.join("database.db");
         let conn =
             Connection::open(&db_path).context("failed to open database")?;
         apply_schema(&conn)?;
+        // Restrict DB file to owner-only (0600)
+        let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
         Ok(Self { conn })
     }
 
