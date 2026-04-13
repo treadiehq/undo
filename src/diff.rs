@@ -5,6 +5,12 @@ use crate::db::Database;
 use crate::snapshots;
 use crate::{find_project, BOLD, DIM, GREEN, RED, RESET};
 
+/// Heuristic: treat content as binary if it contains a NUL byte within the
+/// first 8 KiB (same approach used by git and most editors).
+fn is_binary(data: &[u8]) -> bool {
+    data.iter().take(8192).any(|&b| b == 0)
+}
+
 pub fn cmd_diff(path_str: &str) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
@@ -43,6 +49,12 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     };
 
     let snapshot_content = snapshots::load(project.id, hash)?;
+
+    if is_binary(&snapshot_content) {
+        println!("Binary file — text diff not available.");
+        return Ok(());
+    }
+
     let snapshot_text = String::from_utf8_lossy(&snapshot_content);
 
     if !abs_path.exists() {
@@ -55,6 +67,12 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     }
 
     let current_content = std::fs::read(&abs_path)?;
+
+    if is_binary(&current_content) {
+        println!("Binary file — text diff not available.");
+        return Ok(());
+    }
+
     let current_text = String::from_utf8_lossy(&current_content);
 
     if snapshot_text == current_text {

@@ -15,6 +15,10 @@ use crate::models::WatchedProject;
 use crate::snapshots;
 
 const DEBOUNCE_MS: u64 = 500;
+/// How often to evict stale debounce entries (seconds).
+const DEBOUNCE_CLEANUP_SECS: u64 = 60;
+/// Entries older than this are eligible for eviction.
+const DEBOUNCE_MAX_AGE: Duration = Duration::from_secs(300);
 
 // ── hashing ─────────────────────────────────────────────────────────
 
@@ -27,16 +31,19 @@ fn compute_hash(data: &[u8]) -> String {
 
 struct Debouncer {
     last_event: HashMap<PathBuf, Instant>,
+    last_cleanup: Instant,
 }
 
 impl Debouncer {
     fn new() -> Self {
         Self {
             last_event: HashMap::new(),
+            last_cleanup: Instant::now(),
         }
     }
 
     fn should_process(&mut self, path: &Path) -> bool {
+        self.maybe_cleanup();
         let now = Instant::now();
         if let Some(last) = self.last_event.get(path) {
             if now.duration_since(*last) < Duration::from_millis(DEBOUNCE_MS) {
@@ -45,6 +52,18 @@ impl Debouncer {
         }
         self.last_event.insert(path.to_path_buf(), now);
         true
+    }
+
+    /// Periodically evict entries that are too old to matter for debouncing.
+    fn maybe_cleanup(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_cleanup)
+            < Duration::from_secs(DEBOUNCE_CLEANUP_SECS)
+        {
+            return;
+        }
+        self.last_event.retain(|_, t| now.duration_since(*t) < DEBOUNCE_MAX_AGE);
+        self.last_cleanup = now;
     }
 }
 

@@ -97,27 +97,29 @@ impl Database {
         &self,
         path: &Path,
     ) -> Result<Option<WatchedProject>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, root_path, created_at FROM watched_projects",
-        )?;
-        let projects = stmt.query_map([], |row| {
-            Ok(WatchedProject {
-                id: row.get(0)?,
-                root_path: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        })?;
-
         let path_str = path.to_string_lossy().to_string();
-        for project in projects {
-            let project = project?;
-            if path_str == project.root_path
-                || path_str.starts_with(&format!("{}/", project.root_path))
-            {
-                return Ok(Some(project));
-            }
-        }
-        Ok(None)
+        // Push filtering into SQL and pick the longest (most specific) match.
+        // SUBSTR prefix check is used instead of LIKE to avoid case-folding on
+        // case-sensitive filesystems.
+        self.conn
+            .query_row(
+                "SELECT id, root_path, created_at
+                 FROM watched_projects
+                 WHERE ?1 = root_path
+                    OR SUBSTR(?1, 1, LENGTH(root_path) + 1) = root_path || '/'
+                 ORDER BY LENGTH(root_path) DESC
+                 LIMIT 1",
+                rusqlite::params![path_str],
+                |row| {
+                    Ok(WatchedProject {
+                        id: row.get(0)?,
+                        root_path: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to query project for path")
     }
 
     // ── event operations ────────────────────────────────────────────
