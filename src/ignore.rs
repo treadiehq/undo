@@ -1,4 +1,6 @@
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
+use std::sync::OnceLock;
 
 const IGNORED_NAMES: &[&str] = &[
     ".git",
@@ -12,10 +14,11 @@ const IGNORED_NAMES: &[&str] = &[
     ".idea",
     ".vscode",
     ".backtrack",
+    ".undo",
 ];
 
-/// Returns true if the path contains an ignored directory component.
-pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
+/// Check if a path component matches one of the hardcoded ignore names.
+fn matches_builtin(path: &Path, project_root: &Path) -> bool {
     let rel = path.strip_prefix(project_root).unwrap_or(path);
     for component in rel.components() {
         if let std::path::Component::Normal(name) = component {
@@ -26,6 +29,49 @@ pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
         }
     }
     false
+}
+
+/// Build a Gitignore matcher from `.gitignore` and `.undoignore` in the project root.
+fn build_custom_ignore(project_root: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(project_root);
+
+    let gitignore = project_root.join(".gitignore");
+    if gitignore.exists() {
+        let _ = builder.add(gitignore);
+    }
+
+    // .undoignore patterns are added after .gitignore so they take precedence.
+    let undoignore = project_root.join(".undoignore");
+    if undoignore.exists() {
+        let _ = builder.add(undoignore);
+    }
+
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+/// Thread-local cache for the compiled ignore matcher.
+/// Rebuilt once per project root (the root is fixed for the daemon's lifetime).
+static CUSTOM_IGNORE: OnceLock<Gitignore> = OnceLock::new();
+
+/// Initialise the custom ignore matcher for this project.
+/// Must be called once before `should_ignore` is used.
+pub fn init(project_root: &Path) {
+    CUSTOM_IGNORE.get_or_init(|| build_custom_ignore(project_root));
+}
+
+/// Returns true if the path should be excluded from watching.
+pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
+    if matches_builtin(path, project_root) {
+        return true;
+    }
+
+    if let Some(gi) = CUSTOM_IGNORE.get() {
+        let rel = path.strip_prefix(project_root).unwrap_or(path);
+        let is_dir = path.is_dir();
+        gi.matched(rel, is_dir).is_ignore()
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -60,5 +106,47 @@ mod tests {
     fn regular_source_file_is_not_ignored() {
         let path = Path::new("/home/user/project/src/main.rs");
         assert!(!should_ignore(path, root()));
+    }
+
+    #[test]
+    fn undo_directory_is_ignored() {
+        let path = Path::new("/home/user/project/.undo/database.db");
+        assert!(should_ignore(path, root()));
+    }
+
+    #[test]
+    fn undoignore_patterns_are_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".undoignore"), "*.log\ndata/\n").unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("app.log"), "x").unwrap();
+        std::fs::write(root.join("src/main.rs"), "x").unwrap();
+
+        let gi = build_custom_ignore(root);
+
+        assert!(gi.matched("app.log", false).is_ignore());
+        assert!(gi.matched("data", true).is_ignore());
+        assert!(!gi.matched("src/main.rs", false).is_ignore());
+    }
+
+    #[test]
+    fn gitignore_patterns_are_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
+
+        let gi = build_custom_ignore(root);
+
+        assert!(gi.matched("scratch.tmp", false).is_ignore());
+        assert!(!gi.matched("main.rs", false).is_ignore());
+    }
+
+    #[test]
+    fn works_without_any_ignore_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let gi = build_custom_ignore(dir.path());
+        assert!(!gi.matched("anything.rs", false).is_ignore());
     }
 }

@@ -11,6 +11,7 @@ mod duration;
 mod ignore;
 mod models;
 mod restore;
+mod retention;
 mod snapshots;
 mod update;
 mod watcher;
@@ -108,6 +109,7 @@ fn main() {
         cli::Command::Restore { path, duration } => restore::cmd_restore(&path, &duration),
         cli::Command::Status => daemon::cmd_status(),
         cli::Command::Stop { all } => daemon::cmd_stop(all),
+        cli::Command::Prune { keep, dry_run } => cmd_prune(keep, dry_run),
         cli::Command::Update => update::cmd_update(),
     };
 
@@ -153,6 +155,38 @@ fn cmd_timeline(limit: usize) -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+// ── prune ────────────────────────────────────────────────────────────
+
+fn cmd_prune(keep: Option<String>, dry_run: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let db = db::Database::open()?;
+    let project = find_project(&db, &cwd)?;
+
+    let mut config = retention::load_config(Some(&cwd));
+    if let Some(ref keep_str) = keep {
+        let secs = duration::parse_duration(keep_str)?;
+        let days = (secs as f64 / 86400.0).ceil() as u64;
+        config.retention_days = days.max(1);
+    }
+
+    let label = if dry_run { "Would prune" } else { "Pruned" };
+    let stats = retention::prune(&db, project.id, &config, dry_run)?;
+
+    println!(
+        "{} {} events, {} snapshots, {} backups.",
+        label, stats.events_deleted, stats.snapshots_deleted, stats.backups_deleted,
+    );
+
+    let usage = retention::total_disk_usage()?;
+    println!(
+        "Freed {}. Current usage: {}.",
+        retention::format_size(stats.bytes_freed),
+        retention::format_size(usage),
+    );
 
     Ok(())
 }

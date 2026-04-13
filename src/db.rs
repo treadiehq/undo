@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::models::{FileEvent, FileState, WatchedProject};
@@ -367,6 +368,55 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .context("failed to query file states")
     }
+
+    // ── retention / pruning ──────────────────────────────────────────
+
+    pub fn count_events_before(
+        &self,
+        project_id: i64,
+        before_ts: i64,
+    ) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_events
+                 WHERE project_id = ?1 AND timestamp < ?2",
+                params![project_id, before_ts],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c as u64)
+            .context("failed to count events before timestamp")
+    }
+
+    pub fn delete_events_before(
+        &self,
+        project_id: i64,
+        before_ts: i64,
+    ) -> Result<u64> {
+        let deleted = self.conn.execute(
+            "DELETE FROM file_events
+             WHERE project_id = ?1 AND timestamp < ?2",
+            params![project_id, before_ts],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    pub fn get_live_hashes(&self, project_id: i64) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT current_hash FROM file_events
+             WHERE project_id = ?1 AND current_hash IS NOT NULL",
+        )?;
+        let hashes = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+        hashes
+            .collect::<Result<HashSet<_>, _>>()
+            .context("failed to query live hashes")
+    }
+
+    pub fn get_all_project_ids(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM watched_projects")?;
+        let ids = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        ids.collect::<Result<Vec<_>, _>>()
+            .context("failed to query project ids")
+    }
 }
 
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<FileEvent> {
@@ -502,5 +552,78 @@ mod tests {
         let state = db.get_file_state(p.id, path).unwrap().unwrap();
         assert_eq!(state.latest_hash, Some("deadbeef".to_string()));
         assert!(state.exists_now);
+    }
+
+    // ── retention methods ───────────────────────────────────────────
+
+    fn seed_events(db: &Database, project_id: i64) {
+        let now = chrono::Utc::now().timestamp();
+        // Old event: 10 days ago
+        db.conn.execute(
+            "INSERT INTO file_events (project_id, timestamp, path, event_type, current_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, now - 864_000, "/p/old.rs", "MODIFIED", "hash_old"],
+        ).unwrap();
+        // Recent event: 1 hour ago
+        db.conn.execute(
+            "INSERT INTO file_events (project_id, timestamp, path, event_type, current_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, now - 3600, "/p/new.rs", "MODIFIED", "hash_new"],
+        ).unwrap();
+    }
+
+    #[test]
+    fn count_events_before_counts_old_events() {
+        let db = db();
+        let p = project(&db);
+        seed_events(&db, p.id);
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 86400; // 1 day ago
+        assert_eq!(db.count_events_before(p.id, cutoff).unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_events_before_removes_old_events() {
+        let db = db();
+        let p = project(&db);
+        seed_events(&db, p.id);
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 86400;
+        let deleted = db.delete_events_before(p.id, cutoff).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(db.count_events(p.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn get_live_hashes_returns_referenced_hashes() {
+        let db = db();
+        let p = project(&db);
+        seed_events(&db, p.id);
+        let hashes = db.get_live_hashes(p.id).unwrap();
+        assert!(hashes.contains("hash_old"));
+        assert!(hashes.contains("hash_new"));
+        assert_eq!(hashes.len(), 2);
+    }
+
+    #[test]
+    fn get_live_hashes_after_prune_excludes_deleted() {
+        let db = db();
+        let p = project(&db);
+        seed_events(&db, p.id);
+        let now = chrono::Utc::now().timestamp();
+        db.delete_events_before(p.id, now - 86400).unwrap();
+        let hashes = db.get_live_hashes(p.id).unwrap();
+        assert!(!hashes.contains("hash_old"));
+        assert!(hashes.contains("hash_new"));
+    }
+
+    #[test]
+    fn get_all_project_ids_returns_existing_projects() {
+        let db = db();
+        let p1 = db.get_or_create_project(Path::new("/a")).unwrap();
+        let p2 = db.get_or_create_project(Path::new("/b")).unwrap();
+        let ids = db.get_all_project_ids().unwrap();
+        assert!(ids.contains(&p1.id));
+        assert!(ids.contains(&p2.id));
     }
 }

@@ -61,6 +61,16 @@ pub enum Command {
         all: bool,
     },
 
+    /// Remove old history beyond the retention window
+    Prune {
+        /// Override retention period (e.g. 30d, 12h)
+        #[arg(long)]
+        keep: Option<String>,
+        /// Dry run — show what would be deleted without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Update undo to the latest release
     Update,
 }

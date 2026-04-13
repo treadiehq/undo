@@ -81,6 +81,62 @@ fn check_directory_ownership(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Return all (pid, root_path) pairs from live PID files.
+fn active_daemons(bt_dir: &Path) -> Vec<(u32, PathBuf)> {
+    let pids_dir = bt_dir.join("pids");
+    let Ok(entries) = std::fs::read_dir(&pids_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pid"))
+        .filter_map(|e| {
+            let contents = std::fs::read_to_string(e.path()).ok()?;
+            let mut lines = contents.lines();
+            let pid: u32 = lines.next()?.parse().ok()?;
+            let root = PathBuf::from(lines.next()?);
+            if is_pid_running(pid) {
+                Some((pid, root))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Refuse to start if another daemon is already watching a parent or child
+/// of `new_root`. Overlapping watchers cause duplicate events and wasted
+/// snapshots because both daemons receive the same filesystem notifications.
+fn check_no_overlap(bt_dir: &Path, new_root: &Path) -> Result<()> {
+    let new_str = new_root.to_string_lossy();
+    for (pid, existing) in active_daemons(bt_dir) {
+        let ex_str = existing.to_string_lossy();
+
+        let overlap = if new_str.len() >= ex_str.len() {
+            // new_root is equal to or a child of existing
+            new_str.starts_with(ex_str.as_ref())
+                && (new_str.len() == ex_str.len()
+                    || new_str.as_bytes()[ex_str.len()] == b'/')
+        } else {
+            // new_root is a parent of existing
+            ex_str.starts_with(new_str.as_ref())
+                && ex_str.as_bytes()[new_str.len()] == b'/'
+        };
+
+        if overlap {
+            anyhow::bail!(
+                "directory overlaps with an already-watched path.\n\
+                 Running daemon (PID {}) is watching: {}\n\
+                 Overlapping watchers cause duplicate events.\n\
+                 Use --force to override.",
+                pid,
+                existing.display(),
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let bt_dir = backtrack_dir()?;
@@ -109,6 +165,10 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         let _ = std::fs::remove_file(&pid_path);
     }
 
+    if !force {
+        check_no_overlap(&bt_dir, &cwd)?;
+    }
+
     let db = Database::open()?;
     let project = db.get_or_create_project(&cwd)?;
 
@@ -121,12 +181,29 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
 
+    crate::ignore::init(&cwd);
+
     println!("{}undo{} — filesystem history", BOLD, RESET);
     println!("Watching: {}", cwd.display());
     println!("Recording changes...");
     println!();
 
     watcher::initial_scan(&db, &project, &cwd, verbose, force)?;
+
+    let retention_cfg = crate::retention::load_config(Some(&cwd));
+    match crate::retention::prune(&db, project.id, &retention_cfg, false) {
+        Ok(stats) if stats.events_deleted + stats.snapshots_deleted + stats.backups_deleted > 0 => {
+            eprintln!(
+                "{}auto-prune:{} removed {} events, {} snapshots, {} backups (freed {})",
+                YELLOW, RESET,
+                stats.events_deleted, stats.snapshots_deleted, stats.backups_deleted,
+                crate::retention::format_size(stats.bytes_freed),
+            );
+        }
+        Err(e) => eprintln!("{}warning:{} auto-prune failed: {}", YELLOW, RESET, e),
+        _ => {}
+    }
+
     watcher::watch_directory(&db, &project, &cwd, shutdown, verbose)?;
 
     let _ = std::fs::remove_file(&pid_path);
@@ -251,6 +328,25 @@ pub fn cmd_status() -> Result<()> {
             let snapshot_count = crate::snapshots::count(project.id)?;
             println!("Events:    {}", event_count);
             println!("Snapshots: {}", snapshot_count);
+
+            let project_root = std::path::Path::new(&project.root_path);
+            let cfg = crate::retention::load_config(Some(project_root));
+            println!(
+                "Retention: {} days, {} max",
+                cfg.retention_days,
+                crate::retention::format_size(cfg.max_size_mb * 1024 * 1024),
+            );
+
+            let snap_size = crate::retention::dir_size("snapshots").unwrap_or(0);
+            let backup_size = crate::retention::dir_size("backups").unwrap_or(0);
+            let total = crate::retention::total_disk_usage().unwrap_or(0);
+            println!(
+                "Disk:      {} (snapshots: {}, backups: {}, db: {})",
+                crate::retention::format_size(total),
+                crate::retention::format_size(snap_size),
+                crate::retention::format_size(backup_size),
+                crate::retention::format_size(db_size),
+            );
         }
         None => {
             println!("No project being watched for this directory.");
@@ -351,5 +447,76 @@ mod tests {
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
         assert!(migrate_old_pid_file(bt).is_ok());
+    }
+
+    // ── overlap detection ───────────────────────────────────────────
+
+    fn write_live_pid_file(bt_dir: &Path, root: &str) {
+        let pid = std::process::id(); // current process, so is_pid_running returns true
+        let path = pid_file_for_root(bt_dir, Path::new(root));
+        std::fs::write(&path, format!("{}\n{}", pid, root)).unwrap();
+    }
+
+    #[test]
+    fn overlap_rejects_child_of_watched_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        write_live_pid_file(bt, "/foo");
+
+        let err = check_no_overlap(bt, Path::new("/foo/bar")).unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{}", err);
+    }
+
+    #[test]
+    fn overlap_rejects_parent_of_watched_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        write_live_pid_file(bt, "/foo/bar");
+
+        let err = check_no_overlap(bt, Path::new("/foo")).unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{}", err);
+    }
+
+    #[test]
+    fn overlap_rejects_exact_same_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        write_live_pid_file(bt, "/foo/bar");
+
+        let err = check_no_overlap(bt, Path::new("/foo/bar")).unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{}", err);
+    }
+
+    #[test]
+    fn overlap_allows_sibling_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        write_live_pid_file(bt, "/foo/bar");
+
+        assert!(check_no_overlap(bt, Path::new("/foo/baz")).is_ok());
+    }
+
+    #[test]
+    fn overlap_no_false_positive_for_shared_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        write_live_pid_file(bt, "/foo/bar");
+
+        // "/foo/bar-extra" shares the string prefix but is not a subdirectory
+        assert!(check_no_overlap(bt, Path::new("/foo/bar-extra")).is_ok());
+    }
+
+    #[test]
+    fn overlap_passes_when_no_daemons_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+
+        assert!(check_no_overlap(bt, Path::new("/any/path")).is_ok());
     }
 }

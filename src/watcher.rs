@@ -215,6 +215,8 @@ fn initial_scan_with_limit(
 
 /// How often to verify the watched root directory is still accessible.
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often to auto-prune old history.
+const AUTO_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 fn root_is_accessible(root: &Path) -> bool {
     root.try_exists().unwrap_or(false) && root.is_dir()
@@ -241,6 +243,7 @@ pub fn watch_directory(
     let mut debouncer = Debouncer::new();
     let mut paused = false;
     let mut last_health_check = Instant::now();
+    let mut last_prune = Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -266,6 +269,30 @@ pub fn watch_directory(
                     );
                 }
                 paused = false;
+            }
+        }
+
+        // Hourly auto-prune.
+        if last_prune.elapsed() >= AUTO_PRUNE_INTERVAL {
+            last_prune = Instant::now();
+            let cfg = crate::retention::load_config(Some(root));
+            match crate::retention::prune(db, project.id, &cfg, false) {
+                Ok(stats)
+                    if stats.events_deleted + stats.snapshots_deleted + stats.backups_deleted
+                        > 0 =>
+                {
+                    eprintln!(
+                        "{}auto-prune:{} removed {} events, {} snapshots, {} backups (freed {})",
+                        crate::YELLOW, crate::RESET,
+                        stats.events_deleted, stats.snapshots_deleted, stats.backups_deleted,
+                        crate::retention::format_size(stats.bytes_freed),
+                    );
+                }
+                Err(e) => eprintln!(
+                    "{}warning:{} auto-prune failed: {}",
+                    crate::YELLOW, crate::RESET, e
+                ),
+                _ => {}
             }
         }
 
