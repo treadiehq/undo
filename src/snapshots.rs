@@ -77,33 +77,36 @@ pub fn count(project_id: i64) -> Result<usize> {
 mod tests {
     use super::*;
 
-    // Use large project IDs that won't collide with any real project in a
-    // development database (SQLite autoincrement starts at 1).
-    const TEST_PROJECT: i64 = 9_000_001;
-
     #[test]
     fn save_and_load_round_trip() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
         let content = b"hello, snapshot world\n";
-        let hash = "roundtrip_test_hash_abc123";
-        save(TEST_PROJECT, hash, content).unwrap();
-        let loaded = load(TEST_PROJECT, hash).unwrap();
+        save(1, "roundtrip_hash", content).unwrap();
+        let loaded = load(1, "roundtrip_hash").unwrap();
         assert_eq!(loaded, content);
     }
 
     #[test]
     fn save_is_idempotent_for_same_hash() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
         let content = b"duplicate content to save twice";
-        let hash = "idempotent_test_hash_abc123";
-        save(TEST_PROJECT, hash, content).unwrap();
+        save(1, "dedup_hash", content).unwrap();
         // Second call must succeed — path.exists() guard skips the write.
-        save(TEST_PROJECT, hash, content).unwrap();
-        let loaded = load(TEST_PROJECT, hash).unwrap();
+        save(1, "dedup_hash", content).unwrap();
+        let loaded = load(1, "dedup_hash").unwrap();
         assert_eq!(loaded, content);
     }
 
     #[test]
     fn load_nonexistent_hash_returns_error() {
-        let result = load(TEST_PROJECT, "this_hash_does_not_exist_xyz");
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let result = load(1, "this_hash_does_not_exist_xyz");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("snapshot not found"), "got: {}", msg);
