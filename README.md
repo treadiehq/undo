@@ -47,7 +47,7 @@ That's it. No commits, no staging, no ceremony.
 
 Undo runs a tiny background daemon that uses native OS file watching. When a file changes, it hashes the content, saves a compressed snapshot, and logs the event to a local SQLite database. Everything stays on your machine at `~/.undo/`.
 
-It auto-prunes old history (default: 7 days, 1 GB cap), respects `.gitignore` and `.undoignore`, and refuses to watch dangerous directories like `/` or `~/`.
+Snapshots are gzip-compressed and content-deduplicated. It auto-prunes old history (default: 7 days, 1 GB cap), skips noisy directories like `node_modules` and `target` out of the box, and respects `.gitignore` and `.undoignore` for custom ignore rules.
 
 ## Configuration
 
