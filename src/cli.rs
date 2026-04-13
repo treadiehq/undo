@@ -18,7 +18,11 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Start watching the current directory
-    Start,
+    Start {
+        /// Skip safety checks (ownership, file-count limit)
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Show recent file activity
     Timeline {
@@ -51,7 +55,11 @@ pub enum Command {
     Status,
 
     /// Stop the daemon
-    Stop,
+    Stop {
+        /// Stop all running undo daemons
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Update undo to the latest release
     Update,

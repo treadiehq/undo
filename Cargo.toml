@@ -1,6 +1,6 @@
 [package]
 name = "undo"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Filesystem history for your working directory"
 
@@ -16,3 +16,7 @@ similar = "2"
 signal-hook = "0.3"
 dirs = "5"
 anyhow = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

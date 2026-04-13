@@ -32,14 +32,11 @@ pub fn backtrack_dir() -> Result<std::path::PathBuf> {
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".undo");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir.join("snapshots"))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(&dir)?;
+    builder.create(dir.join("snapshots"))?;
+    builder.create(dir.join("pids"))?;
     Ok(dir)
 }
 
@@ -104,13 +101,13 @@ fn main() {
     let cli = cli::Cli::parse();
 
     let result = match cli.command {
-        cli::Command::Start => daemon::cmd_start(cli.verbose),
+        cli::Command::Start { force } => daemon::cmd_start(cli.verbose, force),
         cli::Command::Timeline { limit } => cmd_timeline(limit),
         cli::Command::WhatChanged { duration } => cmd_what_changed(&duration),
         cli::Command::Diff { path } => diff::cmd_diff(&path),
         cli::Command::Restore { path, duration } => restore::cmd_restore(&path, &duration),
         cli::Command::Status => daemon::cmd_status(),
-        cli::Command::Stop => daemon::cmd_stop(),
+        cli::Command::Stop { all } => daemon::cmd_stop(all),
         cli::Command::Update => update::cmd_update(),
     };
 

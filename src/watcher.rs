@@ -19,6 +19,8 @@ const DEBOUNCE_MS: u64 = 500;
 const DEBOUNCE_CLEANUP_SECS: u64 = 60;
 /// Entries older than this are eligible for eviction.
 const DEBOUNCE_MAX_AGE: Duration = Duration::from_secs(300);
+/// Abort initial scan if more files than this are found (unless --force).
+pub const MAX_FILES_DEFAULT: usize = 50_000;
 
 // ── hashing ─────────────────────────────────────────────────────────
 
@@ -74,10 +76,23 @@ pub fn initial_scan(
     project: &WatchedProject,
     root: &Path,
     verbose: bool,
+    force: bool,
+) -> Result<()> {
+    let max_files = if force { usize::MAX } else { MAX_FILES_DEFAULT };
+    initial_scan_with_limit(db, project, root, verbose, max_files)
+}
+
+fn initial_scan_with_limit(
+    db: &Database,
+    project: &WatchedProject,
+    root: &Path,
+    verbose: bool,
+    max_files: usize,
 ) -> Result<()> {
     let existing_states = db.get_all_file_states(project.id)?;
     let mut seen_paths: HashSet<String> = HashSet::new();
     let mut count = 0usize;
+    let mut total_files = 0usize;
 
     for entry in WalkDir::new(root)
         .into_iter()
@@ -90,6 +105,15 @@ pub fn initial_scan(
 
         if !entry.file_type().is_file() {
             continue;
+        }
+
+        total_files += 1;
+        if total_files > max_files {
+            anyhow::bail!(
+                "directory contains more than {} files — this looks too large to watch safely.\n\
+                 Use --force to override this limit.",
+                max_files
+            );
         }
 
         let path = entry.path();
@@ -189,6 +213,13 @@ pub fn initial_scan(
 
 // ── live watcher ────────────────────────────────────────────────────
 
+/// How often to verify the watched root directory is still accessible.
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+fn root_is_accessible(root: &Path) -> bool {
+    root.try_exists().unwrap_or(false) && root.is_dir()
+}
+
 pub fn watch_directory(
     db: &Database,
     project: &WatchedProject,
@@ -208,14 +239,41 @@ pub fn watch_directory(
     watcher.watch(root, RecursiveMode::Recursive)?;
 
     let mut debouncer = Debouncer::new();
+    let mut paused = false;
+    let mut last_health_check = Instant::now();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
+        // Periodic health check on the root directory.
+        if last_health_check.elapsed() >= HEALTH_CHECK_INTERVAL {
+            last_health_check = Instant::now();
+            let accessible = root_is_accessible(root);
+
+            if !accessible && !paused {
+                eprintln!(
+                    "warning: watched directory is no longer accessible — pausing recording"
+                );
+                paused = true;
+            } else if accessible && paused {
+                eprintln!("watched directory is accessible again — resuming");
+                if let Err(e) = initial_scan(db, project, root, verbose, true) {
+                    eprintln!(
+                        "{}warning:{} reconciliation scan failed: {}",
+                        crate::YELLOW, crate::RESET, e
+                    );
+                }
+                paused = false;
+            }
+        }
+
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
+                if paused {
+                    continue;
+                }
                 if let Err(e) =
                     process_event(db, project, root, event, &mut debouncer, verbose)
                 {
@@ -276,6 +334,9 @@ fn process_event(
         }
 
         EventKind::Remove(_) => {
+            if !root_is_accessible(root) {
+                return Ok(());
+            }
             for path in &event.paths {
                 if should_ignore(path, root) {
                     continue;
@@ -512,4 +573,73 @@ fn handle_rename(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    #[test]
+    fn initial_scan_rejects_directory_over_file_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("file_{}.txt", i)), "data").unwrap();
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+
+        let err = initial_scan_with_limit(&db, &project, dir.path(), false, 5);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("too large to watch"), "got: {}", msg);
+    }
+
+    #[test]
+    fn initial_scan_accepts_directory_under_file_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("file_{}.txt", i)), "data").unwrap();
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+
+        let result = initial_scan_with_limit(&db, &project, dir.path(), false, 100);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn initial_scan_force_bypasses_file_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("file_{}.txt", i)), "data").unwrap();
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+
+        let result = initial_scan(&db, &project, dir.path(), false, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn root_accessible_returns_true_for_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(root_is_accessible(dir.path()));
+    }
+
+    #[test]
+    fn root_accessible_returns_false_for_missing_dir() {
+        assert!(!root_is_accessible(Path::new("/nonexistent/path/that/does/not/exist")));
+    }
+
+    #[test]
+    fn root_accessible_returns_false_for_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_dir");
+        std::fs::write(&file, "data").unwrap();
+        assert!(!root_is_accessible(&file));
+    }
 }
