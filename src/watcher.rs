@@ -21,6 +21,20 @@ const DEBOUNCE_CLEANUP_SECS: u64 = 60;
 const DEBOUNCE_MAX_AGE: Duration = Duration::from_secs(300);
 /// Abort initial scan if more files than this are found (unless --force).
 pub const MAX_FILES_DEFAULT: usize = 50_000;
+/// Timeout for individual filesystem operations (reads, metadata checks).
+const FS_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ── fs watchdog ─────────────────────────────────────────────────────
+
+/// Run a filesystem operation on a separate thread with a timeout.
+/// Returns None if the operation hangs beyond `FS_TIMEOUT`.
+fn fs_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(FS_TIMEOUT).ok()
+}
 
 // ── hashing ─────────────────────────────────────────────────────────
 
@@ -121,8 +135,8 @@ fn initial_scan_with_limit(
         seen_paths.insert(path_str.clone());
 
         let content = match read_if_within_limit(path) {
-            Ok(Some(c)) => c,
-            _ => continue,
+            Some(c) => c,
+            None => continue,
         };
 
         let hash = compute_hash(&content);
@@ -398,13 +412,16 @@ fn process_event(
 // ── per-event handlers ──────────────────────────────────────────────
 
 /// Read a file only if its on-disk size is within `MAX_SNAPSHOT_SIZE`.
-/// Returns None (skip) for files that are too large, avoiding multi-GB allocations.
-fn read_if_within_limit(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    let meta = std::fs::metadata(path)?;
-    if meta.len() > snapshots::MAX_SNAPSHOT_SIZE as u64 {
-        return Ok(None);
-    }
-    std::fs::read(path).map(Some)
+/// Returns None for files that are too large or if the read times out.
+fn read_if_within_limit(path: &Path) -> Option<Vec<u8>> {
+    let p = path.to_path_buf();
+    fs_with_timeout(move || {
+        let meta = std::fs::metadata(&p).ok()?;
+        if meta.len() > snapshots::MAX_SNAPSHOT_SIZE as u64 {
+            return None;
+        }
+        std::fs::read(&p).ok()
+    })?
 }
 
 /// Returns true if the path is a symlink (not a regular file).
@@ -423,9 +440,9 @@ fn handle_create(
     if is_symlink(path) {
         return Ok(());
     }
-    let content = match read_if_within_limit(path)? {
+    let content = match read_if_within_limit(path) {
         Some(c) => c,
-        None => return Ok(()), // too large, skip
+        None => return Ok(()),
     };
     let hash = compute_hash(&content);
     let path_str = path.to_string_lossy().to_string();
@@ -480,8 +497,8 @@ fn handle_modify(
         return Ok(());
     }
     let content = match read_if_within_limit(path) {
-        Ok(Some(c)) => c,
-        _ => return Ok(()),
+        Some(c) => c,
+        None => return Ok(()),
     };
     let hash = compute_hash(&content);
     let path_str = path.to_string_lossy().to_string();
@@ -575,8 +592,8 @@ fn handle_rename(
     let new_str = new_path.to_string_lossy().to_string();
 
     let content = match read_if_within_limit(new_path) {
-        Ok(Some(c)) => c,
-        _ => return Ok(()),
+        Some(c) => c,
+        None => return Ok(()),
     };
     let hash = compute_hash(&content);
 

@@ -391,6 +391,30 @@ undo stop --all
 - macOS (FSEvents)
 - Linux (inotify)
 
+### Filesystem compatibility
+
+| Filesystem | Status | Notes |
+|------------|--------|-------|
+| APFS, HFS+ (macOS) | Works | Full support via FSEvents |
+| ext4, btrfs, xfs, zfs (Linux) | Works | Full support via inotify |
+| NFS, SMB/CIFS | No events | inotify only fires for local changes; remote writes are invisible to the daemon |
+| sshfs, FUSE mounts | Varies | Depends on the FUSE implementation; some emit events, some don't |
+| NTFS (via ntfs-3g) | Unreliable | FUSE-based on Linux, no native notifications |
+
+For filesystems that don't emit events, the reconciliation scan at daemon startup will detect any changes that were missed — you get eventual consistency, but not real-time tracking.
+
+### ZFS rollbacks
+
+If a ZFS snapshot restore (`zfs rollback`) happens while the daemon is running, it may see a flood of change events or miss changes entirely depending on how the rollback interacts with inotify. Restarting the daemon after a rollback triggers a full reconciliation scan that brings the database back in sync.
+
+### Binary files
+
+Binary files (images, compiled assets, databases, etc.) are fully supported:
+
+- **Snapshot and restore** work on raw bytes — content round-trips perfectly
+- **Events** are tracked the same as text files (hash, timestamp, event type)
+- **Diff** detects binary content (NUL bytes in the first 8 KB) and prints "Binary file — text diff not available" instead of attempting a text diff
+
 ---
 
 ## License
