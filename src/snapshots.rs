@@ -9,10 +9,14 @@ use std::path::PathBuf;
 pub const MAX_SNAPSHOT_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 
 fn snapshot_dir(project_id: i64) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let dir = crate::backtrack_dir()?
         .join("snapshots")
         .join(project_id.to_string());
-    fs::create_dir_all(&dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
     Ok(dir)
 }
 

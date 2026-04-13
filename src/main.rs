@@ -28,11 +28,18 @@ pub const RESET: &str = "\x1b[0m";
 // ── helpers ─────────────────────────────────────────────────────────
 
 pub fn backtrack_dir() -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".undo");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::create_dir_all(dir.join("snapshots"))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir.join("snapshots"))?;
     Ok(dir)
 }
 
@@ -67,6 +74,27 @@ fn event_color(event_type: &str) -> &'static str {
         "DELETED" => RED,
         "RENAMED" => BLUE,
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_strips_prefix_and_leading_slash() {
+        assert_eq!(
+            relative_path("/home/user/project/src/main.rs", "/home/user/project"),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn relative_path_returns_original_when_no_prefix_match() {
+        assert_eq!(
+            relative_path("/other/file.rs", "/home/user/project"),
+            "/other/file.rs"
+        );
     }
 }
 

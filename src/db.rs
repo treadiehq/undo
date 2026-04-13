@@ -9,59 +9,69 @@ pub struct Database {
     conn: Connection,
 }
 
+fn apply_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA foreign_keys=ON;",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS watched_projects (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_path  TEXT    NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS file_events (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id    INTEGER NOT NULL,
+            timestamp     INTEGER NOT NULL,
+            path          TEXT    NOT NULL,
+            event_type    TEXT    NOT NULL,
+            current_hash  TEXT,
+            previous_hash TEXT,
+            snapshot_path TEXT,
+            old_path      TEXT,
+            file_size     INTEGER,
+            FOREIGN KEY (project_id) REFERENCES watched_projects(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS file_state (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id   INTEGER NOT NULL,
+            path         TEXT    NOT NULL,
+            latest_hash  TEXT,
+            last_seen_at INTEGER NOT NULL,
+            exists_now   INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (project_id) REFERENCES watched_projects(id),
+            UNIQUE(project_id, path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_project_time
+            ON file_events(project_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_events_path
+            ON file_events(project_id, path, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_state_project_path
+            ON file_state(project_id, path);",
+    )?;
+    Ok(())
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
         let dir = crate::backtrack_dir()?;
         let db_path = dir.join("database.db");
         let conn =
             Connection::open(&db_path).context("failed to open database")?;
+        apply_schema(&conn)?;
+        Ok(Self { conn })
+    }
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;",
-        )?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS watched_projects (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                root_path  TEXT    NOT NULL UNIQUE,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS file_events (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id    INTEGER NOT NULL,
-                timestamp     INTEGER NOT NULL,
-                path          TEXT    NOT NULL,
-                event_type    TEXT    NOT NULL,
-                current_hash  TEXT,
-                previous_hash TEXT,
-                snapshot_path TEXT,
-                old_path      TEXT,
-                file_size     INTEGER,
-                FOREIGN KEY (project_id) REFERENCES watched_projects(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS file_state (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id  INTEGER NOT NULL,
-                path        TEXT    NOT NULL,
-                latest_hash TEXT,
-                last_seen_at INTEGER NOT NULL,
-                exists_now  INTEGER NOT NULL DEFAULT 1,
-                FOREIGN KEY (project_id) REFERENCES watched_projects(id),
-                UNIQUE(project_id, path)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_events_project_time
-                ON file_events(project_id, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_events_path
-                ON file_events(project_id, path, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_state_project_path
-                ON file_state(project_id, path);",
-        )?;
-
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()
+            .context("failed to open in-memory database")?;
+        apply_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -372,4 +382,125 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<FileEvent> {
         old_path: row.get(8)?,
         file_size: row.get(9)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    fn db() -> Database {
+        Database::open_in_memory().expect("in-memory DB")
+    }
+
+    fn project(db: &Database) -> crate::models::WatchedProject {
+        db.get_or_create_project(Path::new("/home/user/project"))
+            .expect("create project")
+    }
+
+    // ── watched_projects ─────────────────────────────────────────────
+
+    #[test]
+    fn create_project_stores_root_path() {
+        let db = db();
+        let p = project(&db);
+        assert_eq!(p.root_path, "/home/user/project");
+    }
+
+    #[test]
+    fn create_project_is_idempotent() {
+        let db = db();
+        let p1 = project(&db);
+        let p2 = project(&db);
+        assert_eq!(p1.id, p2.id);
+    }
+
+    #[test]
+    fn find_project_exact_match() {
+        let db = db();
+        let created = project(&db);
+        let found = db
+            .find_project_for_path(Path::new("/home/user/project"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, created.id);
+    }
+
+    #[test]
+    fn find_project_subdirectory_match() {
+        let db = db();
+        let created = project(&db);
+        let found = db
+            .find_project_for_path(Path::new("/home/user/project/src/main.rs"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, created.id);
+    }
+
+    #[test]
+    fn find_project_returns_none_for_unrelated_path() {
+        let db = db();
+        project(&db);
+        let result = db
+            .find_project_for_path(Path::new("/other/entirely/different"))
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_project_no_false_positive_for_shared_string_prefix() {
+        // "/home/user/project-evil" shares the string prefix "/home/user/project"
+        // but is NOT a subdirectory of it — must not match.
+        let db = db();
+        project(&db);
+        let result = db
+            .find_project_for_path(Path::new("/home/user/project-evil"))
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_project_returns_most_specific_nested_match() {
+        let db = db();
+        let parent = db
+            .get_or_create_project(Path::new("/a/b"))
+            .unwrap();
+        let child = db
+            .get_or_create_project(Path::new("/a/b/c"))
+            .unwrap();
+        let found = db
+            .find_project_for_path(Path::new("/a/b/c/src/main.rs"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, child.id);
+        assert_ne!(found.id, parent.id);
+    }
+
+    // ── file_events ──────────────────────────────────────────────────
+
+    #[test]
+    fn insert_events_and_count() {
+        let db = db();
+        let p = project(&db);
+        db.insert_event(p.id, "/home/user/project/a.rs", "CREATED",
+            Some("aaa"), None, None, None, Some(10)).unwrap();
+        db.insert_event(p.id, "/home/user/project/b.rs", "MODIFIED",
+            Some("bbb"), Some("bbb0"), None, None, Some(20)).unwrap();
+        assert_eq!(db.count_events(p.id).unwrap(), 2);
+    }
+
+    // ── file_state ───────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_and_retrieve_file_state() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/main.rs";
+        db.upsert_file_state(p.id, path, "deadbeef", true).unwrap();
+        let state = db.get_file_state(p.id, path).unwrap().unwrap();
+        assert_eq!(state.latest_hash, Some("deadbeef".to_string()));
+        assert!(state.exists_now);
+    }
 }

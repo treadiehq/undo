@@ -27,3 +27,38 @@ pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOT: &str = "/home/user/project";
+
+    fn root() -> &'static Path {
+        Path::new(ROOT)
+    }
+
+    #[test]
+    fn git_directory_is_ignored() {
+        let path = Path::new("/home/user/project/.git/config");
+        assert!(should_ignore(path, root()));
+    }
+
+    #[test]
+    fn node_modules_is_ignored() {
+        let path = Path::new("/home/user/project/node_modules/lodash/index.js");
+        assert!(should_ignore(path, root()));
+    }
+
+    #[test]
+    fn target_directory_is_ignored() {
+        let path = Path::new("/home/user/project/target/debug/undo");
+        assert!(should_ignore(path, root()));
+    }
+
+    #[test]
+    fn regular_source_file_is_not_ignored() {
+        let path = Path::new("/home/user/project/src/main.rs");
+        assert!(!should_ignore(path, root()));
+    }
+}

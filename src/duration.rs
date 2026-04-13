@@ -37,3 +37,38 @@ pub fn format_elapsed(seconds: i64) -> String {
         format!("{} day(s) ago", seconds / 86400)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_seconds() {
+        assert_eq!(parse_duration("30s").unwrap(), 30);
+    }
+
+    #[test]
+    fn parse_minutes() {
+        assert_eq!(parse_duration("5m").unwrap(), 300);
+    }
+
+    #[test]
+    fn parse_hours() {
+        assert_eq!(parse_duration("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn parse_days() {
+        assert_eq!(parse_duration("1d").unwrap(), 86400);
+    }
+
+    #[test]
+    fn parse_unknown_unit_is_error() {
+        assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn parse_zero_is_rejected() {
+        assert!(parse_duration("0m").is_err());
+    }
+}
