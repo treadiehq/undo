@@ -1,8 +1,8 @@
 [package]
 name = "undo"
 version = "0.1.8"
-edition = "2021"
-description = "Filesystem history for your working directory"
+edition = "2024"
+description = "Ctrl+Z for your filesystem"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
