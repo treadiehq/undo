@@ -98,7 +98,10 @@ impl Database {
         path: &Path,
     ) -> Result<Option<WatchedProject>> {
         let path_str = path.to_string_lossy().to_string();
-        // Push filtering into SQL and pick the longest (most specific) match.
+        // ORDER BY LENGTH DESC ensures the most specific (longest) root_path
+        // wins when multiple watched projects are nested inside one another —
+        // e.g. watching both /a/b and /a/b/c and querying from /a/b/c/src
+        // should resolve to /a/b/c, not /a/b.
         // SUBSTR prefix check is used instead of LIKE to avoid case-folding on
         // case-sensitive filesystems.
         self.conn
