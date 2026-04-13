@@ -1,7 +1,5 @@
 use anyhow::Result;
 use chrono::Utc;
-use std::path::PathBuf;
-
 use crate::db::Database;
 use crate::duration;
 use crate::snapshots;
@@ -52,17 +50,18 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
 
     let content = snapshots::load(project.id, hash)?;
 
-    // Safety backup before overwriting
+    // Safety backup before overwriting.
+    // Stored in ~/.undo/backups/ rather than /tmp so it survives a reboot —
+    // /tmp is cleared on restart, which would defeat the purpose of the backup.
     if abs_path.exists() {
         let filename = abs_path
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
         let ts = Utc::now().timestamp();
-        let backup_path = PathBuf::from(format!(
-            "/tmp/undo-restore-{}-{}.bak",
-            filename, ts
-        ));
+        let backups_dir = crate::backtrack_dir()?.join("backups");
+        std::fs::create_dir_all(&backups_dir)?;
+        let backup_path = backups_dir.join(format!("{}_{}.bak", filename, ts));
         std::fs::copy(&abs_path, &backup_path)?;
         println!("Backup of current file saved to {}", backup_path.display());
     }

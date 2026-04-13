@@ -30,10 +30,23 @@ pub fn snapshot_path(project_id: i64, hash: &str) -> Result<PathBuf> {
 pub fn save(project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
     let path = snapshot_path(project_id, hash)?;
     if !path.exists() {
-        let file = fs::File::create(&path)?;
-        let mut encoder = GzEncoder::new(file, Compression::fast());
-        encoder.write_all(content)?;
-        encoder.finish()?;
+        // Write to a temp file then rename atomically. POSIX guarantees rename
+        // is atomic on the same filesystem, so a crash mid-write can never
+        // leave a partial file at the final path that would be mistaken for a
+        // valid snapshot on the next run.
+        let tmp = path.with_extension("gz.tmp");
+        let write_result = (|| -> Result<()> {
+            let file = fs::File::create(&tmp)?;
+            let mut encoder = GzEncoder::new(file, Compression::fast());
+            encoder.write_all(content)?;
+            encoder.finish()?;
+            fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp); // clean up any partial temp file
+        }
+        write_result?;
     }
     Ok(path.to_string_lossy().to_string())
 }

@@ -219,15 +219,20 @@ pub fn watch_directory(
                 if let Err(e) =
                     process_event(db, project, root, event, &mut debouncer, verbose)
                 {
-                    if verbose {
-                        eprintln!("Error processing event: {}", e);
-                    }
+                    // Always surface errors — a silent failure means the user
+                    // believes changes are being recorded when they aren't.
+                    eprintln!(
+                        "{}warning:{} failed to record event: {}",
+                        crate::YELLOW, crate::RESET, e
+                    );
                 }
             }
             Ok(Err(e)) => {
-                if verbose {
-                    eprintln!("Watch error: {}", e);
-                }
+                // Always surface watcher errors too.
+                eprintln!(
+                    "{}warning:{} file watcher error: {}",
+                    crate::YELLOW, crate::RESET, e
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
