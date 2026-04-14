@@ -126,4 +126,19 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("snapshot not found"), "got: {}", msg);
     }
+
+    #[test]
+    fn count_returns_correct_number_of_snapshots() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        assert_eq!(count(42).unwrap(), 0, "no snapshots yet");
+        save(42, "hash_a", b"content a").unwrap();
+        assert_eq!(count(42).unwrap(), 1);
+        save(42, "hash_b", b"content b").unwrap();
+        assert_eq!(count(42).unwrap(), 2);
+        // Saving the same hash again must not increase the count (deduplication).
+        save(42, "hash_a", b"content a").unwrap();
+        assert_eq!(count(42).unwrap(), 2);
+    }
 }

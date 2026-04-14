@@ -164,6 +164,38 @@ mod tests {
             "/other/file.rs"
         );
     }
+
+    #[test]
+    fn safe_resolve_path_rejects_traversal_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        // "../../etc/passwd" should escape the project root.
+        let result = safe_resolve_path(dir.path(), "../../etc/passwd", root);
+        assert!(result.is_err(), "path traversal must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("outside the project root"), "got: {}", msg);
+    }
+
+    #[test]
+    fn safe_resolve_path_allows_valid_subpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        // A simple nested path that stays within the root must succeed.
+        let result = safe_resolve_path(dir.path(), "src/main.rs", root);
+        assert!(result.is_ok(), "valid subpath must be accepted");
+        let resolved = result.unwrap();
+        assert!(resolved.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn event_color_maps_all_known_types() {
+        assert_eq!(event_color("MODIFIED"), YELLOW);
+        assert_eq!(event_color("CREATED"), GREEN);
+        assert_eq!(event_color("DELETED"), RED);
+        assert_eq!(event_color("RENAMED"), BLUE);
+        // Unknown types should return an empty string (no color).
+        assert_eq!(event_color("UNKNOWN"), "");
+    }
 }
 
 // ── entry point ─────────────────────────────────────────────────────

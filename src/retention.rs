@@ -300,4 +300,17 @@ mod tests {
     fn format_size_gigabytes() {
         assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
+
+    #[test]
+    fn undorc_overrides_both_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".undorc"),
+            "retention_days = 14\nmax_size_mb = 512\n",
+        )
+        .unwrap();
+        let cfg = load_config(Some(dir.path()));
+        assert_eq!(cfg.retention_days, 14);
+        assert_eq!(cfg.max_size_mb, 512);
+    }
 }

@@ -708,4 +708,51 @@ mod tests {
         std::fs::write(&file, "data").unwrap();
         assert!(!root_is_accessible(&file));
     }
+
+    #[test]
+    fn compute_hash_is_stable_and_input_sensitive() {
+        let h1 = compute_hash(b"hello world");
+        let h2 = compute_hash(b"hello world");
+        let h3 = compute_hash(b"hello WORLD");
+        assert_eq!(h1, h2, "same input must produce same hash");
+        assert_ne!(h1, h3, "different input must produce different hash");
+        // SHA-256 hex output is always 64 lowercase hex chars.
+        assert_eq!(h1.len(), 64);
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn debouncer_suppresses_rapid_duplicate_path() {
+        let mut d = Debouncer::new();
+        let path = Path::new("/tmp/test_file.txt");
+        // First call should always pass through.
+        assert!(d.should_process(path));
+        // Immediate second call is within the debounce window — must be suppressed.
+        assert!(!d.should_process(path));
+    }
+
+    #[test]
+    fn initial_scan_records_deletion_for_missing_file() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+
+        // Seed the DB with a file that no longer exists on disk.
+        let phantom_path = dir.path().join("phantom.rs").to_string_lossy().to_string();
+        db.upsert_file_state(project.id, &phantom_path, "deadbeef", true).unwrap();
+
+        // Run the scan on the empty directory — phantom.rs is missing.
+        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX).unwrap();
+
+        // The file's state must now be marked deleted.
+        let state = db.get_file_state(project.id, &phantom_path).unwrap().unwrap();
+        assert!(!state.exists_now);
+
+        // A DELETED event must have been recorded.
+        let event = db.get_latest_event(project.id, &phantom_path).unwrap().unwrap();
+        assert_eq!(event.event_type, "DELETED");
+    }
 }

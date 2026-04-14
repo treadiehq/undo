@@ -647,4 +647,50 @@ mod tests {
         assert!(ids.contains(&p1.id));
         assert!(ids.contains(&p2.id));
     }
+
+    #[test]
+    fn get_latest_event_returns_most_recent() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/foo.rs";
+        // Insert two events for the same path via insert_event_at so we control ordering.
+        let now = chrono::Utc::now().timestamp();
+        db.insert_event_at(p.id, path, "CREATED", now - 100).unwrap();
+        db.insert_event_at(p.id, path, "MODIFIED", now - 10).unwrap();
+        let event = db.get_latest_event(p.id, path).unwrap().unwrap();
+        assert_eq!(event.event_type, "MODIFIED");
+    }
+
+    #[test]
+    fn get_event_at_time_excludes_deleted_and_respects_cutoff() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/bar.rs";
+        let now = chrono::Utc::now().timestamp();
+        // Seed: CREATED long ago, MODIFIED in the middle, DELETED recently.
+        db.insert_event_at(p.id, path, "CREATED", now - 300).unwrap();
+        db.insert_event_at(p.id, path, "MODIFIED", now - 200).unwrap();
+        db.insert_event_at(p.id, path, "DELETED", now - 100).unwrap();
+
+        // Querying at now-150 should return MODIFIED (newest non-DELETE at or before that point).
+        let event = db.get_event_at_time(p.id, path, now - 150).unwrap().unwrap();
+        assert_eq!(event.event_type, "MODIFIED");
+
+        // Querying before any event returns None.
+        let none = db.get_event_at_time(p.id, path, now - 1000).unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn mark_deleted_sets_exists_now_false() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/gone.rs";
+        db.upsert_file_state(p.id, path, "abc123", true).unwrap();
+        // Confirm it's alive before we delete it.
+        assert!(db.get_file_state(p.id, path).unwrap().unwrap().exists_now);
+        db.mark_deleted(p.id, path).unwrap();
+        let state = db.get_file_state(p.id, path).unwrap().unwrap();
+        assert!(!state.exists_now);
+    }
 }
