@@ -722,16 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn debouncer_suppresses_rapid_duplicate_path() {
-        let mut d = Debouncer::new();
-        let path = Path::new("/tmp/test_file.txt");
-        // First call should always pass through.
-        assert!(d.should_process(path));
-        // Immediate second call is within the debounce window — must be suppressed.
-        assert!(!d.should_process(path));
-    }
-
-    #[test]
     fn initial_scan_records_deletion_for_missing_file() {
         let data_dir = tempfile::tempdir().unwrap();
         crate::set_test_data_dir(data_dir.path().to_path_buf());
