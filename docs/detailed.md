@@ -300,7 +300,7 @@ tmp/
 *.sqlite
 ```
 
-If a `.gitignore` file exists, undo respects it too. `.undoignore` patterns take precedence.
+If a root `.gitignore` file exists, undo respects it too. `.undoignore` patterns take precedence. Note: only the root `.gitignore` is loaded; nested `.gitignore` files in subdirectories are not currently supported. If you need to exclude files matched by nested gitignores, add those patterns to your root `.undoignore`.
 
 ### Overriding the defaults
 

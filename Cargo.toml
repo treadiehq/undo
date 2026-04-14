@@ -1,6 +1,6 @@
 [package]
 name = "undo"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "Ctrl+Z for your filesystem"
 

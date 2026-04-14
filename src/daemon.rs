@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -81,7 +82,8 @@ fn check_directory_ownership(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Return all (pid, root_path) pairs from live PID files.
+/// Return all (pid, root_path) pairs from PID files whose daemons
+/// are genuinely alive (verified via flock, not just PID existence).
 fn active_daemons(bt_dir: &Path) -> Vec<(u32, PathBuf)> {
     let pids_dir = bt_dir.join("pids");
     let Ok(entries) = std::fs::read_dir(&pids_dir) else {
@@ -91,15 +93,14 @@ fn active_daemons(bt_dir: &Path) -> Vec<(u32, PathBuf)> {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pid"))
         .filter_map(|e| {
+            if !is_daemon_alive(&e.path()) {
+                return None;
+            }
             let contents = std::fs::read_to_string(e.path()).ok()?;
             let mut lines = contents.lines();
             let pid: u32 = lines.next()?.parse().ok()?;
             let root = PathBuf::from(lines.next()?);
-            if is_pid_running(pid) {
-                Some((pid, root))
-            } else {
-                None
-            }
+            Some((pid, root))
         })
         .collect()
 }
@@ -150,19 +151,34 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
 
     let pid_path = pid_file_for_root(&bt_dir, &cwd);
 
-    // Refuse to start if daemon is already running for this project.
-    if pid_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&pid_path) {
-            if let Some(pid) = contents.lines().next().and_then(|s| s.parse::<u32>().ok()) {
-                if is_pid_running(pid) {
-                    let project = contents.lines().nth(1).unwrap_or("unknown");
-                    println!("undo is already running (PID {}).", pid);
-                    println!("Watching: {}", project);
-                    return Ok(());
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&pid_path);
+    // Open (or create) the PID file, then try an exclusive flock.
+    // If we can't acquire the lock, a live daemon already holds it.
+    let mut pid_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&pid_path)?;
+
+    if !try_lock_exclusive(&pid_file) {
+        use std::io::Read;
+        let mut contents = String::new();
+        pid_file.read_to_string(&mut contents)?;
+        let pid = contents.lines().next().unwrap_or("?");
+        let project = contents.lines().nth(1).unwrap_or("unknown");
+        println!("undo is already running (PID {}).", pid);
+        println!("Watching: {}", project);
+        return Ok(());
+    }
+
+    // Lock acquired — write our PID.
+    {
+        use std::io::Write;
+        pid_file.set_len(0)?;
+        write!(pid_file, "{}\n{}", std::process::id(), cwd.display())?;
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
     }
 
     if !force {
@@ -171,14 +187,6 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
 
     let db = Database::open()?;
     let project = db.get_or_create_project(&cwd)?;
-
-    // Write PID file: line 1 = pid, line 2 = project root
-    let pid = std::process::id();
-    std::fs::write(&pid_path, format!("{}\n{}", pid, cwd.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
-    }
 
     // Catch SIGINT / SIGTERM so we clean up the PID file.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -208,9 +216,11 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         _ => {}
     }
 
+    // pid_file (and its lock) stays alive for the duration of the watch loop.
     watcher::watch_directory(&db, &project, &cwd, shutdown, verbose)?;
 
     let _ = std::fs::remove_file(&pid_path);
+    drop(pid_file);
     eprintln!("\nundo stopped.");
 
     Ok(())
@@ -245,19 +255,25 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid PID file"))?;
 
-    if !is_pid_running(pid) {
+    if !is_daemon_alive(pid_path) {
         println!("Daemon is not running (stale PID file). Cleaning up.");
         std::fs::remove_file(pid_path)?;
         return Ok(());
     }
 
+    // Lock is held by a live undo daemon — safe to signal this PID.
     std::process::Command::new("kill")
         .arg(pid.to_string())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()?;
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    for _ in 0..60 {
+        if !is_daemon_alive(pid_path) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let _ = std::fs::remove_file(pid_path);
 
     let project = contents.lines().nth(1).unwrap_or("unknown");
@@ -304,13 +320,9 @@ pub fn cmd_status() -> Result<()> {
             let project_root = Path::new(&project.root_path);
             let pid_path = pid_file_for_root(&bt_dir, project_root);
             let daemon_status = if pid_path.exists() {
-                let contents = std::fs::read_to_string(&pid_path).unwrap_or_default();
-                let pid: u32 = contents
-                    .lines()
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                if pid > 0 && is_pid_running(pid) {
+                if is_daemon_alive(&pid_path) {
+                    let contents = std::fs::read_to_string(&pid_path).unwrap_or_default();
+                    let pid = contents.lines().next().unwrap_or("?");
                     format!("{}running{} (PID {})", GREEN, RESET, pid)
                 } else {
                     format!("{}not running{} (stale PID)", YELLOW, RESET)
@@ -364,14 +376,21 @@ pub fn cmd_status() -> Result<()> {
     Ok(())
 }
 
-fn is_pid_running(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Try to acquire an exclusive, non-blocking flock on an open file.
+/// Returns true if the lock was acquired (caller now holds it until the
+/// file is dropped), false if another process already holds it.
+fn try_lock_exclusive(file: &std::fs::File) -> bool {
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Probe whether a daemon is alive by trying to lock its PID file.
+/// If we can acquire the lock the daemon is dead; the lock is released
+/// when the probing File handle is dropped.
+fn is_daemon_alive(pid_path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(pid_path) else {
+        return false;
+    };
+    !try_lock_exclusive(&file)
 }
 
 #[cfg(test)]
@@ -455,10 +474,21 @@ mod tests {
 
     // ── overlap detection ───────────────────────────────────────────
 
-    fn write_live_pid_file(bt_dir: &Path, root: &str) {
-        let pid = std::process::id(); // current process, so is_pid_running returns true
+    /// Create a PID file and hold an exclusive flock on it so
+    /// `is_daemon_alive` returns true. Caller must keep the returned
+    /// File alive for the duration of the test.
+    fn write_live_pid_file(bt_dir: &Path, root: &str) -> std::fs::File {
         let path = pid_file_for_root(bt_dir, Path::new(root));
-        std::fs::write(&path, format!("{}\n{}", pid, root)).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(try_lock_exclusive(&file), "failed to lock test PID file");
+        use std::io::Write;
+        write!(&file, "{}\n{}", std::process::id(), root).unwrap();
+        file
     }
 
     #[test]
@@ -466,7 +496,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
-        write_live_pid_file(bt, "/foo");
+        let _lock = write_live_pid_file(bt, "/foo");
 
         let err = check_no_overlap(bt, Path::new("/foo/bar")).unwrap_err();
         assert!(err.to_string().contains("overlaps"), "{}", err);
@@ -477,7 +507,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
-        write_live_pid_file(bt, "/foo/bar");
+        let _lock = write_live_pid_file(bt, "/foo/bar");
 
         let err = check_no_overlap(bt, Path::new("/foo")).unwrap_err();
         assert!(err.to_string().contains("overlaps"), "{}", err);
@@ -488,7 +518,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
-        write_live_pid_file(bt, "/foo/bar");
+        let _lock = write_live_pid_file(bt, "/foo/bar");
 
         let err = check_no_overlap(bt, Path::new("/foo/bar")).unwrap_err();
         assert!(err.to_string().contains("overlaps"), "{}", err);
@@ -499,7 +529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
-        write_live_pid_file(bt, "/foo/bar");
+        let _lock = write_live_pid_file(bt, "/foo/bar");
 
         assert!(check_no_overlap(bt, Path::new("/foo/baz")).is_ok());
     }
@@ -509,7 +539,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
-        write_live_pid_file(bt, "/foo/bar");
+        let _lock = write_live_pid_file(bt, "/foo/bar");
 
         // "/foo/bar-extra" shares the string prefix but is not a subdirectory
         assert!(check_no_overlap(bt, Path::new("/foo/bar-extra")).is_ok());
@@ -522,5 +552,27 @@ mod tests {
         std::fs::create_dir_all(bt.join("pids")).unwrap();
 
         assert!(check_no_overlap(bt, Path::new("/any/path")).is_ok());
+    }
+
+    #[test]
+    fn stale_pid_file_detected_without_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        let path = pid_file_for_root(bt, Path::new("/some/project"));
+        std::fs::write(&path, "99999\n/some/project").unwrap();
+
+        assert!(!is_daemon_alive(&path), "unlocked PID file should be stale");
+    }
+
+    #[test]
+    fn locked_pid_file_detected_as_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        let _lock = write_live_pid_file(bt, "/some/project");
+
+        let path = pid_file_for_root(bt, Path::new("/some/project"));
+        assert!(is_daemon_alive(&path), "locked PID file should be alive");
     }
 }

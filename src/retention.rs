@@ -153,13 +153,14 @@ pub fn prune(
         }
     }
 
-    // 4. Size backstop: if still over max_size_mb, prune oldest snapshots
+    // 4. Size backstop: if still over max_size_mb, prune oldest unreferenced snapshots
     if !dry_run {
         let max_bytes = config.max_size_mb * 1024 * 1024;
         let mut current = total_disk_usage()?;
         if current > max_bytes {
             let all_projects = db.get_all_project_ids()?;
             'outer: for pid in &all_projects {
+                let pid_live_hashes = db.get_live_hashes(*pid)?;
                 let sdir = bt_dir.join("snapshots").join(pid.to_string());
                 if !sdir.exists() {
                     continue;
@@ -179,12 +180,32 @@ pub fn prune(
                     if current <= max_bytes {
                         break 'outer;
                     }
+                    let hash = entry
+                        .path()
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if pid_live_hashes.contains(hash.as_str()) {
+                        continue;
+                    }
                     let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                     let _ = std::fs::remove_file(entry.path());
                     current = current.saturating_sub(size);
                     stats.snapshots_deleted += 1;
                     stats.bytes_freed += size;
                 }
+            }
+            if current > max_bytes {
+                eprintln!(
+                    "{}warning:{} disk usage ({}) still exceeds cap ({}) — \
+                     remaining snapshots are referenced by live events. \
+                     Consider increasing max_size_mb in .undorc or ~/.undo/config.toml.",
+                    crate::YELLOW,
+                    crate::RESET,
+                    format_size(current),
+                    format_size(max_bytes),
+                );
             }
         }
     }

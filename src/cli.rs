@@ -1,5 +1,13 @@
 use clap::{Parser, Subcommand};
 
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|e| format!("{e}"))?;
+    if n == 0 {
+        return Err("limit must be at least 1".to_string());
+    }
+    Ok(n)
+}
+
 #[derive(Parser)]
 #[command(
     name = "undo",
@@ -26,8 +34,8 @@ pub enum Command {
 
     /// Show recent file activity
     Timeline {
-        /// Maximum number of events to show
-        #[arg(long, default_value = "20")]
+        /// Maximum number of events to show (minimum 1)
+        #[arg(long, default_value = "20", value_parser = parse_positive_usize)]
         limit: usize,
     },
 

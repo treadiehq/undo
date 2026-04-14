@@ -384,7 +384,11 @@ fn process_event(
             if event.paths.len() >= 2 {
                 let old = &event.paths[0];
                 let new = &event.paths[1];
-                if !should_ignore(new, root) && debouncer.should_process(new) {
+                if should_ignore(new, root) {
+                    if !should_ignore(old, root) && debouncer.should_process(old) {
+                        handle_delete(db, project, old, verbose)?;
+                    }
+                } else if debouncer.should_process(new) {
                     handle_rename(db, project, old, new, verbose)?;
                 }
             } else {
@@ -599,7 +603,7 @@ fn handle_rename(
 
     let prev_hash = db
         .get_file_state(project.id, &old_str)?
-        .and_then(|s| s.latest_hash);
+        .and_then(|s| if s.exists_now { s.latest_hash } else { None });
 
     let snap = Some(snapshots::save(project.id, &hash, &content)?);
 
