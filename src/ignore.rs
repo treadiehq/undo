@@ -1,5 +1,6 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
+#[cfg(not(test))]
 use std::sync::OnceLock;
 
 const IGNORED_NAMES: &[&str] = &[
@@ -61,31 +62,73 @@ fn build_custom_ignore(project_root: &Path) -> Gitignore {
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-/// Thread-local cache for the compiled ignore matcher.
-/// Rebuilt once per project root (the root is fixed for the daemon's lifetime).
+// ── custom ignore: production ────────────────────────────────────────
+//
+// In production the matcher is initialised once per process and reused for
+// the daemon's lifetime (the watched root never changes while running).
+
+#[cfg(not(test))]
 static CUSTOM_IGNORE: OnceLock<Gitignore> = OnceLock::new();
 
-/// Initialise the custom ignore matcher for this project.
-/// Must be called once before `should_ignore` is used.
+#[cfg(not(test))]
 pub fn init(project_root: &Path) {
     CUSTOM_IGNORE.get_or_init(|| build_custom_ignore(project_root));
 }
 
+// ── custom ignore: test ──────────────────────────────────────────────
+//
+// In tests the matcher is stored per-thread so that each test can call
+// `ignore::init()` with its own project root without poisoning the matcher
+// seen by other tests running in parallel on different threads.
+// OnceLock cannot be reset, so a thread-local RefCell is used instead.
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_IGNORE: std::cell::RefCell<Option<Gitignore>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub fn init(project_root: &Path) {
+    THREAD_IGNORE.with(|gi| *gi.borrow_mut() = Some(build_custom_ignore(project_root)));
+}
+
+// ── shared helper ────────────────────────────────────────────────────
+
+/// Apply a compiled Gitignore matcher to a path. Returns Some(true/false) if
+/// the matcher has an opinion, or None to fall through to the builtin list.
+fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path) -> Option<bool> {
+    let rel = path.strip_prefix(project_root).unwrap_or(path);
+    let m = gi.matched(rel, path.is_dir());
+    if m.is_whitelist() {
+        Some(false) // negation pattern explicitly includes this path
+    } else if m.is_ignore() {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Returns true if the path should be excluded from watching.
 /// Negation patterns in `.undoignore` (e.g. `!build/`) override the builtin list.
+#[cfg(not(test))]
 pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
     if let Some(gi) = CUSTOM_IGNORE.get() {
-        let rel = path.strip_prefix(project_root).unwrap_or(path);
-        let is_dir = path.is_dir();
-        let m = gi.matched(rel, is_dir);
-        if m.is_whitelist() {
-            return false; // negation pattern explicitly includes this path
-        }
-        if m.is_ignore() {
-            return true;
+        if let Some(result) = apply_matcher(gi, path, project_root) {
+            return result;
         }
     }
+    matches_builtin(path, project_root)
+}
 
+#[cfg(test)]
+pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
+    let result = THREAD_IGNORE.with(|gi| {
+        gi.borrow().as_ref().and_then(|g| apply_matcher(g, path, project_root))
+    });
+    if let Some(r) = result {
+        return r;
+    }
     matches_builtin(path, project_root)
 }
 
