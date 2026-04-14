@@ -235,4 +235,45 @@ mod tests {
             "!.env in .undoignore should whitelist .env files"
         );
     }
+
+    /// Prove that init() is isolated per thread — two threads with conflicting
+    /// ignore rules must not see each other's matchers.
+    ///
+    /// This test explicitly spawns two threads rather than relying on separate
+    /// #[test] functions being scheduled on different threads. That makes the
+    /// isolation guarantee deterministic and independent of test-runner behaviour.
+    ///
+    /// If isolation were broken (e.g. a process-wide OnceLock), one thread
+    /// would inherit the other's matcher and at least one assertion would fail.
+    #[test]
+    fn init_is_isolated_per_thread() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        // Thread A's project ignores *.foo; thread B's project ignores *.bar.
+        std::fs::write(dir_a.path().join(".undoignore"), "*.foo\n").unwrap();
+        std::fs::write(dir_b.path().join(".undoignore"), "*.bar\n").unwrap();
+
+        let root_a = dir_a.path().to_path_buf();
+        let root_b = dir_b.path().to_path_buf();
+
+        let handle_a = std::thread::spawn(move || {
+            init(&root_a);
+            let foo = root_a.join("test.foo");
+            let bar = root_a.join("test.bar");
+            assert!(should_ignore(&foo, &root_a), "thread A: *.foo should be ignored");
+            assert!(!should_ignore(&bar, &root_a), "thread A: *.bar should not be ignored");
+        });
+
+        let handle_b = std::thread::spawn(move || {
+            init(&root_b);
+            let foo = root_b.join("test.foo");
+            let bar = root_b.join("test.bar");
+            assert!(!should_ignore(&foo, &root_b), "thread B: *.foo should not be ignored");
+            assert!(should_ignore(&bar, &root_b), "thread B: *.bar should be ignored");
+        });
+
+        handle_a.join().expect("thread A panicked — matchers bled across threads");
+        handle_b.join().expect("thread B panicked — matchers bled across threads");
+    }
 }
