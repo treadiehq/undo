@@ -1,7 +1,5 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
-#[cfg(not(test))]
-use std::sync::OnceLock;
 
 const IGNORED_NAMES: &[&str] = &[
     ".git",
@@ -62,25 +60,23 @@ fn build_custom_ignore(project_root: &Path) -> Gitignore {
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
-// ── custom ignore: production ────────────────────────────────────────
+// ── matcher storage: production ──────────────────────────────────────
 //
-// In production the matcher is initialised once per process and reused for
-// the daemon's lifetime (the watched root never changes while running).
+// In production the matcher is initialised once per process via OnceLock
+// and reused for the daemon's lifetime.
 
 #[cfg(not(test))]
-static CUSTOM_IGNORE: OnceLock<Gitignore> = OnceLock::new();
+static CUSTOM_IGNORE: std::sync::OnceLock<Gitignore> = std::sync::OnceLock::new();
 
 #[cfg(not(test))]
 pub fn init(project_root: &Path) {
     CUSTOM_IGNORE.get_or_init(|| build_custom_ignore(project_root));
 }
 
-// ── custom ignore: test ──────────────────────────────────────────────
+// ── matcher storage: test ───────────────────────────────────────────
 //
-// In tests the matcher is stored per-thread so that each test can call
-// `ignore::init()` with its own project root without poisoning the matcher
-// seen by other tests running in parallel on different threads.
-// OnceLock cannot be reset, so a thread-local RefCell is used instead.
+// In tests the matcher is stored per-thread so each test can call
+// init() with its own project root without poisoning other threads.
 
 #[cfg(test)]
 thread_local! {
@@ -93,15 +89,15 @@ pub fn init(project_root: &Path) {
     THREAD_IGNORE.with(|gi| *gi.borrow_mut() = Some(build_custom_ignore(project_root)));
 }
 
-// ── shared helper ────────────────────────────────────────────────────
+// ── ignore logic (single implementation, always under test) ─────────
 
-/// Apply a compiled Gitignore matcher to a path. Returns Some(true/false) if
-/// the matcher has an opinion, or None to fall through to the builtin list.
+/// Apply a compiled Gitignore matcher to a path. Returns `Some(true/false)`
+/// if the matcher has an opinion, or `None` to fall through to the builtin list.
 fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path) -> Option<bool> {
     let rel = path.strip_prefix(project_root).unwrap_or(path);
     let m = gi.matched(rel, path.is_dir());
     if m.is_whitelist() {
-        Some(false) // negation pattern explicitly includes this path
+        Some(false)
     } else if m.is_ignore() {
         Some(true)
     } else {
@@ -109,11 +105,11 @@ fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path) -> Option<boo
     }
 }
 
-/// Returns true if the path should be excluded from watching.
-/// Negation patterns in `.undoignore` (e.g. `!build/`) override the builtin list.
-#[cfg(not(test))]
-pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
-    if let Some(gi) = CUSTOM_IGNORE.get() {
+/// Core decision function shared by both production and test paths.
+/// Only the *storage* of the matcher differs; the branching logic here
+/// is always the same code that ships in the binary.
+fn should_ignore_with(gi: Option<&Gitignore>, path: &Path, project_root: &Path) -> bool {
+    if let Some(gi) = gi {
         if let Some(result) = apply_matcher(gi, path, project_root) {
             return result;
         }
@@ -121,15 +117,18 @@ pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
     matches_builtin(path, project_root)
 }
 
+/// Returns true if the path should be excluded from watching.
+/// Negation patterns in `.undoignore` (e.g. `!build/`) override the builtin list.
+#[cfg(not(test))]
+pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
+    should_ignore_with(CUSTOM_IGNORE.get(), path, project_root)
+}
+
 #[cfg(test)]
 pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
-    let result = THREAD_IGNORE.with(|gi| {
-        gi.borrow().as_ref().and_then(|g| apply_matcher(g, path, project_root))
-    });
-    if let Some(r) = result {
-        return r;
-    }
-    matches_builtin(path, project_root)
+    THREAD_IGNORE.with(|gi| {
+        should_ignore_with(gi.borrow().as_ref(), path, project_root)
+    })
 }
 
 #[cfg(test)]
