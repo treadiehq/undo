@@ -473,6 +473,7 @@ mod tests {
 
     // ── watched_projects ─────────────────────────────────────────────
 
+    /// Root path is persisted and returned correctly after project creation.
     #[test]
     fn create_project_stores_root_path() {
         let db = db();
@@ -480,6 +481,7 @@ mod tests {
         assert_eq!(p.root_path, "/home/user/project");
     }
 
+    /// Calling get_or_create twice for the same root must return the same project ID.
     #[test]
     fn create_project_is_idempotent() {
         let db = db();
@@ -488,6 +490,7 @@ mod tests {
         assert_eq!(p1.id, p2.id);
     }
 
+    /// An exact path match must find the project.
     #[test]
     fn find_project_exact_match() {
         let db = db();
@@ -499,6 +502,7 @@ mod tests {
         assert_eq!(found.id, created.id);
     }
 
+    /// A path inside the watched root must resolve to that project.
     #[test]
     fn find_project_subdirectory_match() {
         let db = db();
@@ -510,6 +514,7 @@ mod tests {
         assert_eq!(found.id, created.id);
     }
 
+    /// A path with no parent project must return None rather than a wrong match.
     #[test]
     fn find_project_returns_none_for_unrelated_path() {
         let db = db();
@@ -520,6 +525,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// A path that shares a string prefix but is not a subdirectory must not match.
     #[test]
     fn find_project_no_false_positive_for_shared_string_prefix() {
         // "/home/user/project-evil" shares the string prefix "/home/user/project"
@@ -532,6 +538,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// When two projects are nested, the deepest (most specific) match wins.
     #[test]
     fn find_project_returns_most_specific_nested_match() {
         let db = db();
@@ -551,6 +558,7 @@ mod tests {
 
     // ── file_events ──────────────────────────────────────────────────
 
+    /// Inserting events increments the count returned by count_events.
     #[test]
     fn insert_events_and_count() {
         let db = db();
@@ -564,6 +572,7 @@ mod tests {
 
     // ── file_state ───────────────────────────────────────────────────
 
+    /// File state written with upsert must be readable back with the correct hash and exists_now flag.
     #[test]
     fn upsert_and_retrieve_file_state() {
         let db = db();
@@ -593,6 +602,7 @@ mod tests {
         ).unwrap();
     }
 
+    /// Only events older than the cutoff timestamp are included in the count.
     #[test]
     fn count_events_before_counts_old_events() {
         let db = db();
@@ -603,6 +613,7 @@ mod tests {
         assert_eq!(db.count_events_before(p.id, cutoff).unwrap(), 1);
     }
 
+    /// Events older than the cutoff are deleted; newer events are kept.
     #[test]
     fn delete_events_before_removes_old_events() {
         let db = db();
@@ -615,6 +626,7 @@ mod tests {
         assert_eq!(db.count_events(p.id).unwrap(), 1);
     }
 
+    /// All hashes referenced by current events are returned as live.
     #[test]
     fn get_live_hashes_returns_referenced_hashes() {
         let db = db();
@@ -626,6 +638,7 @@ mod tests {
         assert_eq!(hashes.len(), 2);
     }
 
+    /// After pruning old events, their hashes are no longer live.
     #[test]
     fn get_live_hashes_after_prune_excludes_deleted() {
         let db = db();
@@ -638,6 +651,7 @@ mod tests {
         assert!(hashes.contains("hash_new"));
     }
 
+    /// All created project IDs appear in the returned list.
     #[test]
     fn get_all_project_ids_returns_existing_projects() {
         let db = db();
@@ -648,6 +662,7 @@ mod tests {
         assert!(ids.contains(&p2.id));
     }
 
+    /// Returns the most recently timestamped event for the given path.
     #[test]
     fn get_latest_event_returns_most_recent() {
         let db = db();
@@ -661,6 +676,8 @@ mod tests {
         assert_eq!(event.event_type, "MODIFIED");
     }
 
+    /// DELETED events are never returned as restorable; only non-delete events at or before the
+    /// given timestamp are considered.
     #[test]
     fn get_event_at_time_excludes_deleted_and_respects_cutoff() {
         let db = db();
@@ -681,6 +698,7 @@ mod tests {
         assert!(none.is_none());
     }
 
+    /// After mark_deleted the file's exists_now flag is false, signalling it is gone from disk.
     #[test]
     fn mark_deleted_sets_exists_now_false() {
         let db = db();

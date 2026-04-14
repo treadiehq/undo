@@ -397,6 +397,8 @@ fn is_daemon_alive(pid_path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// Watching /usr or similar root-owned paths would silently snapshot system files;
+    /// the ownership check must block it.
     #[test]
     fn rejects_root_owned_directory() {
         let err = check_directory_ownership(Path::new("/usr")).unwrap_err();
@@ -404,12 +406,14 @@ mod tests {
         assert!(msg.contains("owned by root") || msg.contains("system account"));
     }
 
+    /// The current user's home directory is always a valid watch target.
     #[test]
     fn accepts_user_owned_directory() {
         let home = dirs::home_dir().expect("home dir");
         assert!(check_directory_ownership(&home).is_ok());
     }
 
+    /// /etc is root-owned; verifies the ownership check fires for another system path.
     #[test]
     fn rejects_etc_directory() {
         let err = check_directory_ownership(Path::new("/etc")).unwrap_err();
@@ -421,12 +425,14 @@ mod tests {
         );
     }
 
+    /// Running undo as root is disallowed; verifies the check passes for a normal test process.
     #[test]
     fn check_not_root_passes_for_normal_user() {
         // Tests run as a normal user, so this should succeed.
         assert!(check_not_root().is_ok());
     }
 
+    /// Two different roots must map to distinct PID files so each daemon can be tracked independently.
     #[test]
     fn pid_files_are_unique_per_project() {
         let bt_dir = Path::new("/tmp/undo-test-pids");
@@ -435,6 +441,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// The same root must produce the same PID file path across multiple calls.
     #[test]
     fn pid_file_is_stable_for_same_root() {
         let bt_dir = Path::new("/tmp/undo-test-pids");
@@ -444,6 +451,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// The legacy single-file pid format must be migrated to the per-project layout on startup.
     #[test]
     fn migrate_old_pid_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -464,6 +472,7 @@ mod tests {
         assert!(contents.contains(root));
     }
 
+    /// Migration is safe to call when no legacy pid file exists.
     #[test]
     fn migrate_is_noop_when_no_old_pid() {
         let dir = tempfile::tempdir().unwrap();
@@ -491,6 +500,7 @@ mod tests {
         file
     }
 
+    /// Starting a watcher inside an already-watched tree would produce duplicate events.
     #[test]
     fn overlap_rejects_child_of_watched_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -502,6 +512,7 @@ mod tests {
         assert!(err.to_string().contains("overlaps"), "{}", err);
     }
 
+    /// Starting a watcher that contains an existing watched subtree would cause double-recording.
     #[test]
     fn overlap_rejects_parent_of_watched_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -513,6 +524,7 @@ mod tests {
         assert!(err.to_string().contains("overlaps"), "{}", err);
     }
 
+    /// Re-watching the exact same directory must be rejected.
     #[test]
     fn overlap_rejects_exact_same_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -524,6 +536,7 @@ mod tests {
         assert!(err.to_string().contains("overlaps"), "{}", err);
     }
 
+    /// Sibling directories have no overlap and must both be allowed.
     #[test]
     fn overlap_allows_sibling_directories() {
         let dir = tempfile::tempdir().unwrap();
@@ -534,6 +547,7 @@ mod tests {
         assert!(check_no_overlap(bt, Path::new("/foo/baz")).is_ok());
     }
 
+    /// A directory whose name starts with an existing root's name must not be falsely rejected.
     #[test]
     fn overlap_no_false_positive_for_shared_prefix() {
         let dir = tempfile::tempdir().unwrap();
@@ -545,6 +559,7 @@ mod tests {
         assert!(check_no_overlap(bt, Path::new("/foo/bar-extra")).is_ok());
     }
 
+    /// With no active daemons, any directory is a valid watch target.
     #[test]
     fn overlap_passes_when_no_daemons_running() {
         let dir = tempfile::tempdir().unwrap();
@@ -554,6 +569,7 @@ mod tests {
         assert!(check_no_overlap(bt, Path::new("/any/path")).is_ok());
     }
 
+    /// A PID file not held by any process (no flock) is stale and must be ignored.
     #[test]
     fn stale_pid_file_detected_without_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -565,6 +581,7 @@ mod tests {
         assert!(!is_daemon_alive(&path), "unlocked PID file should be stale");
     }
 
+    /// A PID file held by a live process (exclusive flock) must be reported as alive.
     #[test]
     fn locked_pid_file_detected_as_alive() {
         let dir = tempfile::tempdir().unwrap();

@@ -141,36 +141,42 @@ mod tests {
         Path::new(ROOT)
     }
 
+    /// .git directories must always be excluded from recording.
     #[test]
     fn git_directory_is_ignored() {
         let path = Path::new("/home/user/project/.git/config");
         assert!(should_ignore(path, root()));
     }
 
+    /// node_modules is a default-ignored vendor directory.
     #[test]
     fn node_modules_is_ignored() {
         let path = Path::new("/home/user/project/node_modules/lodash/index.js");
         assert!(should_ignore(path, root()));
     }
 
+    /// Rust build output in target/ must be excluded from recording.
     #[test]
     fn target_directory_is_ignored() {
         let path = Path::new("/home/user/project/target/debug/undo");
         assert!(should_ignore(path, root()));
     }
 
+    /// A normal source file under src/ must pass through the ignore filter.
     #[test]
     fn regular_source_file_is_not_ignored() {
         let path = Path::new("/home/user/project/src/main.rs");
         assert!(!should_ignore(path, root()));
     }
 
+    /// The .undo data directory must not watch itself to avoid infinite loops.
     #[test]
     fn undo_directory_is_ignored() {
         let path = Path::new("/home/user/project/.undo/database.db");
         assert!(should_ignore(path, root()));
     }
 
+    /// Glob patterns in .undoignore must cause matching paths to be ignored.
     #[test]
     fn undoignore_patterns_are_respected() {
         let dir = tempfile::tempdir().unwrap();
@@ -188,6 +194,7 @@ mod tests {
         assert!(!gi.matched("src/main.rs", false).is_ignore());
     }
 
+    /// .gitignore patterns are loaded and applied alongside .undoignore rules.
     #[test]
     fn gitignore_patterns_are_loaded() {
         let dir = tempfile::tempdir().unwrap();
@@ -200,6 +207,7 @@ mod tests {
         assert!(!gi.matched("main.rs", false).is_ignore());
     }
 
+    /// When no ignore files are present, no paths are incorrectly excluded.
     #[test]
     fn works_without_any_ignore_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -207,6 +215,7 @@ mod tests {
         assert!(!gi.matched("anything.rs", false).is_ignore());
     }
 
+    /// A ! pattern in .undoignore must override a built-in exclusion for directories.
     #[test]
     fn negation_pattern_whitelists_builtin_ignored_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -221,6 +230,7 @@ mod tests {
         );
     }
 
+    /// A ! pattern in .undoignore must override a built-in exclusion for individual files.
     #[test]
     fn negation_pattern_whitelists_builtin_ignored_file() {
         let dir = tempfile::tempdir().unwrap();

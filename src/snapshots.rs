@@ -92,6 +92,7 @@ pub fn count(project_id: i64) -> Result<usize> {
 mod tests {
     use super::*;
 
+    /// Content saved to a snapshot is recovered byte-for-byte on load.
     #[test]
     fn save_and_load_round_trip() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -103,6 +104,7 @@ mod tests {
         assert_eq!(loaded, content);
     }
 
+    /// Saving the same hash twice must not corrupt the snapshot or create duplicate files.
     #[test]
     fn save_is_idempotent_for_same_hash() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -116,6 +118,7 @@ mod tests {
         assert_eq!(loaded, content);
     }
 
+    /// Loading a hash with no backing file returns a clear error rather than panicking.
     #[test]
     fn load_nonexistent_hash_returns_error() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -127,6 +130,7 @@ mod tests {
         assert!(msg.contains("snapshot not found"), "got: {}", msg);
     }
 
+    /// count() reflects the number of distinct saved snapshots and is unaffected by deduplication.
     #[test]
     fn count_returns_correct_number_of_snapshots() {
         let data_dir = tempfile::tempdir().unwrap();

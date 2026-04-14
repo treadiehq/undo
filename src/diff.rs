@@ -117,16 +117,19 @@ fn print_unified_diff(old: &str, new: &str, path: &str) {
 mod tests {
     use super::*;
 
+    /// A NUL byte within the first 8 KiB marks content as binary.
     #[test]
     fn is_binary_detects_nul_byte() {
         assert!(is_binary(b"hello\x00world"));
     }
 
+    /// Ordinary source text with no NUL bytes is not binary.
     #[test]
     fn is_binary_returns_false_for_plain_text() {
         assert!(!is_binary(b"fn main() {\n    println!(\"hello\");\n}\n"));
     }
 
+    /// A NUL at position 8192 is outside the inspection window and must not trigger the binary flag.
     #[test]
     fn is_binary_ignores_nul_beyond_8192_bytes() {
         // A NUL at position 8192 (0-indexed) is outside the 8 KiB inspection

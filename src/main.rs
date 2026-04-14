@@ -149,6 +149,7 @@ fn event_color(event_type: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The project root and leading slash are stripped to yield a clean relative path.
     #[test]
     fn relative_path_strips_prefix_and_leading_slash() {
         assert_eq!(
@@ -157,6 +158,7 @@ mod tests {
         );
     }
 
+    /// A path outside the project root is returned unchanged.
     #[test]
     fn relative_path_returns_original_when_no_prefix_match() {
         assert_eq!(
@@ -165,6 +167,7 @@ mod tests {
         );
     }
 
+    /// ../ components that escape the project root must be blocked to prevent path traversal.
     #[test]
     fn safe_resolve_path_rejects_traversal_outside_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -176,6 +179,7 @@ mod tests {
         assert!(msg.contains("outside the project root"), "got: {}", msg);
     }
 
+    /// A well-formed subpath within the root is accepted and resolved correctly.
     #[test]
     fn safe_resolve_path_allows_valid_subpath() {
         let dir = tempfile::tempdir().unwrap();
@@ -187,6 +191,7 @@ mod tests {
         assert!(resolved.starts_with(dir.path()));
     }
 
+    /// Every event type maps to the expected ANSI colour; unknown types produce no colour code.
     #[test]
     fn event_color_maps_all_known_types() {
         assert_eq!(event_color("MODIFIED"), YELLOW);

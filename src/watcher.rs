@@ -637,6 +637,7 @@ mod tests {
     use super::*;
     use crate::db::Database;
 
+    /// A directory exceeding the file limit is rejected with a clear error unless --force is set.
     #[test]
     fn initial_scan_rejects_directory_over_file_limit() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -656,6 +657,7 @@ mod tests {
         assert!(msg.contains("too large to watch"), "got: {}", msg);
     }
 
+    /// A directory within the file limit is scanned without error.
     #[test]
     fn initial_scan_accepts_directory_under_file_limit() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -673,6 +675,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// --force overrides the file count limit so large repos can be watched explicitly.
     #[test]
     fn initial_scan_force_bypasses_file_limit() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -690,17 +693,20 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// An existing directory is reported as accessible.
     #[test]
     fn root_accessible_returns_true_for_existing_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(root_is_accessible(dir.path()));
     }
 
+    /// A non-existent path is not accessible.
     #[test]
     fn root_accessible_returns_false_for_missing_dir() {
         assert!(!root_is_accessible(Path::new("/nonexistent/path/that/does/not/exist")));
     }
 
+    /// A file path is not a directory and must not be considered accessible.
     #[test]
     fn root_accessible_returns_false_for_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -709,6 +715,7 @@ mod tests {
         assert!(!root_is_accessible(&file));
     }
 
+    /// The same bytes always produce the same 64-char hex hash; different bytes produce a different hash.
     #[test]
     fn compute_hash_is_stable_and_input_sensitive() {
         let h1 = compute_hash(b"hello world");
@@ -721,6 +728,7 @@ mod tests {
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// A file tracked in the DB but absent from disk triggers a DELETED event and marks exists_now false.
     #[test]
     fn initial_scan_records_deletion_for_missing_file() {
         let data_dir = tempfile::tempdir().unwrap();

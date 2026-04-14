@@ -257,6 +257,7 @@ pub fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    /// The built-in defaults are 7 days retention and a 1 GiB size cap.
     #[test]
     fn default_config_values() {
         let cfg = RetentionConfig::default();
@@ -264,6 +265,7 @@ mod tests {
         assert_eq!(cfg.max_size_mb, 1024);
     }
 
+    /// When no config files are present, load_config returns the built-in defaults.
     #[test]
     fn load_config_without_files_returns_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -272,6 +274,7 @@ mod tests {
         assert_eq!(cfg.max_size_mb, 1024);
     }
 
+    /// A .undorc in the project root overrides only the fields it specifies; others keep defaults.
     #[test]
     fn undorc_overrides_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -281,26 +284,31 @@ mod tests {
         assert_eq!(cfg.max_size_mb, 1024);
     }
 
+    /// Values under 1 KiB are formatted with a B suffix.
     #[test]
     fn format_size_bytes() {
         assert_eq!(format_size(500), "500 B");
     }
 
+    /// Values in the KiB range are formatted with a KB suffix.
     #[test]
     fn format_size_kilobytes() {
         assert_eq!(format_size(2048), "2.0 KB");
     }
 
+    /// Values in the MiB range are formatted with an MB suffix.
     #[test]
     fn format_size_megabytes() {
         assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
     }
 
+    /// Values in the GiB range are formatted with a GB suffix.
     #[test]
     fn format_size_gigabytes() {
         assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 
+    /// Both retention_days and max_size_mb can be overridden together in a single .undorc.
     #[test]
     fn undorc_overrides_both_fields() {
         let dir = tempfile::tempdir().unwrap();
