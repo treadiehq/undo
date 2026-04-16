@@ -274,6 +274,16 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+
+    if is_daemon_alive(pid_path) {
+        anyhow::bail!(
+            "daemon (PID {}) did not stop within 6 seconds.\n\
+             The PID file has been left in place so it can be found later.\n\
+             Try `kill -9 {}` if the process is stuck.",
+            pid, pid
+        );
+    }
+
     let _ = std::fs::remove_file(pid_path);
 
     let project = contents.lines().nth(1).unwrap_or("unknown");

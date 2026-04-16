@@ -135,13 +135,16 @@ pub fn prune(
             if !path.is_file() {
                 continue;
             }
-            let mtime = entry
+            let mtime = match entry
                 .metadata()
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            {
+                Some(t) => t,
+                None => continue, // can't determine age — leave the backup alone
+            };
             if mtime < backup_cutoff {
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 if !dry_run {

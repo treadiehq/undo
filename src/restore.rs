@@ -80,7 +80,15 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(&abs_path, &content)?;
+    // Write to a sibling temp file then rename atomically so an interrupted
+    // restore never leaves a partially-written target.
+    let tmp_path = abs_path.with_extension("undo_tmp");
+    std::fs::write(&tmp_path, &content)
+        .and_then(|_| std::fs::rename(&tmp_path, &abs_path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            e
+        })?;
 
     let elapsed = Utc::now().timestamp() - event.timestamp;
     let ago = duration::format_elapsed(elapsed);
