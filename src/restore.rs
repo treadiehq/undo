@@ -1,9 +1,11 @@
-use anyhow::Result;
-use chrono::Utc;
 use crate::db::Database;
 use crate::duration;
 use crate::snapshots;
 use crate::{find_project, GREEN, RESET};
+use anyhow::Result;
+use chrono::Utc;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     let secs = duration::parse_duration(duration_str)?;
@@ -16,10 +18,7 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
 
     // Refuse to write through symlinks — prevent overwriting files outside the project.
     if abs_path.exists() && abs_path.symlink_metadata()?.file_type().is_symlink() {
-        anyhow::bail!(
-            "refusing to restore through symlink '{}'",
-            path_str,
-        );
+        anyhow::bail!("refusing to restore through symlink '{}'", path_str);
     }
 
     let target_time = Utc::now().timestamp() - secs;
@@ -81,14 +80,10 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     }
 
     // Write to a sibling temp file then rename atomically so an interrupted
-    // restore never leaves a partially-written target.
-    let tmp_path = abs_path.with_extension("undo_tmp");
-    std::fs::write(&tmp_path, &content)
-        .and_then(|_| std::fs::rename(&tmp_path, &abs_path))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            e
-        })?;
+    // restore never leaves a partially-written target. The temp name must never
+    // collide with the target path: `with_extension("undo_tmp")` is wrong for
+    // paths that already end in `.undo_tmp` (it would write the destination in place).
+    write_restore_atomically(&abs_path, &content)?;
 
     let elapsed = Utc::now().timestamp() - event.timestamp;
     let ago = duration::format_elapsed(elapsed);
@@ -100,4 +95,41 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Unique sibling path for the restore temp file — always distinct from `target`,
+/// including when `target` uses `.undo_tmp` or similar as its extension.
+fn restore_atomic_temp_path(target: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut s = target.as_os_str().to_os_string();
+    s.push(format!(".undo.partial.{}_{}", std::process::id(), nanos));
+    PathBuf::from(s)
+}
+
+/// Same pattern as `snapshots::save`: `create_new` temp, full write, `rename` into place.
+fn write_restore_atomically(target: &Path, content: &[u8]) -> Result<()> {
+    let tmp_path = restore_atomic_temp_path(target);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let write_result = (|| -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, target)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    write_result.map_err(|e| e.into())
 }
