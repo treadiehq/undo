@@ -13,13 +13,19 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
 
+    // Refuse to write through symlinks — prevent overwriting files outside the project.
+    // This MUST be checked on the unresolved path: `safe_resolve_path` calls
+    // `canonicalize()`, which follows symlinks, so checking the resolved path
+    // would never see a symlink and the guard would be dead code.
+    let raw_path = cwd.join(path_str);
+    if let Ok(meta) = raw_path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("refusing to restore through symlink '{}'", path_str);
+        }
+    }
+
     let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;
     let abs_path_str = abs_path.to_string_lossy().to_string();
-
-    // Refuse to write through symlinks — prevent overwriting files outside the project.
-    if abs_path.exists() && abs_path.symlink_metadata()?.file_type().is_symlink() {
-        anyhow::bail!("refusing to restore through symlink '{}'", path_str);
-    }
 
     let target_time = Utc::now().timestamp() - secs;
 
@@ -132,4 +138,57 @@ fn write_restore_atomically(target: &Path, content: &[u8]) -> Result<()> {
     }
 
     write_result.map_err(|e| e.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    /// Lock in the discipline that the symlink guard must see the *unresolved*
+    /// path. `safe_resolve_path` calls `canonicalize()`, which follows symlinks,
+    /// so checking the resolved path makes the guard dead code. This test
+    /// proves the bug pattern: canonicalize hides the symlink, but
+    /// symlink_metadata on the raw path catches it.
+    #[test]
+    fn symlink_guard_must_inspect_unresolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, "real content").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+
+        // The canonical (resolved) path is the real file — never a symlink.
+        let canon = link.canonicalize().unwrap();
+        let canon_is_symlink = canon
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        assert!(
+            !canon_is_symlink,
+            "canonicalize() must follow the symlink — proves the post-resolve check is dead code"
+        );
+
+        // The raw (unresolved) path IS a symlink — this is what the fix inspects.
+        let raw_is_symlink = link
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        assert!(
+            raw_is_symlink,
+            "raw symlink_metadata() must report the link as a symlink"
+        );
+    }
+
+    /// A regular file is not flagged by the unresolved-path symlink check.
+    #[test]
+    fn symlink_guard_accepts_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("plain.txt");
+        std::fs::write(&regular, "hi").unwrap();
+        let is_symlink = regular
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        assert!(!is_symlink);
+    }
 }

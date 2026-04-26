@@ -19,6 +19,11 @@ struct RawConfig {
 pub struct RetentionConfig {
     pub retention_days: u64,
     pub max_size_mb: u64,
+    /// Seconds-precise override for the retention window. When set, takes
+    /// precedence over `retention_days`. Used by `--keep <duration>` so
+    /// sub-day inputs (e.g. `12h`, `30m`) are honoured exactly instead of
+    /// being rounded up to whole days.
+    pub retention_secs_override: Option<u64>,
 }
 
 impl Default for RetentionConfig {
@@ -26,6 +31,17 @@ impl Default for RetentionConfig {
         Self {
             retention_days: DEFAULT_RETENTION_DAYS,
             max_size_mb: DEFAULT_MAX_SIZE_MB,
+            retention_secs_override: None,
+        }
+    }
+}
+
+impl RetentionConfig {
+    /// Effective retention window in seconds.
+    pub fn retention_seconds(&self) -> i64 {
+        match self.retention_secs_override {
+            Some(s) => s as i64,
+            None => self.retention_days as i64 * 86400,
         }
     }
 }
@@ -87,7 +103,7 @@ pub fn prune(
         bytes_freed: 0,
     };
 
-    let cutoff = Utc::now().timestamp() - (config.retention_days as i64 * 86400);
+    let cutoff = Utc::now().timestamp() - config.retention_seconds();
 
     // 1. Delete old events
     if dry_run {
@@ -128,7 +144,7 @@ pub fn prune(
     // 3. Delete old backups
     let backups_dir = bt_dir.join("backups");
     if backups_dir.exists() {
-        let backup_cutoff = Utc::now().timestamp() - (config.retention_days as i64 * 86400);
+        let backup_cutoff = Utc::now().timestamp() - config.retention_seconds();
         for entry in std::fs::read_dir(&backups_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -323,5 +339,41 @@ mod tests {
         let cfg = load_config(Some(dir.path()));
         assert_eq!(cfg.retention_days, 14);
         assert_eq!(cfg.max_size_mb, 512);
+    }
+
+    /// Without a seconds override, retention is derived from retention_days.
+    #[test]
+    fn retention_seconds_uses_days_when_no_override() {
+        let cfg = RetentionConfig {
+            retention_days: 7,
+            max_size_mb: 1024,
+            retention_secs_override: None,
+        };
+        assert_eq!(cfg.retention_seconds(), 7 * 86400);
+    }
+
+    /// A seconds override (used by `--keep`) takes precedence over retention_days
+    /// so sub-day windows like 12h or 30m are honoured exactly.
+    #[test]
+    fn retention_seconds_override_takes_precedence_over_days() {
+        let cfg = RetentionConfig {
+            retention_days: 7,
+            max_size_mb: 1024,
+            retention_secs_override: Some(12 * 3600),
+        };
+        assert_eq!(cfg.retention_seconds(), 12 * 3600);
+    }
+
+    /// Sub-minute overrides survive the round-trip — guards against any future
+    /// regression to a "round up to 1 day" implementation.
+    #[test]
+    fn retention_seconds_override_preserves_sub_day_precision() {
+        let cfg = RetentionConfig {
+            retention_days: 7,
+            max_size_mb: 1024,
+            retention_secs_override: Some(30),
+        };
+        assert_eq!(cfg.retention_seconds(), 30);
+        assert_ne!(cfg.retention_seconds(), 86400);
     }
 }
