@@ -80,14 +80,20 @@ pub fn safe_resolve_path(cwd: &Path, path_str: &str, project_root: &str) -> Resu
     let resolved = if abs_path.exists() {
         abs_path.canonicalize()?
     } else {
-        // For non-existent files, normalize manually and check parent
-        let mut normalized = cwd.to_path_buf();
-        for component in std::path::Path::new(path_str).components() {
+        // For non-existent files, normalize manually. Iterate over the *joined*
+        // path's components (not `path_str` alone) so absolute inputs like
+        // "/abs/foo" — which `cwd.join` correctly produces as "/abs/foo" — are
+        // handled. The previous implementation iterated `path_str.components()`
+        // and silently dropped Component::RootDir, treating "/abs/foo" as if
+        // it were "<cwd>/abs/foo".
+        let mut normalized = std::path::PathBuf::new();
+        for component in abs_path.components() {
             match component {
+                std::path::Component::Prefix(p) => normalized.push(p.as_os_str()),
+                std::path::Component::RootDir => normalized.push("/"),
                 std::path::Component::ParentDir => { normalized.pop(); }
                 std::path::Component::Normal(c) => normalized.push(c),
                 std::path::Component::CurDir => {}
-                _ => {}
             }
         }
         normalized
@@ -191,6 +197,44 @@ mod tests {
         assert!(resolved.starts_with(dir.path()));
     }
 
+    /// A non-existent ABSOLUTE path outside the project root must be rejected.
+    /// The previous normaliser dropped Component::RootDir, so "/etc/shadow"
+    /// was silently rewritten to "<cwd>/etc/shadow" — which sometimes lay
+    /// inside the project root and slipped past the bounds check.
+    #[test]
+    fn safe_resolve_path_rejects_nonexistent_absolute_path_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        // Use an absolute path that does not exist and lives well outside cwd.
+        let target = "/nonexistent_absolute_path_outside/test_file.xyz";
+        let result = safe_resolve_path(dir.path(), target, root);
+        assert!(
+            result.is_err(),
+            "absolute non-existent path outside root must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    /// A non-existent absolute path *inside* the project root resolves to that
+    /// absolute path — not to "<cwd>/<root>/<path>" as the old normaliser produced.
+    #[test]
+    fn safe_resolve_path_normalises_nonexistent_absolute_path_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_path = dir.path();
+        let root = root_path.to_str().unwrap();
+
+        // Build an absolute path that's inside the root but doesn't exist on disk.
+        let target_str = format!("{}/missing/child.rs", root);
+        let resolved = safe_resolve_path(root_path, &target_str, root)
+            .expect("absolute path inside root must be accepted");
+
+        let expected = std::path::PathBuf::from(&target_str);
+        assert_eq!(
+            resolved, expected,
+            "absolute non-existent path must round-trip unchanged, not be re-anchored under cwd"
+        );
+    }
+
     /// Every event type maps to the expected ANSI colour; unknown types produce no colour code.
     #[test]
     fn event_color_maps_all_known_types() {
@@ -275,9 +319,9 @@ fn cmd_prune(keep: Option<String>, dry_run: bool) -> Result<()> {
 
     let mut config = retention::load_config(Some(&cwd));
     if let Some(ref keep_str) = keep {
+        // Seconds-precise: `--keep=12h` must mean 12 hours, not "round up to 1 day".
         let secs = duration::parse_duration(keep_str)?;
-        let days = (secs as f64 / 86400.0).ceil() as u64;
-        config.retention_days = days.max(1);
+        config.retention_secs_override = Some(secs as u64);
     }
 
     let label = if dry_run { "Would prune" } else { "Pruned" };

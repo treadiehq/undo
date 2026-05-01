@@ -1,5 +1,7 @@
 use anyhow::Result;
 use similar::{ChangeTag, TextDiff};
+use std::io::Read;
+use std::path::Path;
 
 use crate::db::Database;
 use crate::snapshots;
@@ -9,6 +11,19 @@ use crate::{find_project, BOLD, DIM, GREEN, RED, RESET};
 /// first 8 KiB (same approach used by git and most editors).
 fn is_binary(data: &[u8]) -> bool {
     data.iter().take(8192).any(|&b| b == 0)
+}
+
+/// Read at most `limit` bytes from `path`. Returns `None` if the file is
+/// larger than the limit so callers can degrade gracefully instead of OOM-ing.
+fn read_capped(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+    let file = std::fs::File::open(path)?;
+    let cap = limit as u64 + 1;
+    let mut buf = Vec::new();
+    let n = file.take(cap).read_to_end(&mut buf)?;
+    if n as u64 >= cap {
+        return Ok(None);
+    }
+    Ok(Some(buf))
 }
 
 pub fn cmd_diff(path_str: &str) -> Result<()> {
@@ -61,7 +76,16 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
         return Ok(());
     }
 
-    let current_content = std::fs::read(&abs_path)?;
+    let current_content = match read_capped(&abs_path, snapshots::MAX_SNAPSHOT_SIZE)? {
+        Some(c) => c,
+        None => {
+            println!(
+                "Current file is larger than {} bytes — refusing to diff to avoid OOM.",
+                snapshots::MAX_SNAPSHOT_SIZE
+            );
+            return Ok(());
+        }
+    };
 
     if is_binary(&current_content) {
         println!("Binary file — text diff not available.");
@@ -137,5 +161,36 @@ mod tests {
         let mut data = vec![b'a'; 8193];
         data[8192] = 0;
         assert!(!is_binary(&data));
+    }
+
+    /// A file under the byte limit is read in full and returned as Some.
+    #[test]
+    fn read_capped_returns_content_under_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let got = read_capped(&path, 100).unwrap();
+        assert_eq!(got, Some(b"hello".to_vec()));
+    }
+
+    /// A file larger than the limit must return None rather than allocating
+    /// the whole file — this is the OOM guard for `cmd_diff`.
+    #[test]
+    fn read_capped_returns_none_when_file_exceeds_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        std::fs::write(&path, vec![b'x'; 1024]).unwrap();
+        let got = read_capped(&path, 100).unwrap();
+        assert_eq!(got, None, "files over the cap must not be loaded");
+    }
+
+    /// A file at exactly the limit is still readable — boundary check.
+    #[test]
+    fn read_capped_returns_content_at_exact_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.txt");
+        std::fs::write(&path, vec![b'y'; 100]).unwrap();
+        let got = read_capped(&path, 100).unwrap();
+        assert_eq!(got, Some(vec![b'y'; 100]));
     }
 }

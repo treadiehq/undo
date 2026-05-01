@@ -422,9 +422,18 @@ impl Database {
     }
 
     pub fn get_live_hashes(&self, project_id: i64) -> Result<HashSet<String>> {
+        // Live = referenced by any current event OR by file_state.latest_hash.
+        // Without the file_state arm, a file whose only event predates the
+        // retention window has its event pruned, then its snapshot orphaned —
+        // even though the file still exists on disk and the snapshot is the
+        // only stored copy of its current content. Including latest_hash
+        // pins those snapshots so diff/restore keep working.
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT current_hash FROM file_events
-             WHERE project_id = ?1 AND current_hash IS NOT NULL",
+            "SELECT current_hash FROM file_events
+             WHERE project_id = ?1 AND current_hash IS NOT NULL
+             UNION
+             SELECT latest_hash FROM file_state
+             WHERE project_id = ?1 AND latest_hash IS NOT NULL",
         )?;
         let hashes = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         hashes
@@ -649,6 +658,24 @@ mod tests {
         let hashes = db.get_live_hashes(p.id).unwrap();
         assert!(!hashes.contains("hash_old"));
         assert!(hashes.contains("hash_new"));
+    }
+
+    /// A hash referenced only by file_state (the file's current on-disk content,
+    /// whose creating event has already been pruned) must still be considered live —
+    /// otherwise retention would orphan the only snapshot of an existing file.
+    #[test]
+    fn get_live_hashes_includes_file_state_latest_hash() {
+        let db = db();
+        let p = project(&db);
+        // No events exist for this path; only file_state references the hash.
+        db.upsert_file_state(p.id, "/p/extant.rs", "fs_only_hash", true)
+            .unwrap();
+        let hashes = db.get_live_hashes(p.id).unwrap();
+        assert!(
+            hashes.contains("fs_only_hash"),
+            "file_state.latest_hash must be considered live: {:?}",
+            hashes
+        );
     }
 
     /// All created project IDs appear in the returned list.
