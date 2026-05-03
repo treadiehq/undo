@@ -108,9 +108,18 @@ fn active_daemons(bt_dir: &Path) -> Vec<(u32, PathBuf)> {
 /// Refuse to start if another daemon is already watching a parent or child
 /// of `new_root`. Overlapping watchers cause duplicate events and wasted
 /// snapshots because both daemons receive the same filesystem notifications.
-fn check_no_overlap(bt_dir: &Path, new_root: &Path) -> Result<()> {
+///
+/// `exclude_pid` skips PID files belonging to the calling process. `cmd_start`
+/// already locks its own pid file before this check runs, and on macOS / Linux
+/// flock treats two open file descriptions in the same process as conflicting,
+/// so `is_daemon_alive` would otherwise report our own pid file as alive and
+/// the equal-paths branch below would self-reject every fresh `undo start`.
+fn check_no_overlap(bt_dir: &Path, new_root: &Path, exclude_pid: u32) -> Result<()> {
     let new_str = new_root.to_string_lossy();
     for (pid, existing) in active_daemons(bt_dir) {
+        if pid == exclude_pid {
+            continue;
+        }
         let ex_str = existing.to_string_lossy();
 
         let overlap = if new_str.len() >= ex_str.len() {
@@ -182,7 +191,7 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     }
 
     if !force {
-        check_no_overlap(&bt_dir, &cwd)?;
+        check_no_overlap(&bt_dir, &cwd, std::process::id())?;
     }
 
     let db = Database::open()?;
@@ -510,6 +519,11 @@ mod tests {
         file
     }
 
+    /// A pid value distinct from the caller; passed as `exclude_pid` so the
+    /// helper's self-skip never accidentally matches the foreign daemon
+    /// fixture and hides a real overlap.
+    const FOREIGN_PID: u32 = u32::MAX;
+
     /// Starting a watcher inside an already-watched tree would produce duplicate events.
     #[test]
     fn overlap_rejects_child_of_watched_dir() {
@@ -518,7 +532,7 @@ mod tests {
         std::fs::create_dir_all(bt.join("pids")).unwrap();
         let _lock = write_live_pid_file(bt, "/foo");
 
-        let err = check_no_overlap(bt, Path::new("/foo/bar")).unwrap_err();
+        let err = check_no_overlap(bt, Path::new("/foo/bar"), FOREIGN_PID).unwrap_err();
         assert!(err.to_string().contains("overlaps"), "{}", err);
     }
 
@@ -530,7 +544,7 @@ mod tests {
         std::fs::create_dir_all(bt.join("pids")).unwrap();
         let _lock = write_live_pid_file(bt, "/foo/bar");
 
-        let err = check_no_overlap(bt, Path::new("/foo")).unwrap_err();
+        let err = check_no_overlap(bt, Path::new("/foo"), FOREIGN_PID).unwrap_err();
         assert!(err.to_string().contains("overlaps"), "{}", err);
     }
 
@@ -542,7 +556,7 @@ mod tests {
         std::fs::create_dir_all(bt.join("pids")).unwrap();
         let _lock = write_live_pid_file(bt, "/foo/bar");
 
-        let err = check_no_overlap(bt, Path::new("/foo/bar")).unwrap_err();
+        let err = check_no_overlap(bt, Path::new("/foo/bar"), FOREIGN_PID).unwrap_err();
         assert!(err.to_string().contains("overlaps"), "{}", err);
     }
 
@@ -554,7 +568,7 @@ mod tests {
         std::fs::create_dir_all(bt.join("pids")).unwrap();
         let _lock = write_live_pid_file(bt, "/foo/bar");
 
-        assert!(check_no_overlap(bt, Path::new("/foo/baz")).is_ok());
+        assert!(check_no_overlap(bt, Path::new("/foo/baz"), FOREIGN_PID).is_ok());
     }
 
     /// A directory whose name starts with an existing root's name must not be falsely rejected.
@@ -566,7 +580,7 @@ mod tests {
         let _lock = write_live_pid_file(bt, "/foo/bar");
 
         // "/foo/bar-extra" shares the string prefix but is not a subdirectory
-        assert!(check_no_overlap(bt, Path::new("/foo/bar-extra")).is_ok());
+        assert!(check_no_overlap(bt, Path::new("/foo/bar-extra"), FOREIGN_PID).is_ok());
     }
 
     /// With no active daemons, any directory is a valid watch target.
@@ -576,7 +590,35 @@ mod tests {
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
 
-        assert!(check_no_overlap(bt, Path::new("/any/path")).is_ok());
+        assert!(check_no_overlap(bt, Path::new("/any/path"), FOREIGN_PID).is_ok());
+    }
+
+    /// `cmd_start` locks its own pid file before running the overlap check.
+    /// On macOS / Linux flock treats two open file descriptions in the same
+    /// process as conflicting, so `is_daemon_alive` reports our own pid file
+    /// as alive. Without an `exclude_pid` filter, the equal-paths branch of
+    /// the overlap check would then self-reject every fresh `undo start`.
+    /// This test pins that fix: writing the *current* process's pid into the
+    /// pid file must NOT cause `check_no_overlap` to report an overlap.
+    #[test]
+    fn overlap_excludes_calling_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+
+        // Write a pid file owned by the current process, holding a live flock —
+        // mirrors the cmd_start sequence: lock our pid file, then check overlap.
+        let root = "/proj/self";
+        let path = pid_file_for_root(bt, Path::new(root));
+        let file = std::fs::OpenOptions::new()
+            .create(true).read(true).write(true).open(&path).unwrap();
+        assert!(try_lock_exclusive(&file));
+        use std::io::Write;
+        write!(&file, "{}\n{}", std::process::id(), root).unwrap();
+
+        // Must succeed: the only "live daemon" is us, and we're excluded.
+        check_no_overlap(bt, Path::new(root), std::process::id())
+            .expect("check_no_overlap must skip the calling process");
     }
 
     /// A PID file not held by any process (no flock) is stale and must be ignored.
