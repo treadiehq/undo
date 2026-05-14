@@ -3,11 +3,20 @@ use anyhow::{bail, Result};
 /// Parse a human-friendly duration string (e.g. "5m", "2h", "1d") into seconds.
 pub fn parse_duration(s: &str) -> Result<i64> {
     let s = s.trim();
-    if s.len() < 2 {
+
+    // Split off the trailing *character*, not the trailing byte. Inputs like
+    // "5日" are 4 bytes long but `split_at(len - 1)` would land mid-codepoint
+    // and panic with "byte index is not a char boundary" — turning a typo
+    // into a runtime crash.
+    let unit = s
+        .chars()
+        .next_back()
+        .ok_or_else(|| anyhow::anyhow!("invalid duration: '' — use format like 5m, 2h, 1d"))?;
+    let num_str = &s[..s.len() - unit.len_utf8()];
+    if num_str.is_empty() {
         bail!("invalid duration: '{}' — use format like 5m, 2h, 1d", s);
     }
 
-    let (num_str, unit) = s.split_at(s.len() - 1);
     let num: i64 = num_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid duration number: '{}'", num_str))?;
@@ -17,10 +26,10 @@ pub fn parse_duration(s: &str) -> Result<i64> {
     }
 
     match unit {
-        "s" => Ok(num),
-        "m" => Ok(num * 60),
-        "h" => Ok(num * 3600),
-        "d" => Ok(num * 86400),
+        's' => Ok(num),
+        'm' => Ok(num * 60),
+        'h' => Ok(num * 3600),
+        'd' => Ok(num * 86400),
         _ => bail!("unknown duration unit '{}' — use s, m, h, or d", unit),
     }
 }
@@ -76,6 +85,32 @@ mod tests {
     #[test]
     fn parse_zero_is_rejected() {
         assert!(parse_duration("0m").is_err());
+    }
+
+    /// A multi-byte trailing character must produce a clean error rather than
+    /// panic. `s.split_at(s.len() - 1)` lands mid-codepoint for inputs like
+    /// "5日" (4 bytes, last char starts at byte 1) and used to crash the CLI.
+    #[test]
+    fn parse_multibyte_unit_does_not_panic() {
+        let result = parse_duration("5日");
+        assert!(
+            result.is_err(),
+            "non-ASCII unit must produce an error, not a panic"
+        );
+    }
+
+    /// A bare multi-byte character (no number) must error cleanly — same
+    /// char-boundary trap as above, with no digits to anchor to.
+    #[test]
+    fn parse_lone_multibyte_does_not_panic() {
+        let result = parse_duration("日");
+        assert!(result.is_err(), "lone non-ASCII input must error cleanly");
+    }
+
+    /// An empty string must produce a clean error rather than panic.
+    #[test]
+    fn parse_empty_string_does_not_panic() {
+        assert!(parse_duration("").is_err());
     }
 
     /// Durations under 60 seconds are shown as seconds.

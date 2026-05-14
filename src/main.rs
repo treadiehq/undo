@@ -96,12 +96,53 @@ pub fn safe_resolve_path(cwd: &Path, path_str: &str, project_root: &str) -> Resu
                 std::path::Component::CurDir => {}
             }
         }
-        normalized
+
+        // Defense against parent-directory symlinks: syntactic normalization
+        // does NOT follow symlinks, so `<root>/sym/missing.txt` (where `sym`
+        // is a symlink to `/etc`) passes the bounds check below even though
+        // a subsequent `open()` would write to `/etc/missing.txt`. Resolve
+        // the deepest existing ancestor with `canonicalize()` and re-attach
+        // the missing tail so the bounds check sees the real location.
+        //
+        // Components are collected into a Vec and re-pushed at the end rather
+        // than accumulated via `PathBuf::push` of an empty PathBuf, which can
+        // append a stray separator on some platforms.
+        let mut ancestor = normalized.clone();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while !ancestor.exists() {
+            let Some(name) = ancestor.file_name().map(|n| n.to_os_string()) else {
+                break;
+            };
+            tail.push(name);
+            if !ancestor.pop() {
+                break;
+            }
+        }
+        if ancestor.as_os_str().is_empty() || !ancestor.exists() {
+            normalized
+        } else {
+            let mut result = ancestor.canonicalize()?;
+            for name in tail.iter().rev() {
+                result.push(name);
+            }
+            result
+        }
     };
 
-    let root = std::path::Path::new(project_root);
+    // Canonicalize the project root for the bounds check. The ancestor walk
+    // above produces a path whose existing prefix has been resolved through
+    // symlinks (e.g. on macOS `/var/...` becomes `/private/var/...`), so the
+    // root we compare against must be canonicalized too — otherwise a
+    // perfectly legitimate subpath inside the canonical-form root reads as
+    // "outside" the literal-form root and gets rejected. In production the
+    // stored `project.root_path` is already canonical (set via
+    // `cwd.canonicalize()` in `cmd_start`), so this is a no-op there.
+    let root_path = std::path::Path::new(project_root);
+    let root_canonical = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
     let resolved_str = resolved.to_string_lossy();
-    let root_str = root.to_string_lossy();
+    let root_str = root_canonical.to_string_lossy();
 
     if !resolved_str.starts_with(root_str.as_ref())
         || (resolved_str.len() > root_str.len()
@@ -194,7 +235,18 @@ mod tests {
         let result = safe_resolve_path(dir.path(), "src/main.rs", root);
         assert!(result.is_ok(), "valid subpath must be accepted");
         let resolved = result.unwrap();
-        assert!(resolved.starts_with(dir.path()));
+        // Compare against the canonicalized root: on macOS the system tmpdir
+        // is `/var/folders/...` which is a symlink to `/private/var/folders/...`.
+        // The fix for non-existent parent-symlink escapes resolves the deepest
+        // existing ancestor through `canonicalize()`, so the returned path is
+        // in canonical form and must be checked against the canonical root.
+        let canonical_root = dir.path().canonicalize().unwrap();
+        assert!(
+            resolved.starts_with(&canonical_root),
+            "resolved {:?} must live under canonical root {:?}",
+            resolved,
+            canonical_root
+        );
     }
 
     /// A non-existent ABSOLUTE path outside the project root must be rejected.
@@ -215,8 +267,40 @@ mod tests {
         );
     }
 
-    /// A non-existent absolute path *inside* the project root resolves to that
-    /// absolute path — not to "<cwd>/<root>/<path>" as the old normaliser produced.
+    /// A non-existent path whose *parent* is a symlink pointing outside the
+    /// project root must be rejected. Syntactic normalization alone is not
+    /// enough: `<root>/sym/missing.txt` (where `sym -> /tmp/...`) reads as
+    /// "inside the root" but `open()` would follow the symlink and write to
+    /// `/tmp/.../missing.txt`. The fix canonicalizes the deepest existing
+    /// ancestor and re-attaches the tail so the bounds check sees the real
+    /// destination.
+    #[test]
+    fn safe_resolve_path_rejects_nonexistent_path_through_parent_symlink() {
+        use std::os::unix::fs::symlink;
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = root_dir.path().to_str().unwrap();
+
+        // <root>/sym -> <outside>
+        symlink(outside.path(), root_dir.path().join("sym")).unwrap();
+
+        // The leaf does not exist on either side of the symlink. The old
+        // implementation accepted this because syntactic normalization yields
+        // "<root>/sym/missing.txt" — passes the prefix check.
+        let result = safe_resolve_path(root_dir.path(), "sym/missing.txt", root);
+        assert!(
+            result.is_err(),
+            "non-existent path through a parent symlink that escapes the root must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    /// A non-existent absolute path *inside* the project root resolves correctly,
+    /// landing under the canonical root rather than being re-anchored under cwd.
+    /// (The old normaliser dropped `Component::RootDir` and produced
+    /// "<cwd>/<root>/<path>".) The path is now also canonicalized through any
+    /// ancestor symlinks (e.g. macOS `/var → /private/var`), so the
+    /// expectation is built from the canonical root.
     #[test]
     fn safe_resolve_path_normalises_nonexistent_absolute_path_inside_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -228,10 +312,12 @@ mod tests {
         let resolved = safe_resolve_path(root_path, &target_str, root)
             .expect("absolute path inside root must be accepted");
 
-        let expected = std::path::PathBuf::from(&target_str);
+        let canonical_root = root_path.canonicalize().unwrap();
+        let expected = canonical_root.join("missing").join("child.rs");
         assert_eq!(
             resolved, expected,
-            "absolute non-existent path must round-trip unchanged, not be re-anchored under cwd"
+            "absolute non-existent path must land under the canonical root, \
+             not be re-anchored under cwd"
         );
     }
 
@@ -317,7 +403,12 @@ fn cmd_prune(keep: Option<String>, dry_run: bool) -> Result<()> {
     let db = db::Database::open()?;
     let project = find_project(&db, &cwd)?;
 
-    let mut config = retention::load_config(Some(&cwd));
+    // Load `.undorc` from the project *root*, not the cwd. `undo prune` is
+    // commonly run from a subdirectory; passing `&cwd` here silently falls
+    // back to defaults whenever the user isn't standing in the project root,
+    // even though their `.undorc` lives next to the watched code.
+    let project_root_path = std::path::Path::new(&project.root_path);
+    let mut config = retention::load_config(Some(project_root_path));
     if let Some(ref keep_str) = keep {
         // Seconds-precise: `--keep=12h` must mean 12 hours, not "round up to 1 day".
         let secs = duration::parse_duration(keep_str)?;

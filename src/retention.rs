@@ -303,6 +303,40 @@ mod tests {
         assert_eq!(cfg.max_size_mb, 1024);
     }
 
+    /// `load_config` reads `.undorc` from the path it is given — nothing else.
+    /// This pins the contract that `cmd_prune` relies on: when it passes the
+    /// *project root*, the project's `.undorc` is honoured even if the user
+    /// invoked `undo prune` from a subdirectory with no config of its own.
+    /// (The previous `cmd_prune` passed `cwd`, silently dropping the project
+    /// `.undorc` whenever the user wasn't standing at the root.)
+    #[test]
+    fn load_config_reads_undorc_from_given_root_not_subdir() {
+        let project_root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_root.path().join(".undorc"),
+            "retention_days = 42\n",
+        )
+        .unwrap();
+
+        // A subdirectory with no .undorc of its own — what `cwd` would be when
+        // the user runs `undo prune` from `<root>/src/`.
+        let subdir = project_root.path().join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        // Asking for the project-root config returns the project's settings.
+        let from_root = load_config(Some(project_root.path()));
+        assert_eq!(from_root.retention_days, 42);
+
+        // Asking for the subdir's config silently falls back to defaults —
+        // documenting the bug `cmd_prune` previously hit.
+        let from_subdir = load_config(Some(&subdir));
+        assert_eq!(
+            from_subdir.retention_days,
+            DEFAULT_RETENTION_DAYS,
+            "passing the subdir to load_config silently loses the project .undorc"
+        );
+    }
+
     /// Values under 1 KiB are formatted with a B suffix.
     #[test]
     fn format_size_bytes() {

@@ -422,18 +422,20 @@ impl Database {
     }
 
     pub fn get_live_hashes(&self, project_id: i64) -> Result<HashSet<String>> {
-        // Live = referenced by any current event OR by file_state.latest_hash.
-        // Without the file_state arm, a file whose only event predates the
-        // retention window has its event pruned, then its snapshot orphaned —
-        // even though the file still exists on disk and the snapshot is the
-        // only stored copy of its current content. Including latest_hash
-        // pins those snapshots so diff/restore keep working.
+        // Live = referenced by any current event OR by the latest_hash of a
+        // file that still exists on disk. The file_state arm is what keeps a
+        // file's snapshot pinned after its creating event predates the
+        // retention window — but it MUST be gated on `exists_now = 1`. Without
+        // that gate, `mark_deleted` leaves the row's `latest_hash` set, so
+        // every file ever deleted permanently anchors its snapshot and
+        // retention can never reclaim that disk space.
         let mut stmt = self.conn.prepare(
             "SELECT current_hash FROM file_events
              WHERE project_id = ?1 AND current_hash IS NOT NULL
              UNION
              SELECT latest_hash FROM file_state
-             WHERE project_id = ?1 AND latest_hash IS NOT NULL",
+             WHERE project_id = ?1 AND latest_hash IS NOT NULL
+               AND exists_now = 1",
         )?;
         let hashes = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         hashes
@@ -674,6 +676,43 @@ mod tests {
         assert!(
             hashes.contains("fs_only_hash"),
             "file_state.latest_hash must be considered live: {:?}",
+            hashes
+        );
+    }
+
+    /// A file_state row whose `exists_now = 0` must NOT pin its `latest_hash`
+    /// as live. `mark_deleted` only flips `exists_now` and leaves
+    /// `latest_hash` intact, so without the `exists_now = 1` filter every
+    /// file the user ever deletes anchors its snapshot forever and retention
+    /// can never reclaim that disk space — defeating the size cap.
+    ///
+    /// This also separately verifies the orphan path: once the only event
+    /// referencing the hash is pruned and the file is marked deleted,
+    /// nothing pins the snapshot.
+    #[test]
+    fn get_live_hashes_excludes_deleted_file_state_rows() {
+        let db = db();
+        let p = project(&db);
+        let path = "/p/old_and_gone.rs";
+
+        // Track the file, then mark it deleted (mimicking `handle_delete`,
+        // which leaves `latest_hash` populated).
+        db.upsert_file_state(p.id, path, "ghost_hash", true).unwrap();
+        db.mark_deleted(p.id, path).unwrap();
+        let state = db.get_file_state(p.id, path).unwrap().unwrap();
+        assert!(!state.exists_now, "test setup: file must be marked deleted");
+        assert_eq!(
+            state.latest_hash.as_deref(),
+            Some("ghost_hash"),
+            "test setup: latest_hash must persist past mark_deleted — that's the bug surface"
+        );
+
+        // No events reference ghost_hash. With the bug, the file_state arm of
+        // the UNION still reports it as live, leaking the snapshot.
+        let hashes = db.get_live_hashes(p.id).unwrap();
+        assert!(
+            !hashes.contains("ghost_hash"),
+            "deleted file's latest_hash must not be live: {:?}",
             hashes
         );
     }
