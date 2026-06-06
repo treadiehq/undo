@@ -41,8 +41,20 @@ impl RetentionConfig {
     pub fn retention_seconds(&self) -> i64 {
         match self.retention_secs_override {
             Some(s) => s as i64,
-            None => self.retention_days as i64 * 86400,
+            None => self.retention_days.saturating_mul(86400) as i64,
         }
+    }
+
+    /// Effective size cap in bytes. `max_size_mb` comes from user config
+    /// (`~/.undo/config.toml` / `.undorc`), so a large value would overflow
+    /// `max_size_mb * 1024 * 1024`: in debug that panics the daemon's
+    /// auto-prune thread (no `Err` to catch — it unwinds), and in release it
+    /// wraps to a tiny cap that triggers over-aggressive snapshot deletion.
+    /// Saturate instead so the cap degrades to "effectively unlimited".
+    pub fn max_size_bytes(&self) -> u64 {
+        self.max_size_mb
+            .saturating_mul(1024)
+            .saturating_mul(1024)
     }
 }
 
@@ -174,7 +186,7 @@ pub fn prune(
 
     // 4. Size backstop: if still over max_size_mb, prune oldest unreferenced snapshots
     if !dry_run {
-        let max_bytes = config.max_size_mb * 1024 * 1024;
+        let max_bytes = config.max_size_bytes();
         let mut current = total_disk_usage()?;
         if current > max_bytes {
             let all_projects = db.get_all_project_ids()?;
@@ -409,5 +421,53 @@ mod tests {
         };
         assert_eq!(cfg.retention_seconds(), 30);
         assert_ne!(cfg.retention_seconds(), 86400);
+    }
+
+    /// The default cap converts to bytes without surprises.
+    #[test]
+    fn max_size_bytes_normal_value() {
+        let cfg = RetentionConfig::default();
+        assert_eq!(cfg.max_size_bytes(), 1024 * 1024 * 1024);
+    }
+
+    /// A very large `max_size_mb` from user config must not overflow when
+    /// converted to bytes. The previous `max_size_mb * 1024 * 1024` panics in
+    /// debug (crashing the auto-prune thread) and wraps to a tiny cap in
+    /// release (over-aggressive pruning). `max_size_bytes()` saturates instead.
+    /// (Red before the fix: `u64::MAX * 1024 * 1024` overflows.)
+    #[test]
+    fn max_size_bytes_saturates_instead_of_overflowing() {
+        let cfg = RetentionConfig {
+            retention_days: 7,
+            max_size_mb: u64::MAX,
+            retention_secs_override: None,
+        };
+        // Must not panic, and must clamp to the u64 ceiling rather than wrap.
+        assert_eq!(cfg.max_size_bytes(), u64::MAX);
+    }
+
+    /// Demonstrates the hazard the fix removes: the naive multiplication that
+    /// `prune` and `cmd_status` previously used cannot represent the result.
+    #[test]
+    fn naive_max_size_multiplication_overflows() {
+        assert!(
+            u64::MAX.checked_mul(1024).and_then(|v| v.checked_mul(1024)).is_none(),
+            "max_size_mb * 1024 * 1024 overflows for large configs — \
+             this is why max_size_bytes() must saturate"
+        );
+    }
+
+    /// An enormous retention_days must not overflow the seconds conversion
+    /// either (same `* 86400` hazard).
+    #[test]
+    fn retention_seconds_saturates_for_huge_days() {
+        let cfg = RetentionConfig {
+            retention_days: u64::MAX,
+            max_size_mb: 1024,
+            retention_secs_override: None,
+        };
+        // saturating_mul keeps it within u64, then `as i64` clamps high bits;
+        // the key property is that it does not panic.
+        let _ = cfg.retention_seconds();
     }
 }

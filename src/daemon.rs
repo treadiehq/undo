@@ -369,7 +369,7 @@ pub fn cmd_status() -> Result<()> {
             println!(
                 "Retention: {} days, {} max",
                 cfg.retention_days,
-                crate::retention::format_size(cfg.max_size_mb * 1024 * 1024),
+                crate::retention::format_size(cfg.max_size_bytes()),
             );
 
             let snap_size = crate::retention::dir_size("snapshots").unwrap_or(0);

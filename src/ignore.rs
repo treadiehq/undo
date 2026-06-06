@@ -14,13 +14,19 @@ const IGNORED_NAMES: &[&str] = &[
     ".vscode",
     ".backtrack",
     ".undo",
-    ".env",
-    ".env.local",
-    ".env.production",
     ".ssh",
 ];
 
 const IGNORED_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "keystore"];
+
+/// Dotenv files routinely hold secrets (API keys, DB passwords). The previous
+/// list only enumerated `.env`, `.env.local` and `.env.production`, silently
+/// capturing common variants like `.env.development`, `.env.staging`,
+/// `.env.test` into the snapshot store. Match `.env` and any `.env.<suffix>`
+/// while deliberately NOT matching unrelated names such as `.environment`.
+fn is_dotenv_file(name: &str) -> bool {
+    name == ".env" || name.starts_with(".env.")
+}
 
 /// Check if a path component matches one of the hardcoded ignore names,
 /// or the file has a sensitive extension.
@@ -29,7 +35,9 @@ fn matches_builtin(path: &Path, project_root: &Path) -> bool {
     for component in rel.components() {
         if let std::path::Component::Normal(name) = component {
             let name_str = name.to_string_lossy();
-            if IGNORED_NAMES.iter().any(|&ignored| ignored == name_str.as_ref()) {
+            if IGNORED_NAMES.iter().any(|&ignored| ignored == name_str.as_ref())
+                || is_dotenv_file(name_str.as_ref())
+            {
                 return true;
             }
         }
@@ -174,6 +182,50 @@ mod tests {
     fn undo_directory_is_ignored() {
         let path = Path::new("/home/user/project/.undo/database.db");
         assert!(should_ignore(path, root()));
+    }
+
+    /// A plain `.env` file holds secrets and must always be ignored.
+    #[test]
+    fn dotenv_file_is_ignored() {
+        assert!(should_ignore(Path::new("/home/user/project/.env"), root()));
+    }
+
+    /// `.env.<suffix>` variants beyond the few that were hardcoded must also be
+    /// ignored — this is the gap: `.env.development` / `.env.staging` /
+    /// `.env.test` were being snapshotted into the content store.
+    /// (Red before broadening the builtin matcher to cover `.env.*`.)
+    #[test]
+    fn dotenv_variant_files_are_ignored() {
+        for name in [".env.development", ".env.staging", ".env.test", ".env.local.bak"] {
+            let path = Path::new("/home/user/project").join(name);
+            assert!(
+                should_ignore(&path, root()),
+                "{} should be ignored as a dotenv secret file",
+                name
+            );
+        }
+    }
+
+    /// A dotenv file nested in a subdirectory is still ignored — the check
+    /// runs per path component, not just on the project root.
+    #[test]
+    fn nested_dotenv_file_is_ignored() {
+        let path = Path::new("/home/user/project/config/.env.production");
+        assert!(should_ignore(path, root()));
+    }
+
+    /// Names that merely start with "env" but are not dotenv files must NOT be
+    /// falsely ignored — guards the `.env.` prefix from over-matching.
+    #[test]
+    fn non_dotenv_env_named_files_are_not_ignored() {
+        assert!(!should_ignore(
+            Path::new("/home/user/project/.environment"),
+            root()
+        ));
+        assert!(!should_ignore(
+            Path::new("/home/user/project/environment.rs"),
+            root()
+        ));
     }
 
     /// Glob patterns in .undoignore must cause matching paths to be ignored.
