@@ -60,28 +60,28 @@ pub fn load_config(project_root: Option<&Path>) -> RetentionConfig {
 
     if let Ok(bt_dir) = crate::backtrack_dir() {
         let global_path = bt_dir.join("config.toml");
-        if let Ok(contents) = std::fs::read_to_string(&global_path) {
-            if let Ok(raw) = toml::from_str::<RawConfig>(&contents) {
-                if let Some(d) = raw.retention_days {
-                    cfg.retention_days = d;
-                }
-                if let Some(s) = raw.max_size_mb {
-                    cfg.max_size_mb = s;
-                }
+        if let Ok(contents) = std::fs::read_to_string(&global_path)
+            && let Ok(raw) = toml::from_str::<RawConfig>(&contents)
+        {
+            if let Some(d) = raw.retention_days {
+                cfg.retention_days = d;
+            }
+            if let Some(s) = raw.max_size_mb {
+                cfg.max_size_mb = s;
             }
         }
     }
 
     if let Some(root) = project_root {
         let project_path = root.join(".undorc");
-        if let Ok(contents) = std::fs::read_to_string(&project_path) {
-            if let Ok(raw) = toml::from_str::<RawConfig>(&contents) {
-                if let Some(d) = raw.retention_days {
-                    cfg.retention_days = d;
-                }
-                if let Some(s) = raw.max_size_mb {
-                    cfg.max_size_mb = s;
-                }
+        if let Ok(contents) = std::fs::read_to_string(&project_path)
+            && let Ok(raw) = toml::from_str::<RawConfig>(&contents)
+        {
+            if let Some(d) = raw.retention_days {
+                cfg.retention_days = d;
+            }
+            if let Some(s) = raw.max_size_mb {
+                cfg.max_size_mb = s;
             }
         }
     }

@@ -34,10 +34,10 @@ fn matches_builtin(path: &Path, project_root: &Path) -> bool {
             }
         }
     }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if IGNORED_EXTENSIONS.iter().any(|&e| e == ext) {
-            return true;
-        }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && IGNORED_EXTENSIONS.contains(&ext)
+    {
+        return true;
     }
     false
 }
@@ -81,7 +81,7 @@ pub fn init(project_root: &Path) {
 #[cfg(test)]
 thread_local! {
     static THREAD_IGNORE: std::cell::RefCell<Option<Gitignore>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -109,10 +109,10 @@ fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path) -> Option<boo
 /// Only the *storage* of the matcher differs; the branching logic here
 /// is always the same code that ships in the binary.
 fn should_ignore_with(gi: Option<&Gitignore>, path: &Path, project_root: &Path) -> bool {
-    if let Some(gi) = gi {
-        if let Some(result) = apply_matcher(gi, path, project_root) {
-            return result;
-        }
+    if let Some(gi) = gi
+        && let Some(result) = apply_matcher(gi, path, project_root)
+    {
+        return result;
     }
     matches_builtin(path, project_root)
 }

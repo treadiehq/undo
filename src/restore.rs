@@ -18,10 +18,10 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     // `canonicalize()`, which follows symlinks, so checking the resolved path
     // would never see a symlink and the guard would be dead code.
     let raw_path = cwd.join(path_str);
-    if let Ok(meta) = raw_path.symlink_metadata() {
-        if meta.file_type().is_symlink() {
-            anyhow::bail!("refusing to restore through symlink '{}'", path_str);
-        }
+    if let Ok(meta) = raw_path.symlink_metadata()
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!("refusing to restore through symlink '{}'", path_str);
     }
 
     let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;

@@ -61,10 +61,10 @@ impl Debouncer {
     fn should_process(&mut self, path: &Path) -> bool {
         self.maybe_cleanup();
         let now = Instant::now();
-        if let Some(last) = self.last_event.get(path) {
-            if now.duration_since(*last) < Duration::from_millis(DEBOUNCE_MS) {
-                return false;
-            }
+        if let Some(last) = self.last_event.get(path)
+            && now.duration_since(*last) < Duration::from_millis(DEBOUNCE_MS)
+        {
+            return false;
         }
         self.last_event.insert(path.to_path_buf(), now);
         true
@@ -453,10 +453,11 @@ fn handle_create(
 
     let state = db.get_file_state(project.id, &path_str)?;
 
-    if let Some(ref s) = state {
-        if s.latest_hash.as_deref() == Some(&hash) && s.exists_now {
-            return Ok(());
-        }
+    if let Some(ref s) = state
+        && s.latest_hash.as_deref() == Some(&hash)
+        && s.exists_now
+    {
+        return Ok(());
     }
 
     let snap = Some(snapshots::save(project.id, &hash, &content)?);
