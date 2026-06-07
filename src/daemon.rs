@@ -270,12 +270,11 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Lock is held by a live undo daemon — safe to signal this PID.
-    std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
+    // Lock is held by a live undo daemon — safe to signal this PID. Use a
+    // direct kill(2) syscall rather than spawning `/usr/bin/kill`: it avoids a
+    // process fork, removes the PATH/external-binary dependency, and makes the
+    // exact signal explicit.
+    signal_terminate(pid);
 
     for _ in 0..60 {
         if !is_daemon_alive(pid_path) {
@@ -402,6 +401,13 @@ fn try_lock_exclusive(file: &std::fs::File) -> bool {
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
+/// Send SIGTERM to `pid` via a direct syscall. Returns true if the signal was
+/// delivered. A failure (e.g. the process already exited, ESRCH) is not fatal —
+/// the caller polls liveness afterward to confirm the daemon is gone.
+fn signal_terminate(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
+}
+
 /// Probe whether a daemon is alive by trying to lock its PID file.
 /// If we can acquire the lock the daemon is dead; the lock is released
 /// when the probing File handle is dropped.
@@ -415,6 +421,32 @@ fn is_daemon_alive(pid_path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `signal_terminate` must actually deliver SIGTERM via the syscall: spawn a
+    /// long-lived child, signal it, and confirm it exits. Proves the libc::kill
+    /// path is a real replacement for shelling out to `/usr/bin/kill`.
+    #[test]
+    fn signal_terminate_stops_a_live_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        assert!(signal_terminate(pid), "kill() should report success for a live pid");
+
+        // Wait briefly for the default SIGTERM disposition to take effect.
+        let mut exited = false;
+        for _ in 0..50 {
+            if child.try_wait().unwrap().is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(exited, "child should have terminated after SIGTERM");
+        let _ = child.wait();
+    }
 
     /// Watching /usr or similar root-owned paths would silently snapshot system files;
     /// the ownership check must block it.

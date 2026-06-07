@@ -58,16 +58,35 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Force `database.db` and its `-wal`/`-shm` sidecars to mode 0600.
+/// Best-effort (like the rest of the permission tightening): a chmod failure
+/// is non-fatal because the parent `~/.undo` is already 0700.
+fn restrict_db_files(db_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = db_path.as_os_str().to_os_string();
+        p.push(suffix);
+        let p = std::path::PathBuf::from(p);
+        if p.exists() {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 impl Database {
     pub fn open() -> Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::backtrack_dir()?;
         let db_path = dir.join("database.db");
         let conn =
             Connection::open(&db_path).context("failed to open database")?;
         apply_schema(&conn)?;
-        // Restrict DB file to owner-only (0600)
-        let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        // Restrict the DB and its WAL sidecars to owner-only. apply_schema()
+        // enables WAL mode, which creates `-wal` and `-shm` — and SQLite
+        // creates THOSE with the process umask (typically 0644), even though
+        // they hold the same data as the main DB. Lock all three down so the
+        // 0600 policy actually covers every file that contains snapshot data,
+        // not just `database.db`.
+        restrict_db_files(&db_path);
         Ok(Self { conn })
     }
 
@@ -480,6 +499,38 @@ mod tests {
     fn project(db: &Database) -> crate::models::WatchedProject {
         db.get_or_create_project(Path::new("/home/user/project"))
             .expect("create project")
+    }
+
+    /// The on-disk DB *and* its WAL sidecars must be owner-only (0600). SQLite
+    /// creates `-wal`/`-shm` with the umask (0644 by default), so without the
+    /// explicit chmod in `open()` those files — which hold the same snapshot
+    /// data as the main DB — would be group/world readable.
+    /// (Red before `restrict_db_files`: `-wal`/`-shm` come out 0644.)
+    #[test]
+    fn open_restricts_db_and_wal_files_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(dir.path().to_path_buf());
+
+        let db = Database::open().expect("open on-disk db");
+        // Force a write so the WAL is materialized.
+        db.get_or_create_project(Path::new("/x")).unwrap();
+
+        let base = crate::backtrack_dir().unwrap().join("database.db");
+        let mut checked_wal = false;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = base.as_os_str().to_os_string();
+            p.push(suffix);
+            let p = std::path::PathBuf::from(p);
+            if p.exists() {
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{:?} must be 0600, got {:o}", p, mode);
+                if !suffix.is_empty() {
+                    checked_wal = true;
+                }
+            }
+        }
+        assert!(checked_wal, "expected a -wal or -shm sidecar to exist and be checked");
     }
 
     // ── watched_projects ─────────────────────────────────────────────
