@@ -244,20 +244,40 @@ pub fn total_disk_usage() -> Result<u64> {
     Ok(total)
 }
 
-/// Size of a specific subdirectory under ~/.undo/ in bytes.
-pub fn dir_size(subdir: &str) -> Result<u64> {
+/// Per-bucket disk usage for `~/.undo`, computed in a SINGLE tree walk.
+///
+/// `undo status` previously called `dir_size("snapshots")`, `dir_size("backups")`
+/// and `total_disk_usage()` separately, so the snapshots and backups subtrees
+/// were each walked twice. On a large store that triple-walk made `status`
+/// needlessly slow. This walks `~/.undo` once and attributes each file to its
+/// bucket while accumulating the grand total.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiskUsage {
+    pub total: u64,
+    pub snapshots: u64,
+    pub backups: u64,
+}
+
+pub fn disk_usage_breakdown() -> Result<DiskUsage> {
     let bt_dir = crate::backtrack_dir()?;
-    let target = bt_dir.join(subdir);
-    if !target.exists() {
-        return Ok(0);
-    }
-    let mut total: u64 = 0;
-    for entry in WalkDir::new(&target).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file() {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+    let snapshots_root = bt_dir.join("snapshots");
+    let backups_root = bt_dir.join("backups");
+
+    let mut usage = DiskUsage::default();
+    for entry in WalkDir::new(&bt_dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        usage.total += len;
+        let path = entry.path();
+        if path.starts_with(&snapshots_root) {
+            usage.snapshots += len;
+        } else if path.starts_with(&backups_root) {
+            usage.backups += len;
         }
     }
-    Ok(total)
+    Ok(usage)
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -275,6 +295,48 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A single walk attributes files to the snapshots/backups buckets and
+    /// sums the grand total — including files that belong to neither bucket
+    /// (db, pids), which count toward `total` only. This is the behavior
+    /// `cmd_status` relies on after collapsing its three walks into one.
+    #[test]
+    fn disk_usage_breakdown_buckets_and_totals_in_one_walk() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let bt = crate::backtrack_dir().unwrap();
+
+        // snapshots/<id>/<hash>.gz
+        let snap_dir = bt.join("snapshots").join("1");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(snap_dir.join("a.gz"), vec![b'x'; 100]).unwrap();
+        std::fs::write(snap_dir.join("b.gz"), vec![b'x'; 50]).unwrap();
+
+        // backups/<name>.bak
+        let backups_dir = bt.join("backups");
+        std::fs::create_dir_all(&backups_dir).unwrap();
+        std::fs::write(backups_dir.join("f.bak"), vec![b'y'; 30]).unwrap();
+
+        // A file in neither bucket: counts toward total only.
+        std::fs::write(bt.join("database.db"), vec![b'z'; 7]).unwrap();
+
+        let usage = disk_usage_breakdown().unwrap();
+        assert_eq!(usage.snapshots, 150, "snapshots bucket");
+        assert_eq!(usage.backups, 30, "backups bucket");
+        assert_eq!(usage.total, 187, "total includes db (150 + 30 + 7)");
+    }
+
+    /// With no store on disk yet, every bucket is zero (no panic on an empty
+    /// or freshly-created data dir).
+    #[test]
+    fn disk_usage_breakdown_empty_store_is_zero() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let usage = disk_usage_breakdown().unwrap();
+        assert_eq!(usage.total, 0);
+        assert_eq!(usage.snapshots, 0);
+        assert_eq!(usage.backups, 0);
+    }
 
     /// The built-in defaults are 7 days retention and a 1 GiB size cap.
     #[test]

@@ -173,6 +173,21 @@ pub fn relative_path<'a>(abs_path: &'a str, project_root: &str) -> &'a str {
         .unwrap_or(abs_path)
 }
 
+/// Lowercase-hex encode bytes into a single allocation. The previous
+/// `bytes.iter().map(|b| format!("{:02x}", b)).collect()` idiom heap-allocated
+/// a `String` per byte (32 allocations per SHA-256), which is wasteful on the
+/// hashing hot path. A pre-sized buffer + nibble lookup avoids both the
+/// per-byte allocation and the `format!` machinery.
+pub fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn format_local_time(timestamp: i64) -> String {
     use chrono::{Local, TimeZone};
     Local
@@ -330,6 +345,28 @@ mod tests {
         assert_eq!(event_color("RENAMED"), BLUE);
         // Unknown types should return an empty string (no color).
         assert_eq!(event_color("UNKNOWN"), "");
+    }
+
+    /// to_hex produces lowercase, zero-padded, two-chars-per-byte output —
+    /// including a leading zero nibble, which is the easy thing to get wrong.
+    #[test]
+    fn to_hex_encodes_known_vectors() {
+        assert_eq!(to_hex(&[]), "");
+        assert_eq!(to_hex(&[0x00]), "00");
+        assert_eq!(to_hex(&[0x0f]), "0f");
+        assert_eq!(to_hex(&[0xff]), "ff");
+        assert_eq!(to_hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+    }
+
+    /// to_hex must be byte-for-byte identical to the previous
+    /// `map(|b| format!("{:02x}", b)).collect()` idiom it replaced, across the
+    /// full 0..=255 byte range.
+    #[test]
+    fn to_hex_matches_format_reference() {
+        let all: Vec<u8> = (0..=255).collect();
+        let reference: String = all.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(to_hex(&all), reference);
+        assert_eq!(to_hex(&all).len(), all.len() * 2);
     }
 }
 

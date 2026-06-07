@@ -14,7 +14,7 @@ use crate::{backtrack_dir, BOLD, GREEN, RED, RESET, YELLOW};
 /// Uses a truncated SHA-256 so each project gets its own file.
 fn pid_file_for_root(bt_dir: &Path, root: &Path) -> PathBuf {
     let hash = Sha256::digest(root.to_string_lossy().as_bytes());
-    let short: String = hash.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+    let short = crate::to_hex(&hash[..8]);
     bt_dir.join("pids").join(format!("{}.pid", short))
 }
 
@@ -372,14 +372,13 @@ pub fn cmd_status() -> Result<()> {
                 crate::retention::format_size(cfg.max_size_mb * 1024 * 1024),
             );
 
-            let snap_size = crate::retention::dir_size("snapshots").unwrap_or(0);
-            let backup_size = crate::retention::dir_size("backups").unwrap_or(0);
-            let total = crate::retention::total_disk_usage().unwrap_or(0);
+            // Single tree walk instead of three (was: dir_size x2 + total).
+            let usage = crate::retention::disk_usage_breakdown().unwrap_or_default();
             println!(
                 "Disk:      {} (snapshots: {}, backups: {}, db: {})",
-                crate::retention::format_size(total),
-                crate::retention::format_size(snap_size),
-                crate::retention::format_size(backup_size),
+                crate::retention::format_size(usage.total),
+                crate::retention::format_size(usage.snapshots),
+                crate::retention::format_size(usage.backups),
                 crate::retention::format_size(db_size),
             );
         }

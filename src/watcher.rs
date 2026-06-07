@@ -40,7 +40,7 @@ fn fs_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) ->
 
 fn compute_hash(data: &[u8]) -> String {
     let result = Sha256::digest(data);
-    result.iter().map(|b| format!("{:02x}", b)).collect()
+    crate::to_hex(&result)
 }
 
 // ── debouncer ───────────────────────────────────────────────────────
