@@ -307,15 +307,29 @@ pub fn watch_directory(
                 if paused {
                     continue;
                 }
-                if let Err(e) =
+                // Guard each event so a single panic (a bug in one handler, a
+                // malformed event) can never unwind and kill the whole daemon —
+                // which would stop recording silently while still appearing to
+                // run. Log and move on to the next event instead.
+                match guard_event(|| {
                     process_event(db, project, root, event, &mut debouncer, verbose)
-                {
-                    // Always surface errors — a silent failure means the user
-                    // believes changes are being recorded when they aren't.
-                    eprintln!(
-                        "{}warning:{} failed to record event: {}",
-                        crate::YELLOW, crate::RESET, e
-                    );
+                }) {
+                    EventOutcome::Ok => {}
+                    EventOutcome::Failed(e) => {
+                        // Always surface errors — a silent failure means the user
+                        // believes changes are being recorded when they aren't.
+                        eprintln!(
+                            "{}warning:{} failed to record event: {}",
+                            crate::YELLOW, crate::RESET, e
+                        );
+                    }
+                    EventOutcome::Panicked => {
+                        eprintln!(
+                            "{}warning:{} panicked while processing an event — \
+                             skipping it; daemon continues",
+                            crate::YELLOW, crate::RESET
+                        );
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -334,6 +348,28 @@ pub fn watch_directory(
 }
 
 // ── event dispatch ──────────────────────────────────────────────────
+
+/// Result of attempting to process one watcher event, including the panic case
+/// so the watch loop can keep running after any single failure.
+enum EventOutcome {
+    Ok,
+    Failed(String),
+    Panicked,
+}
+
+/// Run `f` (the per-event processing) catching both errors and panics.
+/// `AssertUnwindSafe` is required because the closure mutably borrows the
+/// debouncer and holds a DB handle; that is sound here because on a panic we
+/// discard the event and continue — no partially-mutated state is observed
+/// across the boundary in a way that could violate invariants (DB writes are
+/// autocommit; the debouncer is just a timing cache).
+fn guard_event<F: FnOnce() -> Result<()>>(f: F) -> EventOutcome {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(())) => EventOutcome::Ok,
+        Ok(Err(e)) => EventOutcome::Failed(e.to_string()),
+        Err(_) => EventOutcome::Panicked,
+    }
+}
 
 fn process_event(
     db: &Database,
@@ -637,6 +673,41 @@ fn handle_rename(
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    /// guard_event maps a successful handler to Ok.
+    #[test]
+    fn guard_event_passes_through_success() {
+        assert!(matches!(guard_event(|| Ok(())), EventOutcome::Ok));
+    }
+
+    /// guard_event surfaces a handler error as Failed without unwinding.
+    #[test]
+    fn guard_event_reports_errors() {
+        let outcome = guard_event(|| anyhow::bail!("boom"));
+        match outcome {
+            EventOutcome::Failed(msg) => assert!(msg.contains("boom")),
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    /// The crux of the fix: a panicking handler is caught and reported as
+    /// Panicked rather than unwinding the watch loop and killing the daemon.
+    /// (Before the guard, this panic propagated out of `process_event` and
+    /// took the whole daemon down.)
+    #[test]
+    fn guard_event_catches_panics() {
+        // Silence the default panic hook so the caught panic doesn't spam the
+        // test output with a backtrace.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = guard_event(|| panic!("simulated handler panic"));
+        std::panic::set_hook(prev);
+
+        assert!(
+            matches!(outcome, EventOutcome::Panicked),
+            "a panic in event processing must be caught, not propagated"
+        );
+    }
 
     /// A directory exceeding the file limit is rejected with a clear error unless --force is set.
     #[test]
