@@ -25,13 +25,20 @@ pub fn parse_duration(s: &str) -> Result<i64> {
         bail!("duration must be positive");
     }
 
-    match unit {
-        's' => Ok(num),
-        'm' => Ok(num * 60),
-        'h' => Ok(num * 3600),
-        'd' => Ok(num * 86400),
+    // Use checked multiplication: a large value like "999999999999999d"
+    // parses cleanly as an i64 but `num * 86400` overflows. In debug builds
+    // that panics (crashing the CLI / daemon auto-prune); in release builds it
+    // wraps silently to a NEGATIVE value, which in `prune` becomes a cutoff
+    // FAR in the future and deletes the entire history. Reject the overflow.
+    let factor: i64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
         _ => bail!("unknown duration unit '{}' — use s, m, h, or d", unit),
-    }
+    };
+    num.checked_mul(factor)
+        .ok_or_else(|| anyhow::anyhow!("duration '{}' is too large", s))
 }
 
 /// Format an elapsed duration in seconds into a human-readable string.
@@ -111,6 +118,34 @@ mod tests {
     #[test]
     fn parse_empty_string_does_not_panic() {
         assert!(parse_duration("").is_err());
+    }
+
+    /// A value whose `number * unit_factor` overflows i64 must be rejected
+    /// cleanly. "999999999999999d" parses as a valid i64 but `* 86400`
+    /// overflows: in debug it would panic, in release it wraps to a negative
+    /// value that makes `prune` compute a future cutoff and wipe all history.
+    /// (Red before the `checked_mul` fix: the multiply panicked under the
+    /// debug overflow checks that tests run with.)
+    #[test]
+    fn parse_overflowing_duration_is_rejected() {
+        let result = parse_duration("999999999999999d");
+        assert!(
+            result.is_err(),
+            "an overflowing duration must error, not panic or wrap; got {:?}",
+            result
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("too large"),
+            "error should explain the value is too large"
+        );
+    }
+
+    /// The largest non-overflowing second-count is accepted unchanged, proving
+    /// the overflow guard does not reject ordinary in-range values.
+    #[test]
+    fn parse_max_in_range_seconds_is_accepted() {
+        let s = format!("{}s", i64::MAX);
+        assert_eq!(parse_duration(&s).unwrap(), i64::MAX);
     }
 
     /// Durations under 60 seconds are shown as seconds.

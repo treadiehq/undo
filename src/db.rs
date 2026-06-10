@@ -275,6 +275,31 @@ impl Database {
             .context("failed to query event at time")
     }
 
+    /// Find the most recent DELETED event for a path, if any. A deleted file's
+    /// last captured content survives only in the event's `previous_hash`, so
+    /// restore uses this as a last resort when no non-DELETE event remains.
+    pub fn get_latest_deleted_event(
+        &self,
+        project_id: i64,
+        path: &str,
+    ) -> Result<Option<FileEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND path = ?2
+                   AND event_type = 'DELETED'
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                params![project_id, path],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query latest deleted event")
+    }
+
     /// Find the oldest non-DELETE event for a file (the earliest known state).
     pub fn get_oldest_event(
         &self,
@@ -429,13 +454,28 @@ impl Database {
         // that gate, `mark_deleted` leaves the row's `latest_hash` set, so
         // every file ever deleted permanently anchors its snapshot and
         // retention can never reclaim that disk space.
+        //
+        // The third arm pins the `previous_hash` of surviving DELETED events.
+        // When a file is removed, its DELETED event carries `current_hash =
+        // NULL` and only `previous_hash` points at the last captured content.
+        // If that file's creating event has already aged out of retention,
+        // nothing else references the snapshot, so without this arm the only
+        // copy of a just-deleted file is orphaned and pruned immediately —
+        // making the file unrecoverable even though the user deleted it
+        // seconds ago. The pin lasts exactly as long as the DELETED event
+        // itself (until `delete_events_before` removes it), so the snapshot is
+        // still reclaimed once the deletion ages past the retention window.
         let mut stmt = self.conn.prepare(
             "SELECT current_hash FROM file_events
              WHERE project_id = ?1 AND current_hash IS NOT NULL
              UNION
              SELECT latest_hash FROM file_state
              WHERE project_id = ?1 AND latest_hash IS NOT NULL
-               AND exists_now = 1",
+               AND exists_now = 1
+             UNION
+             SELECT previous_hash FROM file_events
+             WHERE project_id = ?1 AND event_type = 'DELETED'
+               AND previous_hash IS NOT NULL",
         )?;
         let hashes = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         hashes
@@ -715,6 +755,52 @@ mod tests {
             "deleted file's latest_hash must not be live: {:?}",
             hashes
         );
+    }
+
+    /// A surviving DELETED event must keep its `previous_hash` (the file's last
+    /// captured content) alive, so a just-deleted file whose creating event has
+    /// aged out of retention is still recoverable. Without this pin the only
+    /// snapshot of the deleted file is orphaned and pruned immediately.
+    /// (Red before adding the DELETED `previous_hash` arm to `get_live_hashes`.)
+    #[test]
+    fn get_live_hashes_pins_deleted_event_previous_hash() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/gone.rs";
+
+        // Simulate handle_delete: a DELETED event whose previous_hash is the
+        // last known content, and no surviving non-DELETE event for the path.
+        db.insert_event(p.id, path, "DELETED", None, Some("last_content_hash"),
+            None, None, None).unwrap();
+
+        let hashes = db.get_live_hashes(p.id).unwrap();
+        assert!(
+            hashes.contains("last_content_hash"),
+            "a deleted file's last content must stay live while its DELETED \
+             event survives: {:?}",
+            hashes
+        );
+    }
+
+    /// Returns the most recent DELETED event so restore can fall back to its
+    /// previous_hash; returns None when the file was never deleted.
+    #[test]
+    fn get_latest_deleted_event_finds_deletion() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/gone.rs";
+
+        assert!(
+            db.get_latest_deleted_event(p.id, path).unwrap().is_none(),
+            "no deletion recorded yet"
+        );
+
+        db.insert_event(p.id, path, "DELETED", None, Some("prev_hash"),
+            None, None, None).unwrap();
+
+        let ev = db.get_latest_deleted_event(p.id, path).unwrap().unwrap();
+        assert_eq!(ev.event_type, "DELETED");
+        assert_eq!(ev.previous_hash.as_deref(), Some("prev_hash"));
     }
 
     /// All created project IDs appear in the returned list.
