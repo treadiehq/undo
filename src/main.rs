@@ -38,7 +38,7 @@ pub const RESET: &str = "\x1b[0m";
 #[cfg(test)]
 thread_local! {
     static TEST_DATA_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Redirect `backtrack_dir()` to `path` for the duration of the current test.
@@ -192,147 +192,6 @@ fn event_color(event_type: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The project root and leading slash are stripped to yield a clean relative path.
-    #[test]
-    fn relative_path_strips_prefix_and_leading_slash() {
-        assert_eq!(
-            relative_path("/home/user/project/src/main.rs", "/home/user/project"),
-            "src/main.rs"
-        );
-    }
-
-    /// A path outside the project root is returned unchanged.
-    #[test]
-    fn relative_path_returns_original_when_no_prefix_match() {
-        assert_eq!(
-            relative_path("/other/file.rs", "/home/user/project"),
-            "/other/file.rs"
-        );
-    }
-
-    /// ../ components that escape the project root must be blocked to prevent path traversal.
-    #[test]
-    fn safe_resolve_path_rejects_traversal_outside_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
-        // "../../etc/passwd" should escape the project root.
-        let result = safe_resolve_path(dir.path(), "../../etc/passwd", root);
-        assert!(result.is_err(), "path traversal must be rejected");
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("outside the project root"), "got: {}", msg);
-    }
-
-    /// A well-formed subpath within the root is accepted and resolved correctly.
-    #[test]
-    fn safe_resolve_path_allows_valid_subpath() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
-        // A simple nested path that stays within the root must succeed.
-        let result = safe_resolve_path(dir.path(), "src/main.rs", root);
-        assert!(result.is_ok(), "valid subpath must be accepted");
-        let resolved = result.unwrap();
-        // Compare against the canonicalized root: on macOS the system tmpdir
-        // is `/var/folders/...` which is a symlink to `/private/var/folders/...`.
-        // The fix for non-existent parent-symlink escapes resolves the deepest
-        // existing ancestor through `canonicalize()`, so the returned path is
-        // in canonical form and must be checked against the canonical root.
-        let canonical_root = dir.path().canonicalize().unwrap();
-        assert!(
-            resolved.starts_with(&canonical_root),
-            "resolved {:?} must live under canonical root {:?}",
-            resolved,
-            canonical_root
-        );
-    }
-
-    /// A non-existent ABSOLUTE path outside the project root must be rejected.
-    /// The previous normaliser dropped Component::RootDir, so "/etc/shadow"
-    /// was silently rewritten to "<cwd>/etc/shadow" — which sometimes lay
-    /// inside the project root and slipped past the bounds check.
-    #[test]
-    fn safe_resolve_path_rejects_nonexistent_absolute_path_outside_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
-        // Use an absolute path that does not exist and lives well outside cwd.
-        let target = "/nonexistent_absolute_path_outside/test_file.xyz";
-        let result = safe_resolve_path(dir.path(), target, root);
-        assert!(
-            result.is_err(),
-            "absolute non-existent path outside root must be rejected, got: {:?}",
-            result
-        );
-    }
-
-    /// A non-existent path whose *parent* is a symlink pointing outside the
-    /// project root must be rejected. Syntactic normalization alone is not
-    /// enough: `<root>/sym/missing.txt` (where `sym -> /tmp/...`) reads as
-    /// "inside the root" but `open()` would follow the symlink and write to
-    /// `/tmp/.../missing.txt`. The fix canonicalizes the deepest existing
-    /// ancestor and re-attaches the tail so the bounds check sees the real
-    /// destination.
-    #[test]
-    fn safe_resolve_path_rejects_nonexistent_path_through_parent_symlink() {
-        use std::os::unix::fs::symlink;
-        let root_dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let root = root_dir.path().to_str().unwrap();
-
-        // <root>/sym -> <outside>
-        symlink(outside.path(), root_dir.path().join("sym")).unwrap();
-
-        // The leaf does not exist on either side of the symlink. The old
-        // implementation accepted this because syntactic normalization yields
-        // "<root>/sym/missing.txt" — passes the prefix check.
-        let result = safe_resolve_path(root_dir.path(), "sym/missing.txt", root);
-        assert!(
-            result.is_err(),
-            "non-existent path through a parent symlink that escapes the root must be rejected, got: {:?}",
-            result
-        );
-    }
-
-    /// A non-existent absolute path *inside* the project root resolves correctly,
-    /// landing under the canonical root rather than being re-anchored under cwd.
-    /// (The old normaliser dropped `Component::RootDir` and produced
-    /// "<cwd>/<root>/<path>".) The path is now also canonicalized through any
-    /// ancestor symlinks (e.g. macOS `/var → /private/var`), so the
-    /// expectation is built from the canonical root.
-    #[test]
-    fn safe_resolve_path_normalises_nonexistent_absolute_path_inside_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root_path = dir.path();
-        let root = root_path.to_str().unwrap();
-
-        // Build an absolute path that's inside the root but doesn't exist on disk.
-        let target_str = format!("{}/missing/child.rs", root);
-        let resolved = safe_resolve_path(root_path, &target_str, root)
-            .expect("absolute path inside root must be accepted");
-
-        let canonical_root = root_path.canonicalize().unwrap();
-        let expected = canonical_root.join("missing").join("child.rs");
-        assert_eq!(
-            resolved, expected,
-            "absolute non-existent path must land under the canonical root, \
-             not be re-anchored under cwd"
-        );
-    }
-
-    /// Every event type maps to the expected ANSI colour; unknown types produce no colour code.
-    #[test]
-    fn event_color_maps_all_known_types() {
-        assert_eq!(event_color("MODIFIED"), YELLOW);
-        assert_eq!(event_color("CREATED"), GREEN);
-        assert_eq!(event_color("DELETED"), RED);
-        assert_eq!(event_color("RENAMED"), BLUE);
-        // Unknown types should return an empty string (no color).
-        assert_eq!(event_color("UNKNOWN"), "");
-    }
-}
-
 // ── entry point ─────────────────────────────────────────────────────
 
 fn main() {
@@ -480,4 +339,145 @@ fn cmd_what_changed(duration_str: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The project root and leading slash are stripped to yield a clean relative path.
+    #[test]
+    fn relative_path_strips_prefix_and_leading_slash() {
+        assert_eq!(
+            relative_path("/home/user/project/src/main.rs", "/home/user/project"),
+            "src/main.rs"
+        );
+    }
+
+    /// A path outside the project root is returned unchanged.
+    #[test]
+    fn relative_path_returns_original_when_no_prefix_match() {
+        assert_eq!(
+            relative_path("/other/file.rs", "/home/user/project"),
+            "/other/file.rs"
+        );
+    }
+
+    /// ../ components that escape the project root must be blocked to prevent path traversal.
+    #[test]
+    fn safe_resolve_path_rejects_traversal_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        // "../../etc/passwd" should escape the project root.
+        let result = safe_resolve_path(dir.path(), "../../etc/passwd", root);
+        assert!(result.is_err(), "path traversal must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("outside the project root"), "got: {}", msg);
+    }
+
+    /// A well-formed subpath within the root is accepted and resolved correctly.
+    #[test]
+    fn safe_resolve_path_allows_valid_subpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        // A simple nested path that stays within the root must succeed.
+        let result = safe_resolve_path(dir.path(), "src/main.rs", root);
+        assert!(result.is_ok(), "valid subpath must be accepted");
+        let resolved = result.unwrap();
+        // Compare against the canonicalized root: on macOS the system tmpdir
+        // is `/var/folders/...` which is a symlink to `/private/var/folders/...`.
+        // The fix for non-existent parent-symlink escapes resolves the deepest
+        // existing ancestor through `canonicalize()`, so the returned path is
+        // in canonical form and must be checked against the canonical root.
+        let canonical_root = dir.path().canonicalize().unwrap();
+        assert!(
+            resolved.starts_with(&canonical_root),
+            "resolved {:?} must live under canonical root {:?}",
+            resolved,
+            canonical_root
+        );
+    }
+
+    /// A non-existent ABSOLUTE path outside the project root must be rejected.
+    /// The previous normaliser dropped Component::RootDir, so "/etc/shadow"
+    /// was silently rewritten to "<cwd>/etc/shadow" — which sometimes lay
+    /// inside the project root and slipped past the bounds check.
+    #[test]
+    fn safe_resolve_path_rejects_nonexistent_absolute_path_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        // Use an absolute path that does not exist and lives well outside cwd.
+        let target = "/nonexistent_absolute_path_outside/test_file.xyz";
+        let result = safe_resolve_path(dir.path(), target, root);
+        assert!(
+            result.is_err(),
+            "absolute non-existent path outside root must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    /// A non-existent path whose *parent* is a symlink pointing outside the
+    /// project root must be rejected. Syntactic normalization alone is not
+    /// enough: `<root>/sym/missing.txt` (where `sym -> /tmp/...`) reads as
+    /// "inside the root" but `open()` would follow the symlink and write to
+    /// `/tmp/.../missing.txt`. The fix canonicalizes the deepest existing
+    /// ancestor and re-attaches the tail so the bounds check sees the real
+    /// destination.
+    #[test]
+    fn safe_resolve_path_rejects_nonexistent_path_through_parent_symlink() {
+        use std::os::unix::fs::symlink;
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = root_dir.path().to_str().unwrap();
+
+        // <root>/sym -> <outside>
+        symlink(outside.path(), root_dir.path().join("sym")).unwrap();
+
+        // The leaf does not exist on either side of the symlink. The old
+        // implementation accepted this because syntactic normalization yields
+        // "<root>/sym/missing.txt" — passes the prefix check.
+        let result = safe_resolve_path(root_dir.path(), "sym/missing.txt", root);
+        assert!(
+            result.is_err(),
+            "non-existent path through a parent symlink that escapes the root must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    /// A non-existent absolute path *inside* the project root resolves correctly,
+    /// landing under the canonical root rather than being re-anchored under cwd.
+    /// (The old normaliser dropped `Component::RootDir` and produced
+    /// "<cwd>/<root>/<path>".) The path is now also canonicalized through any
+    /// ancestor symlinks (e.g. macOS `/var → /private/var`), so the
+    /// expectation is built from the canonical root.
+    #[test]
+    fn safe_resolve_path_normalises_nonexistent_absolute_path_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_path = dir.path();
+        let root = root_path.to_str().unwrap();
+
+        // Build an absolute path that's inside the root but doesn't exist on disk.
+        let target_str = format!("{}/missing/child.rs", root);
+        let resolved = safe_resolve_path(root_path, &target_str, root)
+            .expect("absolute path inside root must be accepted");
+
+        let canonical_root = root_path.canonicalize().unwrap();
+        let expected = canonical_root.join("missing").join("child.rs");
+        assert_eq!(
+            resolved, expected,
+            "absolute non-existent path must land under the canonical root, \
+             not be re-anchored under cwd"
+        );
+    }
+
+    /// Every event type maps to the expected ANSI colour; unknown types produce no colour code.
+    #[test]
+    fn event_color_maps_all_known_types() {
+        assert_eq!(event_color("MODIFIED"), YELLOW);
+        assert_eq!(event_color("CREATED"), GREEN);
+        assert_eq!(event_color("DELETED"), RED);
+        assert_eq!(event_color("RENAMED"), BLUE);
+        // Unknown types should return an empty string (no color).
+        assert_eq!(event_color("UNKNOWN"), "");
+    }
 }

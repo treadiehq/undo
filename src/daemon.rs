@@ -166,6 +166,9 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         .create(true)
         .read(true)
         .write(true)
+        // Do not truncate on open: if a live daemon holds the lock we read the
+        // existing PID/path back; we only clear it (set_len(0)) after we win it.
+        .truncate(false)
         .open(&pid_path)?;
 
     if !try_lock_exclusive(&pid_file) {
@@ -311,10 +314,10 @@ fn stop_all_daemons(bt_dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(&pids_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("pid") {
-            if stop_one_daemon(&path).is_ok() {
-                stopped += 1;
-            }
+        if path.extension().and_then(|e| e.to_str()) == Some("pid")
+            && stop_one_daemon(&path).is_ok()
+        {
+            stopped += 1;
         }
     }
 
@@ -511,6 +514,7 @@ mod tests {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&path)
             .unwrap();
         assert!(try_lock_exclusive(&file), "failed to lock test PID file");
@@ -611,7 +615,7 @@ mod tests {
         let root = "/proj/self";
         let path = pid_file_for_root(bt, Path::new(root));
         let file = std::fs::OpenOptions::new()
-            .create(true).read(true).write(true).open(&path).unwrap();
+            .create(true).read(true).write(true).truncate(false).open(&path).unwrap();
         assert!(try_lock_exclusive(&file));
         use std::io::Write;
         write!(&file, "{}\n{}", std::process::id(), root).unwrap();
