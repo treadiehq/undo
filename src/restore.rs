@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::duration;
 use crate::snapshots;
-use crate::{find_project, GREEN, RESET};
+use crate::{GREEN, RESET, find_project};
 use anyhow::Result;
 use chrono::Utc;
 use std::io::Write;
@@ -139,34 +139,34 @@ fn resolve_restore_source(
     path: &str,
     target_time: i64,
 ) -> Result<Option<RestoreSource>> {
-    if let Some(e) = db.get_event_at_time(project_id, path, target_time)? {
-        if let Some(hash) = e.current_hash {
-            return Ok(Some(RestoreSource {
-                hash,
-                timestamp: e.timestamp,
-                kind: RestoreKind::Exact,
-            }));
-        }
+    if let Some(e) = db.get_event_at_time(project_id, path, target_time)?
+        && let Some(hash) = e.current_hash
+    {
+        return Ok(Some(RestoreSource {
+            hash,
+            timestamp: e.timestamp,
+            kind: RestoreKind::Exact,
+        }));
     }
 
-    if let Some(e) = db.get_oldest_event(project_id, path)? {
-        if let Some(hash) = e.current_hash {
-            return Ok(Some(RestoreSource {
-                hash,
-                timestamp: e.timestamp,
-                kind: RestoreKind::OldestFallback,
-            }));
-        }
+    if let Some(e) = db.get_oldest_event(project_id, path)?
+        && let Some(hash) = e.current_hash
+    {
+        return Ok(Some(RestoreSource {
+            hash,
+            timestamp: e.timestamp,
+            kind: RestoreKind::OldestFallback,
+        }));
     }
 
-    if let Some(e) = db.get_latest_deleted_event(project_id, path)? {
-        if let Some(hash) = e.previous_hash {
-            return Ok(Some(RestoreSource {
-                hash,
-                timestamp: e.timestamp,
-                kind: RestoreKind::DeletedFallback,
-            }));
-        }
+    if let Some(e) = db.get_latest_deleted_event(project_id, path)?
+        && let Some(hash) = e.previous_hash
+    {
+        return Ok(Some(RestoreSource {
+            hash,
+            timestamp: e.timestamp,
+            kind: RestoreKind::DeletedFallback,
+        }));
     }
 
     Ok(None)
@@ -261,7 +261,7 @@ mod tests {
         assert!(!is_symlink);
     }
 
-    use super::{resolve_restore_source, RestoreKind};
+    use super::{RestoreKind, resolve_restore_source};
     use crate::db::Database;
 
     fn mem_db() -> (Database, i64) {
@@ -285,8 +285,17 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
 
         // Only a DELETED event remains (creating/modify events already pruned).
-        db.insert_event(pid, path, "DELETED", None, Some("last_hash"),
-            None, None, None).unwrap();
+        db.insert_event(
+            pid,
+            path,
+            "DELETED",
+            None,
+            Some("last_hash"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Both pre-existing lookups return nothing — what the old code saw.
         assert!(db.get_event_at_time(pid, path, now).unwrap().is_none());
@@ -307,13 +316,24 @@ mod tests {
     fn resolve_prefers_exact_snapshot_over_fallbacks() {
         let (db, pid) = mem_db();
         let path = "/proj/live.rs";
-        db.insert_event(pid, path, "MODIFIED", Some("good_hash"), None,
-            None, None, None).unwrap();
+        db.insert_event(
+            pid,
+            path,
+            "MODIFIED",
+            Some("good_hash"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Query with a comfortably-future target so the event (timestamped at
         // insert time) is unambiguously "at or before" it.
         let target = chrono::Utc::now().timestamp() + 3600;
 
-        let src = resolve_restore_source(&db, pid, path, target).unwrap().unwrap();
+        let src = resolve_restore_source(&db, pid, path, target)
+            .unwrap()
+            .unwrap();
         assert_eq!(src.hash, "good_hash");
         assert_eq!(src.kind, RestoreKind::Exact);
     }
@@ -324,8 +344,10 @@ mod tests {
     fn resolve_returns_none_when_nothing_recorded() {
         let (db, pid) = mem_db();
         let now = chrono::Utc::now().timestamp();
-        assert!(resolve_restore_source(&db, pid, "/proj/never.rs", now)
-            .unwrap()
-            .is_none());
+        assert!(
+            resolve_restore_source(&db, pid, "/proj/never.rs", now)
+                .unwrap()
+                .is_none()
+        );
     }
 }

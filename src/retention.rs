@@ -52,9 +52,7 @@ impl RetentionConfig {
     /// wraps to a tiny cap that triggers over-aggressive snapshot deletion.
     /// Saturate instead so the cap degrades to "effectively unlimited".
     pub fn max_size_bytes(&self) -> u64 {
-        self.max_size_mb
-            .saturating_mul(1024)
-            .saturating_mul(1024)
+        self.max_size_mb.saturating_mul(1024).saturating_mul(1024)
     }
 }
 
@@ -127,9 +125,7 @@ pub fn prune(
     // 2. Delete orphaned snapshots
     let live_hashes = db.get_live_hashes(project_id)?;
     let bt_dir = crate::backtrack_dir()?;
-    let snap_dir = bt_dir
-        .join("snapshots")
-        .join(project_id.to_string());
+    let snap_dir = bt_dir.join("snapshots").join(project_id.to_string());
 
     if snap_dir.exists() {
         for entry in std::fs::read_dir(&snap_dir)? {
@@ -138,10 +134,7 @@ pub fn prune(
             if path.extension().and_then(|e| e.to_str()) != Some("gz") {
                 continue;
             }
-            let hash = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let hash = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if !live_hashes.contains(hash) {
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 if !dry_run {
@@ -198,9 +191,7 @@ pub fn prune(
                 }
                 let mut files: Vec<_> = std::fs::read_dir(&sdir)?
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().extension().and_then(|x| x.to_str()) == Some("gz")
-                    })
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gz"))
                     .collect();
                 files.sort_by_key(|e| {
                     e.metadata()
@@ -386,11 +377,7 @@ mod tests {
     #[test]
     fn load_config_reads_undorc_from_given_root_not_subdir() {
         let project_root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            project_root.path().join(".undorc"),
-            "retention_days = 42\n",
-        )
-        .unwrap();
+        std::fs::write(project_root.path().join(".undorc"), "retention_days = 42\n").unwrap();
 
         // A subdirectory with no .undorc of its own — what `cwd` would be when
         // the user runs `undo prune` from `<root>/src/`.
@@ -405,8 +392,7 @@ mod tests {
         // documenting the bug `cmd_prune` previously hit.
         let from_subdir = load_config(Some(&subdir));
         assert_eq!(
-            from_subdir.retention_days,
-            DEFAULT_RETENTION_DAYS,
+            from_subdir.retention_days, DEFAULT_RETENTION_DAYS,
             "passing the subdir to load_config silently loses the project .undorc"
         );
     }
@@ -513,7 +499,10 @@ mod tests {
     #[test]
     fn naive_max_size_multiplication_overflows() {
         assert!(
-            u64::MAX.checked_mul(1024).and_then(|v| v.checked_mul(1024)).is_none(),
+            u64::MAX
+                .checked_mul(1024)
+                .and_then(|v| v.checked_mul(1024))
+                .is_none(),
             "max_size_mb * 1024 * 1024 overflows for large configs — \
              this is why max_size_bytes() must saturate"
         );

@@ -5,11 +5,7 @@ const REPO: &str = "treadiehq/undo";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn cmd_update() -> Result<()> {
-    println!(
-        "{}undo{} — self-update",
-        crate::BOLD,
-        crate::RESET
-    );
+    println!("{}undo{} — self-update", crate::BOLD, crate::RESET);
     println!();
     println!("  Current version: v{}", CURRENT_VERSION);
 
@@ -66,7 +62,8 @@ pub fn cmd_update() -> Result<()> {
         anyhow::bail!("extracted archive does not contain 'undo' binary");
     }
 
-    let current_exe = std::env::current_exe().context("cannot determine current executable path")?;
+    let current_exe =
+        std::env::current_exe().context("cannot determine current executable path")?;
 
     // Move the old binary aside, then install the new one. Both steps must work
     // even though `new_binary` lives in a tempdir that is very often on a

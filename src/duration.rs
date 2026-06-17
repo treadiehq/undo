@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Parse a human-friendly duration string (e.g. "5m", "2h", "1d") into seconds.
 pub fn parse_duration(s: &str) -> Result<i64> {

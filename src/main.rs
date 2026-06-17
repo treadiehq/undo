@@ -76,7 +76,11 @@ pub fn backtrack_dir() -> Result<std::path::PathBuf> {
 
 /// Resolve a user-provided path and verify it stays within the project root.
 /// Prevents path traversal via `../` and symlinks pointing outside the project.
-pub fn safe_resolve_path(cwd: &Path, path_str: &str, project_root: &str) -> Result<std::path::PathBuf> {
+pub fn safe_resolve_path(
+    cwd: &Path,
+    path_str: &str,
+    project_root: &str,
+) -> Result<std::path::PathBuf> {
     let abs_path = cwd.join(path_str);
     let resolved = if abs_path.exists() {
         abs_path.canonicalize()?
@@ -92,7 +96,9 @@ pub fn safe_resolve_path(cwd: &Path, path_str: &str, project_root: &str) -> Resu
             match component {
                 std::path::Component::Prefix(p) => normalized.push(p.as_os_str()),
                 std::path::Component::RootDir => normalized.push("/"),
-                std::path::Component::ParentDir => { normalized.pop(); }
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
                 std::path::Component::Normal(c) => normalized.push(c),
                 std::path::Component::CurDir => {}
             }
@@ -146,8 +152,7 @@ pub fn safe_resolve_path(cwd: &Path, path_str: &str, project_root: &str) -> Resu
     let root_str = root_canonical.to_string_lossy();
 
     if !resolved_str.starts_with(root_str.as_ref())
-        || (resolved_str.len() > root_str.len()
-            && resolved_str.as_bytes()[root_str.len()] != b'/')
+        || (resolved_str.len() > root_str.len() && resolved_str.as_bytes()[root_str.len()] != b'/')
     {
         anyhow::bail!(
             "path '{}' resolves outside the project root ({})",
@@ -161,9 +166,7 @@ pub fn safe_resolve_path(cwd: &Path, path_str: &str, project_root: &str) -> Resu
 
 pub fn find_project(db: &db::Database, cwd: &Path) -> Result<models::WatchedProject> {
     db.find_project_for_path(cwd)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no project is being watched for this directory.\nRun `undo start` first."
-        )
+        anyhow::anyhow!("no project is being watched for this directory.\nRun `undo start` first.")
     })
 }
 

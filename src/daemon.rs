@@ -3,12 +3,12 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::db::Database;
 use crate::watcher;
-use crate::{backtrack_dir, BOLD, GREEN, RED, RESET, YELLOW};
+use crate::{BOLD, GREEN, RED, RESET, YELLOW, backtrack_dir};
 
 /// Derive a per-project PID file path from the project root.
 /// Uses a truncated SHA-256 so each project gets its own file.
@@ -125,12 +125,10 @@ fn check_no_overlap(bt_dir: &Path, new_root: &Path, exclude_pid: u32) -> Result<
         let overlap = if new_str.len() >= ex_str.len() {
             // new_root is equal to or a child of existing
             new_str.starts_with(ex_str.as_ref())
-                && (new_str.len() == ex_str.len()
-                    || new_str.as_bytes()[ex_str.len()] == b'/')
+                && (new_str.len() == ex_str.len() || new_str.as_bytes()[ex_str.len()] == b'/')
         } else {
             // new_root is a parent of existing
-            ex_str.starts_with(new_str.as_ref())
-                && ex_str.as_bytes()[new_str.len()] == b'/'
+            ex_str.starts_with(new_str.as_ref()) && ex_str.as_bytes()[new_str.len()] == b'/'
         };
 
         if overlap {
@@ -304,7 +302,8 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
             "daemon (PID {}) did not stop within 6 seconds.\n\
              The PID file has been left in place so it can be found later.\n\
              Try `kill -9 {}` if the process is stuck.",
-            pid, pid
+            pid,
+            pid
         );
     }
 
@@ -401,10 +400,7 @@ pub fn cmd_status() -> Result<()> {
         }
         None => {
             println!("No project being watched for this directory.");
-            println!(
-                "Run {}undo start{} to begin watching.",
-                BOLD, RESET
-            );
+            println!("Run {}undo start{} to begin watching.", BOLD, RESET);
         }
     }
 
@@ -450,7 +446,10 @@ mod tests {
             .expect("spawn sleep");
         let pid = child.id();
 
-        assert!(signal_terminate(pid), "kill() should report success for a live pid");
+        assert!(
+            signal_terminate(pid),
+            "kill() should report success for a live pid"
+        );
 
         // Wait briefly for the default SIGTERM disposition to take effect.
         let mut exited = false;
@@ -661,7 +660,12 @@ mod tests {
         let root = "/proj/self";
         let path = pid_file_for_root(bt, Path::new(root));
         let file = std::fs::OpenOptions::new()
-            .create(true).read(true).write(true).truncate(false).open(&path).unwrap();
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
         assert!(try_lock_exclusive(&file));
         use std::io::Write;
         write!(&file, "{}\n{}", std::process::id(), root).unwrap();

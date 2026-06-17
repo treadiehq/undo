@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::db::Database;
 use crate::snapshots;
-use crate::{find_project, BOLD, DIM, GREEN, RED, RESET};
+use crate::{BOLD, DIM, GREEN, RED, RESET, find_project};
 
 /// Heuristic: treat content as binary if it contains a NUL byte within the
 /// first 8 KiB (same approach used by git and most editors).

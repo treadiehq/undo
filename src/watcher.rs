@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
@@ -73,12 +73,11 @@ impl Debouncer {
     /// Periodically evict entries that are too old to matter for debouncing.
     fn maybe_cleanup(&mut self) {
         let now = Instant::now();
-        if now.duration_since(self.last_cleanup)
-            < Duration::from_secs(DEBOUNCE_CLEANUP_SECS)
-        {
+        if now.duration_since(self.last_cleanup) < Duration::from_secs(DEBOUNCE_CLEANUP_SECS) {
             return;
         }
-        self.last_event.retain(|_, t| now.duration_since(*t) < DEBOUNCE_MAX_AGE);
+        self.last_event
+            .retain(|_, t| now.duration_since(*t) < DEBOUNCE_MAX_AGE);
         self.last_cleanup = now;
     }
 }
@@ -760,7 +759,9 @@ mod tests {
     /// A non-existent path is not accessible.
     #[test]
     fn root_accessible_returns_false_for_missing_dir() {
-        assert!(!root_is_accessible(Path::new("/nonexistent/path/that/does/not/exist")));
+        assert!(!root_is_accessible(Path::new(
+            "/nonexistent/path/that/does/not/exist"
+        )));
     }
 
     /// A file path is not a directory and must not be considered accessible.
@@ -797,17 +798,24 @@ mod tests {
 
         // Seed the DB with a file that no longer exists on disk.
         let phantom_path = dir.path().join("phantom.rs").to_string_lossy().to_string();
-        db.upsert_file_state(project.id, &phantom_path, "deadbeef", true).unwrap();
+        db.upsert_file_state(project.id, &phantom_path, "deadbeef", true)
+            .unwrap();
 
         // Run the scan on the empty directory — phantom.rs is missing.
         initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX).unwrap();
 
         // The file's state must now be marked deleted.
-        let state = db.get_file_state(project.id, &phantom_path).unwrap().unwrap();
+        let state = db
+            .get_file_state(project.id, &phantom_path)
+            .unwrap()
+            .unwrap();
         assert!(!state.exists_now);
 
         // A DELETED event must have been recorded.
-        let event = db.get_latest_event(project.id, &phantom_path).unwrap().unwrap();
+        let event = db
+            .get_latest_event(project.id, &phantom_path)
+            .unwrap()
+            .unwrap();
         assert_eq!(event.event_type, "DELETED");
     }
 }

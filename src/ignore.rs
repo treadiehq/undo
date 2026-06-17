@@ -35,7 +35,9 @@ fn matches_builtin(path: &Path, project_root: &Path) -> bool {
     for component in rel.components() {
         if let std::path::Component::Normal(name) = component {
             let name_str = name.to_string_lossy();
-            if IGNORED_NAMES.iter().any(|&ignored| ignored == name_str.as_ref())
+            if IGNORED_NAMES
+                .iter()
+                .any(|&ignored| ignored == name_str.as_ref())
                 || is_dotenv_file(name_str.as_ref())
             {
                 return true;
@@ -134,9 +136,7 @@ pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
 
 #[cfg(test)]
 pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
-    THREAD_IGNORE.with(|gi| {
-        should_ignore_with(gi.borrow().as_ref(), path, project_root)
-    })
+    THREAD_IGNORE.with(|gi| should_ignore_with(gi.borrow().as_ref(), path, project_root))
 }
 
 #[cfg(test)]
@@ -196,7 +196,12 @@ mod tests {
     /// (Red before broadening the builtin matcher to cover `.env.*`.)
     #[test]
     fn dotenv_variant_files_are_ignored() {
-        for name in [".env.development", ".env.staging", ".env.test", ".env.local.bak"] {
+        for name in [
+            ".env.development",
+            ".env.staging",
+            ".env.test",
+            ".env.local.bak",
+        ] {
             let path = Path::new("/home/user/project").join(name);
             assert!(
                 should_ignore(&path, root()),
@@ -322,19 +327,35 @@ mod tests {
             init(&root_a);
             let foo = root_a.join("test.foo");
             let bar = root_a.join("test.bar");
-            assert!(should_ignore(&foo, &root_a), "thread A: *.foo should be ignored");
-            assert!(!should_ignore(&bar, &root_a), "thread A: *.bar should not be ignored");
+            assert!(
+                should_ignore(&foo, &root_a),
+                "thread A: *.foo should be ignored"
+            );
+            assert!(
+                !should_ignore(&bar, &root_a),
+                "thread A: *.bar should not be ignored"
+            );
         });
 
         let handle_b = std::thread::spawn(move || {
             init(&root_b);
             let foo = root_b.join("test.foo");
             let bar = root_b.join("test.bar");
-            assert!(!should_ignore(&foo, &root_b), "thread B: *.foo should not be ignored");
-            assert!(should_ignore(&bar, &root_b), "thread B: *.bar should be ignored");
+            assert!(
+                !should_ignore(&foo, &root_b),
+                "thread B: *.foo should not be ignored"
+            );
+            assert!(
+                should_ignore(&bar, &root_b),
+                "thread B: *.bar should be ignored"
+            );
         });
 
-        handle_a.join().expect("thread A panicked — matchers bled across threads");
-        handle_b.join().expect("thread B panicked — matchers bled across threads");
+        handle_a
+            .join()
+            .expect("thread A panicked — matchers bled across threads");
+        handle_b
+            .join()
+            .expect("thread B panicked — matchers bled across threads");
     }
 }

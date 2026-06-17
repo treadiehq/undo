@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -77,8 +77,7 @@ impl Database {
     pub fn open() -> Result<Self> {
         let dir = crate::backtrack_dir()?;
         let db_path = dir.join("database.db");
-        let conn =
-            Connection::open(&db_path).context("failed to open database")?;
+        let conn = Connection::open(&db_path).context("failed to open database")?;
         apply_schema(&conn)?;
         // Restrict the DB and its WAL sidecars to owner-only. apply_schema()
         // enables WAL mode, which creates `-wal` and `-shm` — and SQLite
@@ -92,8 +91,7 @@ impl Database {
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()
-            .context("failed to open in-memory database")?;
+        let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
         apply_schema(&conn)?;
         Ok(Self { conn })
     }
@@ -144,10 +142,7 @@ impl Database {
         Ok(project)
     }
 
-    pub fn find_project_for_path(
-        &self,
-        path: &Path,
-    ) -> Result<Option<WatchedProject>> {
+    pub fn find_project_for_path(&self, path: &Path) -> Result<Option<WatchedProject>> {
         let path_str = path.to_string_lossy().to_string();
         // ORDER BY LENGTH DESC ensures the most specific (longest) root_path
         // wins when multiple watched projects are nested inside one another —
@@ -211,11 +206,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_timeline(
-        &self,
-        project_id: i64,
-        limit: usize,
-    ) -> Result<Vec<FileEvent>> {
+    pub fn get_timeline(&self, project_id: i64, limit: usize) -> Result<Vec<FileEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, timestamp, path, event_type,
                     current_hash, previous_hash, snapshot_path, old_path, file_size
@@ -242,18 +233,13 @@ impl Database {
              WHERE project_id = ?1 AND timestamp >= ?2
              ORDER BY timestamp DESC",
         )?;
-        let events =
-            stmt.query_map(params![project_id, since_timestamp], row_to_event)?;
+        let events = stmt.query_map(params![project_id, since_timestamp], row_to_event)?;
         events
             .collect::<Result<Vec<_>, _>>()
             .context("failed to query events")
     }
 
-    pub fn get_latest_event(
-        &self,
-        project_id: i64,
-        path: &str,
-    ) -> Result<Option<FileEvent>> {
+    pub fn get_latest_event(&self, project_id: i64, path: &str) -> Result<Option<FileEvent>> {
         self.conn
             .query_row(
                 "SELECT id, project_id, timestamp, path, event_type,
@@ -320,11 +306,7 @@ impl Database {
     }
 
     /// Find the oldest non-DELETE event for a file (the earliest known state).
-    pub fn get_oldest_event(
-        &self,
-        project_id: i64,
-        path: &str,
-    ) -> Result<Option<FileEvent>> {
+    pub fn get_oldest_event(&self, project_id: i64, path: &str) -> Result<Option<FileEvent>> {
         self.conn
             .query_row(
                 "SELECT id, project_id, timestamp, path, event_type,
@@ -374,11 +356,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_file_state(
-        &self,
-        project_id: i64,
-        path: &str,
-    ) -> Result<Option<FileState>> {
+    pub fn get_file_state(&self, project_id: i64, path: &str) -> Result<Option<FileState>> {
         self.conn
             .query_row(
                 "SELECT id, project_id, path, latest_hash, last_seen_at, exists_now
@@ -410,10 +388,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_all_file_states(
-        &self,
-        project_id: i64,
-    ) -> Result<Vec<FileState>> {
+    pub fn get_all_file_states(&self, project_id: i64) -> Result<Vec<FileState>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, path, latest_hash, last_seen_at, exists_now
              FROM file_state
@@ -436,11 +411,7 @@ impl Database {
 
     // ── retention / pruning ──────────────────────────────────────────
 
-    pub fn count_events_before(
-        &self,
-        project_id: i64,
-        before_ts: i64,
-    ) -> Result<u64> {
+    pub fn count_events_before(&self, project_id: i64, before_ts: i64) -> Result<u64> {
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM file_events
@@ -452,11 +423,7 @@ impl Database {
             .context("failed to count events before timestamp")
     }
 
-    pub fn delete_events_before(
-        &self,
-        project_id: i64,
-        before_ts: i64,
-    ) -> Result<u64> {
+    pub fn delete_events_before(&self, project_id: i64, before_ts: i64) -> Result<u64> {
         let deleted = self.conn.execute(
             "DELETE FROM file_events
              WHERE project_id = ?1 AND timestamp < ?2",
@@ -570,7 +537,10 @@ mod tests {
                 }
             }
         }
-        assert!(checked_wal, "expected a -wal or -shm sidecar to exist and be checked");
+        assert!(
+            checked_wal,
+            "expected a -wal or -shm sidecar to exist and be checked"
+        );
     }
 
     // ── watched_projects ─────────────────────────────────────────────
@@ -644,12 +614,8 @@ mod tests {
     #[test]
     fn find_project_returns_most_specific_nested_match() {
         let db = db();
-        let parent = db
-            .get_or_create_project(Path::new("/a/b"))
-            .unwrap();
-        let child = db
-            .get_or_create_project(Path::new("/a/b/c"))
-            .unwrap();
+        let parent = db.get_or_create_project(Path::new("/a/b")).unwrap();
+        let child = db.get_or_create_project(Path::new("/a/b/c")).unwrap();
         let found = db
             .find_project_for_path(Path::new("/a/b/c/src/main.rs"))
             .unwrap()
@@ -665,10 +631,28 @@ mod tests {
     fn insert_events_and_count() {
         let db = db();
         let p = project(&db);
-        db.insert_event(p.id, "/home/user/project/a.rs", "CREATED",
-            Some("aaa"), None, None, None, Some(10)).unwrap();
-        db.insert_event(p.id, "/home/user/project/b.rs", "MODIFIED",
-            Some("bbb"), Some("bbb0"), None, None, Some(20)).unwrap();
+        db.insert_event(
+            p.id,
+            "/home/user/project/a.rs",
+            "CREATED",
+            Some("aaa"),
+            None,
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+        db.insert_event(
+            p.id,
+            "/home/user/project/b.rs",
+            "MODIFIED",
+            Some("bbb"),
+            Some("bbb0"),
+            None,
+            None,
+            Some(20),
+        )
+        .unwrap();
         assert_eq!(db.count_events(p.id).unwrap(), 2);
     }
 
@@ -691,17 +675,27 @@ mod tests {
     fn seed_events(db: &Database, project_id: i64) {
         let now = chrono::Utc::now().timestamp();
         // Old event: 10 days ago
-        db.conn.execute(
-            "INSERT INTO file_events (project_id, timestamp, path, event_type, current_hash)
+        db.conn
+            .execute(
+                "INSERT INTO file_events (project_id, timestamp, path, event_type, current_hash)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![project_id, now - 864_000, "/p/old.rs", "MODIFIED", "hash_old"],
-        ).unwrap();
+                params![
+                    project_id,
+                    now - 864_000,
+                    "/p/old.rs",
+                    "MODIFIED",
+                    "hash_old"
+                ],
+            )
+            .unwrap();
         // Recent event: 1 hour ago
-        db.conn.execute(
-            "INSERT INTO file_events (project_id, timestamp, path, event_type, current_hash)
+        db.conn
+            .execute(
+                "INSERT INTO file_events (project_id, timestamp, path, event_type, current_hash)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![project_id, now - 3600, "/p/new.rs", "MODIFIED", "hash_new"],
-        ).unwrap();
+                params![project_id, now - 3600, "/p/new.rs", "MODIFIED", "hash_new"],
+            )
+            .unwrap();
     }
 
     /// Only events older than the cutoff timestamp are included in the count.
@@ -788,7 +782,8 @@ mod tests {
 
         // Track the file, then mark it deleted (mimicking `handle_delete`,
         // which leaves `latest_hash` populated).
-        db.upsert_file_state(p.id, path, "ghost_hash", true).unwrap();
+        db.upsert_file_state(p.id, path, "ghost_hash", true)
+            .unwrap();
         db.mark_deleted(p.id, path).unwrap();
         let state = db.get_file_state(p.id, path).unwrap().unwrap();
         assert!(!state.exists_now, "test setup: file must be marked deleted");
@@ -821,8 +816,17 @@ mod tests {
 
         // Simulate handle_delete: a DELETED event whose previous_hash is the
         // last known content, and no surviving non-DELETE event for the path.
-        db.insert_event(p.id, path, "DELETED", None, Some("last_content_hash"),
-            None, None, None).unwrap();
+        db.insert_event(
+            p.id,
+            path,
+            "DELETED",
+            None,
+            Some("last_content_hash"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let hashes = db.get_live_hashes(p.id).unwrap();
         assert!(
@@ -846,8 +850,17 @@ mod tests {
             "no deletion recorded yet"
         );
 
-        db.insert_event(p.id, path, "DELETED", None, Some("prev_hash"),
-            None, None, None).unwrap();
+        db.insert_event(
+            p.id,
+            path,
+            "DELETED",
+            None,
+            Some("prev_hash"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let ev = db.get_latest_deleted_event(p.id, path).unwrap().unwrap();
         assert_eq!(ev.event_type, "DELETED");
@@ -873,8 +886,10 @@ mod tests {
         let path = "/home/user/project/foo.rs";
         // Insert two events for the same path via insert_event_at so we control ordering.
         let now = chrono::Utc::now().timestamp();
-        db.insert_event_at(p.id, path, "CREATED", now - 100).unwrap();
-        db.insert_event_at(p.id, path, "MODIFIED", now - 10).unwrap();
+        db.insert_event_at(p.id, path, "CREATED", now - 100)
+            .unwrap();
+        db.insert_event_at(p.id, path, "MODIFIED", now - 10)
+            .unwrap();
         let event = db.get_latest_event(p.id, path).unwrap().unwrap();
         assert_eq!(event.event_type, "MODIFIED");
     }
@@ -888,12 +903,18 @@ mod tests {
         let path = "/home/user/project/bar.rs";
         let now = chrono::Utc::now().timestamp();
         // Seed: CREATED long ago, MODIFIED in the middle, DELETED recently.
-        db.insert_event_at(p.id, path, "CREATED", now - 300).unwrap();
-        db.insert_event_at(p.id, path, "MODIFIED", now - 200).unwrap();
-        db.insert_event_at(p.id, path, "DELETED", now - 100).unwrap();
+        db.insert_event_at(p.id, path, "CREATED", now - 300)
+            .unwrap();
+        db.insert_event_at(p.id, path, "MODIFIED", now - 200)
+            .unwrap();
+        db.insert_event_at(p.id, path, "DELETED", now - 100)
+            .unwrap();
 
         // Querying at now-150 should return MODIFIED (newest non-DELETE at or before that point).
-        let event = db.get_event_at_time(p.id, path, now - 150).unwrap().unwrap();
+        let event = db
+            .get_event_at_time(p.id, path, now - 150)
+            .unwrap()
+            .unwrap();
         assert_eq!(event.event_type, "MODIFIED");
 
         // Querying before any event returns None.

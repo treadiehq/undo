@@ -69,10 +69,10 @@ impl Logger {
         if len < self.max_bytes {
             return;
         }
-        if std::fs::rename(&self.path, &self.rotated).is_ok() {
-            if let Ok(file) = open_append_0600(&self.path) {
-                self.file = file;
-            }
+        if std::fs::rename(&self.path, &self.rotated).is_ok()
+            && let Ok(file) = open_append_0600(&self.path)
+        {
+            self.file = file;
         }
     }
 
@@ -80,7 +80,14 @@ impl Logger {
         self.rotate_if_needed();
         let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
         // One write per line; O_APPEND keeps concurrent daemons' lines intact.
-        let _ = writeln!(self.file, "{} [{}] {} {}", ts, std::process::id(), level.as_str(), msg);
+        let _ = writeln!(
+            self.file,
+            "{} [{}] {} {}",
+            ts,
+            std::process::id(),
+            level.as_str(),
+            msg
+        );
         let _ = self.file.flush();
     }
 }
@@ -137,10 +144,10 @@ pub fn install_panic_hook() {
 }
 
 fn to_file(level: Level, msg: &str) {
-    if let Some(handle) = LOGGER.get() {
-        if let Ok(mut logger) = handle.lock() {
-            logger.write_line(level, msg);
-        }
+    if let Some(handle) = LOGGER.get()
+        && let Ok(mut logger) = handle.lock()
+    {
+        logger.write_line(level, msg);
     }
 }
 
@@ -216,7 +223,10 @@ mod tests {
         logger.write_line(Level::Warn, "disk gremlins detected");
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("WARN"), "level missing: {contents}");
-        assert!(contents.contains("disk gremlins detected"), "message missing: {contents}");
+        assert!(
+            contents.contains("disk gremlins detected"),
+            "message missing: {contents}"
+        );
         assert!(
             contents.contains(&format!("[{}]", std::process::id())),
             "pid prefix missing: {contents}"
@@ -246,10 +256,19 @@ mod tests {
         // Tiny cap so a handful of lines triggers rotation.
         let mut logger = Logger::open(path.clone(), 128).unwrap();
         for _ in 0..50 {
-            logger.write_line(Level::Info, "filler line long enough to exceed the tiny cap quickly");
+            logger.write_line(
+                Level::Info,
+                "filler line long enough to exceed the tiny cap quickly",
+            );
         }
-        assert!(rotated.exists(), "a rotated .1 file must exist after exceeding the cap");
-        assert!(path.exists(), "the active log must be reopened after rotation");
+        assert!(
+            rotated.exists(),
+            "a rotated .1 file must exist after exceeding the cap"
+        );
+        assert!(
+            path.exists(),
+            "the active log must be reopened after rotation"
+        );
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the reopened log must remain owner-only");
     }
