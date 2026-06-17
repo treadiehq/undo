@@ -238,6 +238,19 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         _ => {}
     }
 
+    // Flag any snapshot referenced by a currently-existing file that's missing
+    // from the store (e.g. lost to a power cut). Existence-only so startup stays
+    // fast; `undo status` runs the deeper decompress check on demand.
+    match crate::integrity::check(&db, project.id, false) {
+        Ok(report) if !report.is_clean() => crate::log_warn!(
+            "integrity: {} of {} current-file snapshot(s) are missing from the store",
+            report.missing,
+            report.checked,
+        ),
+        Ok(_) => {}
+        Err(e) => crate::log_warn!("integrity check failed: {}", e),
+    }
+
     // pid_file (and its lock) stays alive for the duration of the watch loop.
     watcher::watch_directory(&db, &project, &cwd, shutdown, verbose)?;
 
@@ -395,6 +408,22 @@ pub fn cmd_status() -> Result<()> {
                 crate::retention::format_size(usage.backups),
                 crate::retention::format_size(db_size),
             );
+
+            // Deep integrity check (decompresses each current-file snapshot) —
+            // affordable here because status is user-invoked, unlike startup.
+            let integrity = crate::integrity::check(&db, project.id, true).unwrap_or_default();
+            let integrity_line = if integrity.is_clean() {
+                format!(
+                    "{}OK{} ({} snapshot(s) verified)",
+                    GREEN, RESET, integrity.checked
+                )
+            } else {
+                format!(
+                    "{}{} missing, {} corrupt{} of {} checked",
+                    RED, integrity.missing, integrity.corrupt, RESET, integrity.checked
+                )
+            };
+            println!("Integrity: {}", integrity_line);
 
             println!("Log:       {}", crate::logging::log_path(&bt_dir).display());
         }

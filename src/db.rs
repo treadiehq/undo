@@ -8,6 +8,11 @@ use crate::models::{FileEvent, FileState, WatchedProject};
 
 pub struct Database {
     conn: Connection,
+    /// Reentrancy guard for `transaction`. SQLite rejects a nested `BEGIN`, but
+    /// the error is opaque; this turns an accidental nested `transaction()` call
+    /// into a clear, early failure. Not shared across threads — the daemon drives
+    /// one connection from a single thread.
+    in_txn: std::cell::Cell<bool>,
 }
 
 fn apply_schema(conn: &Connection) -> Result<()> {
@@ -100,14 +105,20 @@ impl Database {
         // 0600 policy actually covers every file that contains snapshot data,
         // not just `database.db`.
         restrict_db_files(&db_path);
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            in_txn: std::cell::Cell::new(false),
+        })
     }
 
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
         apply_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            in_txn: std::cell::Cell::new(false),
+        })
     }
 
     /// Run `f` inside a single SQLite transaction, committing on `Ok` and rolling
@@ -115,8 +126,16 @@ impl Database {
     /// avoids a per-statement WAL commit on the on-disk database, which dominates
     /// scan time for large repositories.
     pub fn transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        if self.in_txn.get() {
+            anyhow::bail!("nested Database::transaction is not supported");
+        }
         self.conn.execute_batch("BEGIN")?;
-        match f(self) {
+        self.in_txn.set(true);
+        let result = f(self);
+        // Clear the guard before COMMIT/ROLLBACK so an error in those statements
+        // doesn't strand the connection as "in transaction" for later calls.
+        self.in_txn.set(false);
+        match result {
             Ok(value) => {
                 self.conn.execute_batch("COMMIT")?;
                 Ok(value)
@@ -549,6 +568,91 @@ mod tests {
         Database::open_in_memory().expect("in-memory DB")
     }
 
+    // ── transaction ──────────────────────────────────────────────────
+
+    /// On `Ok`, the transaction commits and its writes are durable.
+    #[test]
+    fn transaction_commits_on_ok() {
+        let db = db();
+        let p = project(&db);
+        db.transaction(|db| {
+            db.insert_event(
+                p.id,
+                "/p/a.rs",
+                "CREATED",
+                Some("h"),
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .unwrap();
+        assert_eq!(db.count_events(p.id).unwrap(), 1);
+    }
+
+    /// On `Err`, every write inside the transaction is rolled back — this is what
+    /// makes the live handlers' event + state pair all-or-nothing.
+    #[test]
+    fn transaction_rolls_back_on_error() {
+        let db = db();
+        let p = project(&db);
+        let result: Result<()> = db.transaction(|db| {
+            db.insert_event(
+                p.id,
+                "/p/a.rs",
+                "CREATED",
+                Some("h"),
+                None,
+                None,
+                None,
+                None,
+            )?;
+            // Fail after a successful write; the insert above must not persist.
+            anyhow::bail!("boom")
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            db.count_events(p.id).unwrap(),
+            0,
+            "a failed transaction must leave no rows behind"
+        );
+    }
+
+    /// A nested `transaction` call is rejected up front rather than producing
+    /// SQLite's opaque "cannot start a transaction within a transaction".
+    #[test]
+    fn nested_transaction_is_rejected() {
+        let db = db();
+        let outer: Result<()> = db.transaction(|db| db.transaction(|_| Ok(())));
+        let err = outer.unwrap_err().to_string();
+        assert!(err.contains("nested"), "got: {err}");
+    }
+
+    /// After a transaction fails, the reentrancy guard must be cleared so the
+    /// next transaction still works (regression for the `in_txn` flag handling).
+    #[test]
+    fn transaction_guard_clears_after_error() {
+        let db = db();
+        let p = project(&db);
+        let _ = db.transaction(|_| -> Result<()> { anyhow::bail!("boom") });
+        // A subsequent transaction must not be wrongly seen as nested.
+        db.transaction(|db| {
+            db.insert_event(
+                p.id,
+                "/p/b.rs",
+                "CREATED",
+                Some("h"),
+                None,
+                None,
+                None,
+                None,
+            )
+        })
+        .unwrap();
+        assert_eq!(db.count_events(p.id).unwrap(), 1);
+    }
+
     fn project(db: &Database) -> crate::models::WatchedProject {
         db.get_or_create_project(Path::new("/home/user/project"))
             .expect("create project")
@@ -750,7 +854,10 @@ mod tests {
         // Running the schema migration must add the columns, not drop the row.
         apply_schema(&conn).unwrap();
 
-        let db = Database { conn };
+        let db = Database {
+            conn,
+            in_txn: std::cell::Cell::new(false),
+        };
         let state = db.get_file_state(1, "/legacy.rs").unwrap().unwrap();
         assert_eq!(state.latest_hash.as_deref(), Some("oldhash"));
         assert_eq!(state.size, None, "legacy rows have no recorded size");
