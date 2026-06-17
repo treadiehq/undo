@@ -38,10 +38,20 @@ impl Default for RetentionConfig {
 
 impl RetentionConfig {
     /// Effective retention window in seconds.
+    ///
+    /// Clamped to `i64::MAX`. `retention_days` comes from user config, so a huge
+    /// value would make `retention_days * 86400` exceed `i64::MAX`; the bare
+    /// `as i64` cast then *wraps to a negative number*, and `now - retention_seconds()`
+    /// becomes a cutoff in the FUTURE — which makes prune delete the entire
+    /// history (every timestamp is "before" a future cutoff). Saturating keeps
+    /// the window non-negative; callers pair it with `saturating_sub` so an
+    /// effectively-infinite window degrades to "keep everything", never "delete
+    /// everything".
     pub fn retention_seconds(&self) -> i64 {
+        let ceiling = i64::MAX as u64;
         match self.retention_secs_override {
-            Some(s) => s as i64,
-            None => self.retention_days.saturating_mul(86400) as i64,
+            Some(s) => s.min(ceiling) as i64,
+            None => self.retention_days.saturating_mul(86400).min(ceiling) as i64,
         }
     }
 
@@ -113,7 +123,12 @@ pub fn prune(
         bytes_freed: 0,
     };
 
-    let cutoff = Utc::now().timestamp() - config.retention_seconds();
+    // saturating_sub so an effectively-infinite retention window (a huge
+    // `retention_days`) yields a cutoff far in the PAST ("keep everything"),
+    // never an underflow that wraps into the future and deletes everything.
+    let cutoff = Utc::now()
+        .timestamp()
+        .saturating_sub(config.retention_seconds());
 
     // 1. Delete old events
     if dry_run {
@@ -149,7 +164,9 @@ pub fn prune(
     // 3. Delete old backups
     let backups_dir = bt_dir.join("backups");
     if backups_dir.exists() {
-        let backup_cutoff = Utc::now().timestamp() - config.retention_seconds();
+        let backup_cutoff = Utc::now()
+            .timestamp()
+            .saturating_sub(config.retention_seconds());
         for entry in std::fs::read_dir(&backups_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -508,17 +525,67 @@ mod tests {
         );
     }
 
-    /// An enormous retention_days must not overflow the seconds conversion
-    /// either (same `* 86400` hazard).
+    /// An enormous retention_days must not overflow the seconds conversion.
+    /// The bare `saturating_mul(86400) as i64` *wraps to a negative value* for
+    /// large day counts; `retention_seconds()` must instead clamp to a
+    /// non-negative window (`i64::MAX`) so the downstream `now - window` cutoff
+    /// can never land in the future. (Red before the `.min(i64::MAX as u64)`
+    /// clamp: `u64::MAX` days returns `-1`.)
     #[test]
     fn retention_seconds_saturates_for_huge_days() {
+        for days in [u64::MAX, 1_000_000_000_000_000, 213_503_982_334_601] {
+            let cfg = RetentionConfig {
+                retention_days: days,
+                max_size_mb: 1024,
+                retention_secs_override: None,
+            };
+            let secs = cfg.retention_seconds();
+            assert!(
+                secs >= 0,
+                "retention window must never be negative (got {secs} for {days} days) — \
+                 a negative window makes prune's cutoff land in the future"
+            );
+            assert_eq!(secs, i64::MAX, "an oversized window must clamp to i64::MAX");
+        }
+    }
+
+    /// End-to-end guard for the data-loss footgun: with an enormous
+    /// `retention_days`, `prune` must KEEP recent events, not wipe them. Before
+    /// the fix, `retention_seconds()` wrapped negative and the cutoff landed in
+    /// the future, so `delete_events_before` removed every event on the next
+    /// (hourly) auto-prune.
+    #[test]
+    fn prune_with_huge_retention_days_keeps_recent_events() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+        // A brand-new event (timestamped "now") that must survive pruning.
+        db.insert_event(
+            project.id,
+            "/proj/a.rs",
+            "CREATED",
+            Some("h"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.count_events(project.id).unwrap(), 1);
+
         let cfg = RetentionConfig {
-            retention_days: u64::MAX,
+            retention_days: 1_000_000_000_000_000, // wraps negative without the clamp
             max_size_mb: 1024,
             retention_secs_override: None,
         };
-        // saturating_mul keeps it within u64, then `as i64` clamps high bits;
-        // the key property is that it does not panic.
-        let _ = cfg.retention_seconds();
+        prune(&db, project.id, &cfg, false).unwrap();
+
+        assert_eq!(
+            db.count_events(project.id).unwrap(),
+            1,
+            "a huge retention window must keep everything, not delete it"
+        );
     }
 }
