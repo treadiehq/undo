@@ -103,9 +103,12 @@ pub fn init(project_root: &Path) {
 
 /// Apply a compiled Gitignore matcher to a path. Returns `Some(true/false)`
 /// if the matcher has an opinion, or `None` to fall through to the builtin list.
-fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path) -> Option<bool> {
+/// `is_dir` is passed in (rather than re-`stat`ed here) so callers that already
+/// know the entry type — e.g. the initial scan, where WalkDir reports it — avoid
+/// a redundant syscall per path.
+fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path, is_dir: bool) -> Option<bool> {
     let rel = path.strip_prefix(project_root).unwrap_or(path);
-    let m = gi.matched(rel, path.is_dir());
+    let m = gi.matched(rel, is_dir);
     if m.is_whitelist() {
         Some(false)
     } else if m.is_ignore() {
@@ -118,9 +121,14 @@ fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path) -> Option<boo
 /// Core decision function shared by both production and test paths.
 /// Only the *storage* of the matcher differs; the branching logic here
 /// is always the same code that ships in the binary.
-fn should_ignore_with(gi: Option<&Gitignore>, path: &Path, project_root: &Path) -> bool {
+fn should_ignore_with(
+    gi: Option<&Gitignore>,
+    path: &Path,
+    project_root: &Path,
+    is_dir: bool,
+) -> bool {
     if let Some(gi) = gi
-        && let Some(result) = apply_matcher(gi, path, project_root)
+        && let Some(result) = apply_matcher(gi, path, project_root, is_dir)
     {
         return result;
     }
@@ -129,14 +137,30 @@ fn should_ignore_with(gi: Option<&Gitignore>, path: &Path, project_root: &Path) 
 
 /// Returns true if the path should be excluded from watching.
 /// Negation patterns in `.undoignore` (e.g. `!build/`) override the builtin list.
+///
+/// Resolves directory-ness with a single `is_dir()` stat. Callers that already
+/// know whether the path is a directory should prefer [`should_ignore_with_type`].
 #[cfg(not(test))]
 pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
-    should_ignore_with(CUSTOM_IGNORE.get(), path, project_root)
+    should_ignore_with_type(path, project_root, path.is_dir())
+}
+
+/// As [`should_ignore`], but the caller supplies `is_dir`, avoiding a stat when
+/// the entry type is already known (WalkDir during the initial scan, or a
+/// `symlink_metadata` already taken on the live event path).
+#[cfg(not(test))]
+pub fn should_ignore_with_type(path: &Path, project_root: &Path, is_dir: bool) -> bool {
+    should_ignore_with(CUSTOM_IGNORE.get(), path, project_root, is_dir)
 }
 
 #[cfg(test)]
 pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
-    THREAD_IGNORE.with(|gi| should_ignore_with(gi.borrow().as_ref(), path, project_root))
+    should_ignore_with_type(path, project_root, path.is_dir())
+}
+
+#[cfg(test)]
+pub fn should_ignore_with_type(path: &Path, project_root: &Path, is_dir: bool) -> bool {
+    THREAD_IGNORE.with(|gi| should_ignore_with(gi.borrow().as_ref(), path, project_root, is_dir))
 }
 
 #[cfg(test)]
@@ -231,6 +255,29 @@ mod tests {
             Path::new("/home/user/project/environment.rs"),
             root()
         ));
+    }
+
+    /// `should_ignore_with_type` must honour the caller-supplied `is_dir` for
+    /// directory-only patterns, so the initial scan can pass WalkDir's known
+    /// type instead of paying a redundant `is_dir()` stat. A `logs/` pattern
+    /// matches a directory but not a regular file of the same name.
+    #[test]
+    fn should_ignore_with_type_respects_supplied_dir_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // `logs` is not a builtin-ignored name, so only the dir-only pattern decides.
+        std::fs::write(root.join(".undoignore"), "logs/\n").unwrap();
+        init(root);
+
+        let p = root.join("logs");
+        assert!(
+            should_ignore_with_type(&p, root, true),
+            "logs/ must match when the entry is a directory"
+        );
+        assert!(
+            !should_ignore_with_type(&p, root, false),
+            "logs/ must not match when the entry is a regular file"
+        );
     }
 
     /// Glob patterns in .undoignore must cause matching paths to be ignored.

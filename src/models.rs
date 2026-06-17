@@ -24,4 +24,10 @@ pub struct FileState {
     pub latest_hash: Option<String>,
     pub last_seen_at: i64,
     pub exists_now: bool,
+    /// On-disk size in bytes at the time the hash was recorded. `None` for rows
+    /// written before size/mtime tracking (#26); such rows skip the fast path.
+    pub size: Option<i64>,
+    /// Modification time in nanoseconds since the Unix epoch when the hash was
+    /// recorded. Paired with `size` to short-circuit no-op modify events.
+    pub mtime_nanos: Option<i64>,
 }

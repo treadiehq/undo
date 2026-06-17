@@ -44,6 +44,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             latest_hash  TEXT,
             last_seen_at INTEGER NOT NULL,
             exists_now   INTEGER NOT NULL DEFAULT 1,
+            size         INTEGER,
+            mtime_nanos  INTEGER,
             FOREIGN KEY (project_id) REFERENCES watched_projects(id),
             UNIQUE(project_id, path)
         );
@@ -55,6 +57,18 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_state_project_path
             ON file_state(project_id, path);",
     )?;
+
+    // Additive migration (#26): databases created before size/mtime tracking
+    // lack these columns. New databases already have them from the CREATE TABLE
+    // above, so these ALTERs fail with "duplicate column name" — which is the
+    // expected, harmless outcome we deliberately ignore.
+    for stmt in [
+        "ALTER TABLE file_state ADD COLUMN size INTEGER",
+        "ALTER TABLE file_state ADD COLUMN mtime_nanos INTEGER",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
+
     Ok(())
 }
 
@@ -204,12 +218,17 @@ impl Database {
         file_size: Option<i64>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO file_events
+        // `prepare_cached` reuses the parsed statement across calls — the initial
+        // scan applies tens of thousands of these inside one transaction, so
+        // re-parsing the SQL each time would be pure waste (#27).
+        self.conn
+            .prepare_cached(
+                "INSERT INTO file_events
                 (project_id, timestamp, path, event_type,
                  current_hash, previous_hash, snapshot_path, old_path, file_size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
+            )?
+            .execute(params![
                 project_id,
                 now,
                 path,
@@ -219,8 +238,7 @@ impl Database {
                 snapshot_path,
                 old_path,
                 file_size
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -360,24 +378,29 @@ impl Database {
         path: &str,
         hash: &str,
         exists: bool,
+        size: i64,
+        mtime_nanos: Option<i64>,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO file_state (project_id, path, latest_hash, last_seen_at, exists_now)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO file_state (project_id, path, latest_hash, last_seen_at, exists_now, size, mtime_nanos)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(project_id, path) DO UPDATE SET
                 latest_hash  = excluded.latest_hash,
                 last_seen_at = excluded.last_seen_at,
-                exists_now   = excluded.exists_now",
-            params![project_id, path, hash, now, exists as i32],
-        )?;
+                exists_now   = excluded.exists_now,
+                size         = excluded.size,
+                mtime_nanos  = excluded.mtime_nanos",
+            )?
+            .execute(params![project_id, path, hash, now, exists as i32, size, mtime_nanos])?;
         Ok(())
     }
 
     pub fn get_file_state(&self, project_id: i64, path: &str) -> Result<Option<FileState>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, path, latest_hash, last_seen_at, exists_now
+                "SELECT id, project_id, path, latest_hash, last_seen_at, exists_now, size, mtime_nanos
                  FROM file_state
                  WHERE project_id = ?1 AND path = ?2",
                 params![project_id, path],
@@ -389,6 +412,8 @@ impl Database {
                         latest_hash: row.get(3)?,
                         last_seen_at: row.get(4)?,
                         exists_now: row.get::<_, i32>(5)? != 0,
+                        size: row.get(6)?,
+                        mtime_nanos: row.get(7)?,
                     })
                 },
             )
@@ -398,17 +423,18 @@ impl Database {
 
     pub fn mark_deleted(&self, project_id: i64, path: &str) -> Result<()> {
         let now = Utc::now().timestamp();
-        self.conn.execute(
-            "UPDATE file_state SET exists_now = 0, last_seen_at = ?1
+        self.conn
+            .prepare_cached(
+                "UPDATE file_state SET exists_now = 0, last_seen_at = ?1
              WHERE project_id = ?2 AND path = ?3",
-            params![now, project_id, path],
-        )?;
+            )?
+            .execute(params![now, project_id, path])?;
         Ok(())
     }
 
     pub fn get_all_file_states(&self, project_id: i64) -> Result<Vec<FileState>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, path, latest_hash, last_seen_at, exists_now
+            "SELECT id, project_id, path, latest_hash, last_seen_at, exists_now, size, mtime_nanos
              FROM file_state
              WHERE project_id = ?1",
         )?;
@@ -420,6 +446,8 @@ impl Database {
                 latest_hash: row.get(3)?,
                 last_seen_at: row.get(4)?,
                 exists_now: row.get::<_, i32>(5)? != 0,
+                size: row.get(6)?,
+                mtime_nanos: row.get(7)?,
             })
         })?;
         states
@@ -676,16 +704,67 @@ mod tests {
 
     // ── file_state ───────────────────────────────────────────────────
 
-    /// File state written with upsert must be readable back with the correct hash and exists_now flag.
+    /// File state written with upsert must be readable back with the correct
+    /// hash, exists_now flag, and the size/mtime used by the #26 fast path.
     #[test]
     fn upsert_and_retrieve_file_state() {
         let db = db();
         let p = project(&db);
         let path = "/home/user/project/main.rs";
-        db.upsert_file_state(p.id, path, "deadbeef", true).unwrap();
+        db.upsert_file_state(p.id, path, "deadbeef", true, 1234, Some(987_654_321))
+            .unwrap();
         let state = db.get_file_state(p.id, path).unwrap().unwrap();
         assert_eq!(state.latest_hash, Some("deadbeef".to_string()));
         assert!(state.exists_now);
+        assert_eq!(state.size, Some(1234));
+        assert_eq!(state.mtime_nanos, Some(987_654_321));
+    }
+
+    /// A database created before #26 lacks the `size`/`mtime_nanos` columns.
+    /// `apply_schema` must add them in place (additive migration) without losing
+    /// existing rows, and legacy rows must read back as NULL size/mtime so the
+    /// fast path is simply disabled for them rather than misbehaving.
+    #[test]
+    fn migration_backfills_size_and_mtime_columns_on_legacy_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-#26 file_state schema: no size / mtime_nanos.
+        conn.execute_batch(
+            "CREATE TABLE file_state (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id   INTEGER NOT NULL,
+                path         TEXT    NOT NULL,
+                latest_hash  TEXT,
+                last_seen_at INTEGER NOT NULL,
+                exists_now   INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(project_id, path)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_state (project_id, path, latest_hash, last_seen_at, exists_now)
+             VALUES (1, '/legacy.rs', 'oldhash', 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        // Running the schema migration must add the columns, not drop the row.
+        apply_schema(&conn).unwrap();
+
+        let db = Database { conn };
+        let state = db.get_file_state(1, "/legacy.rs").unwrap().unwrap();
+        assert_eq!(state.latest_hash.as_deref(), Some("oldhash"));
+        assert_eq!(state.size, None, "legacy rows have no recorded size");
+        assert_eq!(
+            state.mtime_nanos, None,
+            "legacy rows have no recorded mtime"
+        );
+
+        // And the migrated table accepts new size/mtime writes.
+        db.upsert_file_state(1, "/legacy.rs", "newhash", true, 42, Some(7))
+            .unwrap();
+        let updated = db.get_file_state(1, "/legacy.rs").unwrap().unwrap();
+        assert_eq!(updated.size, Some(42));
+        assert_eq!(updated.mtime_nanos, Some(7));
     }
 
     // ── retention methods ───────────────────────────────────────────
@@ -773,7 +852,7 @@ mod tests {
         let db = db();
         let p = project(&db);
         // No events exist for this path; only file_state references the hash.
-        db.upsert_file_state(p.id, "/p/extant.rs", "fs_only_hash", true)
+        db.upsert_file_state(p.id, "/p/extant.rs", "fs_only_hash", true, 0, None)
             .unwrap();
         let hashes = db.get_live_hashes(p.id).unwrap();
         assert!(
@@ -800,7 +879,7 @@ mod tests {
 
         // Track the file, then mark it deleted (mimicking `handle_delete`,
         // which leaves `latest_hash` populated).
-        db.upsert_file_state(p.id, path, "ghost_hash", true)
+        db.upsert_file_state(p.id, path, "ghost_hash", true, 0, None)
             .unwrap();
         db.mark_deleted(p.id, path).unwrap();
         let state = db.get_file_state(p.id, path).unwrap().unwrap();
@@ -946,7 +1025,8 @@ mod tests {
         let db = db();
         let p = project(&db);
         let path = "/home/user/project/gone.rs";
-        db.upsert_file_state(p.id, path, "abc123", true).unwrap();
+        db.upsert_file_state(p.id, path, "abc123", true, 0, None)
+            .unwrap();
         // Confirm it's alive before we delete it.
         assert!(db.get_file_state(p.id, path).unwrap().unwrap().exists_now);
         db.mark_deleted(p.id, path).unwrap();

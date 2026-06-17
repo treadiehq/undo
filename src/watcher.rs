@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 use crate::db::Database;
-use crate::ignore::should_ignore;
+use crate::ignore::{should_ignore, should_ignore_with_type};
 use crate::models::{FileState, WatchedProject};
 use crate::snapshots;
 
@@ -41,6 +41,16 @@ fn fs_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) ->
 fn compute_hash(data: &[u8]) -> String {
     let result = Sha256::digest(data);
     crate::to_hex(&result)
+}
+
+/// Modification time as nanoseconds since the Unix epoch, or `None` if the
+/// filesystem doesn't report a usable mtime. Paired with the file size, this
+/// lets modify events short-circuit the read+hash when nothing changed (#26).
+fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
 }
 
 // ── debouncer ───────────────────────────────────────────────────────
@@ -99,14 +109,21 @@ pub fn initial_scan(
 /// hash + snapshot write happen in parallel workers) and applied to the database
 /// serially inside one transaction.
 enum ScanWrite {
-    /// File on disk matches its recorded hash — only refresh `exists_now`.
-    Unchanged { path: String, hash: String },
+    /// File on disk matches its recorded hash — refresh `exists_now` and the
+    /// size/mtime so the live fast path (#26) can short-circuit later events.
+    Unchanged {
+        path: String,
+        hash: String,
+        size: i64,
+        mtime_nanos: Option<i64>,
+    },
     /// File not previously tracked.
     Created {
         path: String,
         hash: String,
         snapshot: String,
         size: i64,
+        mtime_nanos: Option<i64>,
     },
     /// File content changed since the last recorded state.
     Modified {
@@ -115,6 +132,7 @@ enum ScanWrite {
         prev_hash: Option<String>,
         snapshot: String,
         size: i64,
+        mtime_nanos: Option<i64>,
     },
 }
 
@@ -145,6 +163,7 @@ fn scan_one(
     if meta.len() > snapshots::MAX_SNAPSHOT_SIZE as u64 {
         return Ok(None);
     }
+    let mtime = mtime_nanos(&meta);
     let content = match std::fs::read(path) {
         Ok(c) => c,
         Err(_) => return Ok(None),
@@ -158,6 +177,8 @@ fn scan_one(
             Ok(Some(ScanWrite::Unchanged {
                 path: path_str.to_string(),
                 hash,
+                size,
+                mtime_nanos: mtime,
             }))
         }
         Some(state) => {
@@ -168,6 +189,7 @@ fn scan_one(
                 hash,
                 snapshot,
                 size,
+                mtime_nanos: mtime,
             }))
         }
         None => {
@@ -177,6 +199,7 @@ fn scan_one(
                 hash,
                 snapshot,
                 size,
+                mtime_nanos: mtime,
             }))
         }
     }
@@ -257,7 +280,7 @@ fn initial_scan_with_limit(
     let mut total_files = 0usize;
     for entry in WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !should_ignore(e.path(), root))
+        .filter_entry(|e| !should_ignore_with_type(e.path(), root, e.file_type().is_dir()))
     {
         let entry = match entry {
             Ok(e) => e,
@@ -292,14 +315,20 @@ fn initial_scan_with_limit(
     let deletions = db.transaction(|db| -> Result<usize> {
         for write in &writes {
             match write {
-                ScanWrite::Unchanged { path, hash } => {
-                    db.upsert_file_state(project.id, path, hash, true)?;
+                ScanWrite::Unchanged {
+                    path,
+                    hash,
+                    size,
+                    mtime_nanos,
+                } => {
+                    db.upsert_file_state(project.id, path, hash, true, *size, *mtime_nanos)?;
                 }
                 ScanWrite::Created {
                     path,
                     hash,
                     snapshot,
                     size,
+                    mtime_nanos,
                 } => {
                     db.insert_event(
                         project.id,
@@ -311,7 +340,7 @@ fn initial_scan_with_limit(
                         None,
                         Some(*size),
                     )?;
-                    db.upsert_file_state(project.id, path, hash, true)?;
+                    db.upsert_file_state(project.id, path, hash, true, *size, *mtime_nanos)?;
                 }
                 ScanWrite::Modified {
                     path,
@@ -319,6 +348,7 @@ fn initial_scan_with_limit(
                     prev_hash,
                     snapshot,
                     size,
+                    mtime_nanos,
                 } => {
                     db.insert_event(
                         project.id,
@@ -330,7 +360,7 @@ fn initial_scan_with_limit(
                         None,
                         Some(*size),
                     )?;
-                    db.upsert_file_state(project.id, path, hash, true)?;
+                    db.upsert_file_state(project.id, path, hash, true, *size, *mtime_nanos)?;
                     if verbose {
                         eprintln!(
                             "  scan: MODIFIED {}",
@@ -526,22 +556,30 @@ fn process_event(
     match event.kind {
         EventKind::Create(_) => {
             for path in &event.paths {
-                if should_ignore(path, root) || !path.is_file() {
+                // One stat per path: its type drives the ignore check (is_dir),
+                // the regular-file gate, and the snapshot size limit downstream.
+                let Ok(meta) = std::fs::symlink_metadata(path) else {
+                    continue;
+                };
+                if should_ignore_with_type(path, root, meta.is_dir()) || !meta.is_file() {
                     continue;
                 }
                 if debouncer.should_process(path) {
-                    handle_create(db, project, path, verbose)?;
+                    handle_create(db, project, path, meta.len(), mtime_nanos(&meta), verbose)?;
                 }
             }
         }
 
         EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any) => {
             for path in &event.paths {
-                if should_ignore(path, root) || !path.is_file() {
+                let Ok(meta) = std::fs::symlink_metadata(path) else {
+                    continue;
+                };
+                if should_ignore_with_type(path, root, meta.is_dir()) || !meta.is_file() {
                     continue;
                 }
                 if debouncer.should_process(path) {
-                    handle_modify(db, project, path, verbose)?;
+                    handle_modify(db, project, path, meta.len(), mtime_nanos(&meta), verbose)?;
                 }
             }
         }
@@ -551,6 +589,8 @@ fn process_event(
                 return Ok(());
             }
             for path in &event.paths {
+                // The path is gone, so there is no type to stat; the matcher
+                // falls back to its name/extension rules.
                 if should_ignore(path, root) {
                     continue;
                 }
@@ -564,24 +604,49 @@ fn process_event(
             if event.paths.len() >= 2 {
                 let old = &event.paths[0];
                 let new = &event.paths[1];
-                if should_ignore(new, root) {
+                let new_meta = std::fs::symlink_metadata(new).ok();
+                let new_is_dir = new_meta.as_ref().is_some_and(|m| m.is_dir());
+                if should_ignore_with_type(new, root, new_is_dir) {
                     if !should_ignore(old, root) && debouncer.should_process(old) {
                         handle_delete(db, project, old, verbose)?;
                     }
                 } else if debouncer.should_process(new) {
-                    handle_rename(db, project, old, new, verbose)?;
+                    // Only regular files become RENAMED events; symlinks and
+                    // directories are no-ops, matching the old is_symlink guard.
+                    if let Some(meta) = new_meta.filter(|m| m.is_file()) {
+                        handle_rename(
+                            db,
+                            project,
+                            old,
+                            new,
+                            meta.len(),
+                            mtime_nanos(&meta),
+                            verbose,
+                        )?;
+                    }
                 }
             } else {
                 for path in &event.paths {
-                    if should_ignore(path, root) {
+                    let meta = std::fs::symlink_metadata(path).ok();
+                    let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+                    if should_ignore_with_type(path, root, is_dir) {
                         continue;
                     }
-                    if path.exists() && path.is_file() {
-                        if debouncer.should_process(path) {
-                            handle_modify(db, project, path, verbose)?;
+                    match &meta {
+                        // Symlinks are never recorded — skip without a delete.
+                        Some(m) if m.file_type().is_symlink() => {}
+                        Some(m) if m.is_file() => {
+                            if debouncer.should_process(path) {
+                                handle_modify(db, project, path, m.len(), mtime_nanos(m), verbose)?;
+                            }
                         }
-                    } else if debouncer.should_process(path) {
-                        handle_delete(db, project, path, verbose)?;
+                        // Missing (renamed away) or a directory: a delete, which
+                        // is a no-op for anything not tracked as a file.
+                        _ => {
+                            if debouncer.should_process(path) {
+                                handle_delete(db, project, path, verbose)?;
+                            }
+                        }
                     }
                 }
             }
@@ -595,36 +660,27 @@ fn process_event(
 
 // ── per-event handlers ──────────────────────────────────────────────
 
-/// Read a file only if its on-disk size is within `MAX_SNAPSHOT_SIZE`.
-/// Returns None for files that are too large or if the read times out.
-fn read_if_within_limit(path: &Path) -> Option<Vec<u8>> {
+/// Read a file whose size (`len`, already known from the caller's stat) is within
+/// `MAX_SNAPSHOT_SIZE`. The read itself still runs under `fs_with_timeout` so a
+/// hung filesystem can't wedge the watch loop. Returns None for oversized files
+/// or if the read times out.
+fn read_within_limit(path: &Path, len: u64) -> Option<Vec<u8>> {
+    if len > snapshots::MAX_SNAPSHOT_SIZE as u64 {
+        return None;
+    }
     let p = path.to_path_buf();
-    fs_with_timeout(move || {
-        let meta = std::fs::metadata(&p).ok()?;
-        if meta.len() > snapshots::MAX_SNAPSHOT_SIZE as u64 {
-            return None;
-        }
-        std::fs::read(&p).ok()
-    })?
-}
-
-/// Returns true if the path is a symlink (not a regular file).
-fn is_symlink(path: &Path) -> bool {
-    path.symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+    fs_with_timeout(move || std::fs::read(&p).ok())?
 }
 
 fn handle_create(
     db: &Database,
     project: &WatchedProject,
     path: &Path,
+    len: u64,
+    mtime_nanos: Option<i64>,
     verbose: bool,
 ) -> Result<()> {
-    if is_symlink(path) {
-        return Ok(());
-    }
-    let content = match read_if_within_limit(path) {
+    let content = match read_within_limit(path, len) {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -637,6 +693,16 @@ fn handle_create(
         && s.latest_hash.as_deref() == Some(&hash)
         && s.exists_now
     {
+        // Content unchanged; refresh stored size/mtime so the modify fast path
+        // can short-circuit subsequent events without re-reading.
+        db.upsert_file_state(
+            project.id,
+            &path_str,
+            &hash,
+            true,
+            content.len() as i64,
+            mtime_nanos,
+        )?;
         return Ok(());
     }
 
@@ -659,7 +725,14 @@ fn handle_create(
         None,
         Some(content.len() as i64),
     )?;
-    db.upsert_file_state(project.id, &path_str, &hash, true)?;
+    db.upsert_file_state(
+        project.id,
+        &path_str,
+        &hash,
+        true,
+        content.len() as i64,
+        mtime_nanos,
+    )?;
 
     if verbose {
         eprintln!(
@@ -676,23 +749,46 @@ fn handle_modify(
     db: &Database,
     project: &WatchedProject,
     path: &Path,
+    len: u64,
+    mtime_nanos: Option<i64>,
     verbose: bool,
 ) -> Result<()> {
-    if is_symlink(path) {
+    let path_str = path.to_string_lossy().to_string();
+    let state = db.get_file_state(project.id, &path_str)?;
+
+    // Fast path (#26): a recorded file whose size *and* mtime are unchanged has
+    // unchanged bytes, so skip the (up to 100 MB) read + hash entirely. Any
+    // mismatch — or a missing/legacy mtime — falls through to the full read.
+    if let Some(s) = &state
+        && s.exists_now
+        && s.latest_hash.is_some()
+        && mtime_nanos.is_some()
+        && s.size == Some(len as i64)
+        && s.mtime_nanos == mtime_nanos
+    {
         return Ok(());
     }
-    let content = match read_if_within_limit(path) {
+
+    let content = match read_within_limit(path, len) {
         Some(c) => c,
         None => return Ok(()),
     };
     let hash = compute_hash(&content);
-    let path_str = path.to_string_lossy().to_string();
-
-    let state = db.get_file_state(project.id, &path_str)?;
 
     match &state {
         Some(s) if s.exists_now => {
             if s.latest_hash.as_deref() == Some(&hash) {
+                // Bytes unchanged but size/mtime moved (e.g. a no-op rewrite that
+                // bumped mtime): refresh the stored stat so the next event can
+                // take the fast path, without recording a spurious MODIFIED.
+                db.upsert_file_state(
+                    project.id,
+                    &path_str,
+                    &hash,
+                    true,
+                    content.len() as i64,
+                    mtime_nanos,
+                )?;
                 return Ok(());
             }
 
@@ -708,7 +804,14 @@ fn handle_modify(
                 None,
                 Some(content.len() as i64),
             )?;
-            db.upsert_file_state(project.id, &path_str, &hash, true)?;
+            db.upsert_file_state(
+                project.id,
+                &path_str,
+                &hash,
+                true,
+                content.len() as i64,
+                mtime_nanos,
+            )?;
 
             if verbose {
                 eprintln!(
@@ -718,7 +821,7 @@ fn handle_modify(
             }
         }
         _ => {
-            return handle_create(db, project, path, verbose);
+            return handle_create(db, project, path, len, mtime_nanos, verbose);
         }
     }
 
@@ -768,15 +871,14 @@ fn handle_rename(
     project: &WatchedProject,
     old_path: &Path,
     new_path: &Path,
+    len: u64,
+    mtime_nanos: Option<i64>,
     verbose: bool,
 ) -> Result<()> {
-    if is_symlink(new_path) {
-        return Ok(());
-    }
     let old_str = old_path.to_string_lossy().to_string();
     let new_str = new_path.to_string_lossy().to_string();
 
-    let content = match read_if_within_limit(new_path) {
+    let content = match read_within_limit(new_path, len) {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -800,7 +902,14 @@ fn handle_rename(
     )?;
 
     db.mark_deleted(project.id, &old_str)?;
-    db.upsert_file_state(project.id, &new_str, &hash, true)?;
+    db.upsert_file_state(
+        project.id,
+        &new_str,
+        &hash,
+        true,
+        content.len() as i64,
+        mtime_nanos,
+    )?;
 
     if verbose {
         eprintln!(
@@ -970,12 +1079,14 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // Phase A: read+hash via the current thread-per-read helper.
+        // Phase A: read+hash via the live-path timed read (fs_with_timeout
+        // spawns a thread per call), measuring that wrapper's overhead.
         let paths = collect_paths();
         let t = Instant::now();
         let mut acc = 0u8;
         for p in &paths {
-            if let Some(c) = read_if_within_limit(p) {
+            let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            if let Some(c) = read_within_limit(p, len) {
                 acc ^= compute_hash(&c).as_bytes()[0];
             }
         }
@@ -1135,6 +1246,87 @@ mod tests {
         assert!(!root_is_accessible(&file));
     }
 
+    /// #26 fast path: when the recorded size and mtime both match, `handle_modify`
+    /// must skip the read+hash entirely. We prove the skip by seeding a
+    /// deliberately *wrong* hash with the file's real size+mtime — if the read
+    /// happened, the true hash would differ and a MODIFIED event would appear.
+    #[test]
+    fn handle_modify_fast_path_skips_when_size_and_mtime_match() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+        let path_str = file.to_string_lossy().to_string();
+
+        let meta = std::fs::metadata(&file).unwrap();
+        let size = meta.len();
+        let mtime = mtime_nanos(&meta);
+        assert!(mtime.is_some(), "test requires a usable mtime");
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+        db.upsert_file_state(
+            project.id,
+            &path_str,
+            "deadbeefdeadbeef",
+            true,
+            size as i64,
+            mtime,
+        )
+        .unwrap();
+
+        handle_modify(&db, &project, &file, size, mtime, false).unwrap();
+
+        assert!(
+            db.get_latest_event(project.id, &path_str)
+                .unwrap()
+                .is_none(),
+            "matching size+mtime must short-circuit before any read/hash"
+        );
+    }
+
+    /// #26 fast path falls through on any mismatch: a stale recorded mtime forces
+    /// the full read+hash, which detects the changed content and records MODIFIED.
+    #[test]
+    fn handle_modify_reads_when_mtime_differs() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"new content").unwrap();
+        let path_str = file.to_string_lossy().to_string();
+
+        let meta = std::fs::metadata(&file).unwrap();
+        let size = meta.len();
+        let mtime = mtime_nanos(&meta);
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+        // Same size, but a stale mtime and a non-matching hash.
+        let stale_mtime = mtime.map(|m| m - 1_000_000_000);
+        db.upsert_file_state(
+            project.id,
+            &path_str,
+            "0000000000000000",
+            true,
+            size as i64,
+            stale_mtime,
+        )
+        .unwrap();
+
+        handle_modify(&db, &project, &file, size, mtime, false).unwrap();
+
+        let ev = db.get_latest_event(project.id, &path_str).unwrap();
+        assert_eq!(
+            ev.map(|e| e.event_type),
+            Some("MODIFIED".to_string()),
+            "mtime mismatch must fall through to a real read+hash"
+        );
+    }
+
     /// The same bytes always produce the same 64-char hex hash; different bytes produce a different hash.
     #[test]
     fn compute_hash_is_stable_and_input_sensitive() {
@@ -1160,7 +1352,7 @@ mod tests {
 
         // Seed the DB with a file that no longer exists on disk.
         let phantom_path = dir.path().join("phantom.rs").to_string_lossy().to_string();
-        db.upsert_file_state(project.id, &phantom_path, "deadbeef", true)
+        db.upsert_file_state(project.id, &phantom_path, "deadbeef", true, 0, None)
             .unwrap();
 
         // Run the scan on the empty directory — phantom.rs is missing.
