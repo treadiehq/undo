@@ -14,6 +14,7 @@ Complete reference for undo's features, internals, and configuration.
 - [Data Storage](#data-storage)
 - [Multi-Project Support](#multi-project-support)
 - [Platform Support](#platform-support)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -32,7 +33,7 @@ Prebuilt binaries for macOS (ARM + Intel) and Linux (x86_64) are available on th
 
 ### Build from source
 
-Requires Rust 1.70+.
+Requires Rust 1.85+ (the project uses the 2024 edition).
 
 ```bash
 git clone https://github.com/treadiehq/undo.git
@@ -40,6 +41,8 @@ cd undo
 cargo build --release
 cp target/release/undo /usr/local/bin/
 ```
+
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development workflow (tests, lints, project layout).
 
 ---
 
@@ -179,6 +182,7 @@ Events:    142
 Snapshots: 87
 Retention: 7 days, 1.0 GB max
 Disk:      45.2 MB (snapshots: 38.1 MB, backups: 5.8 MB, db: 1.3 MB)
+Log:       /Users/me/.undo/undo.log
 ```
 
 ### `undo stop`
@@ -197,6 +201,8 @@ Update undo to the latest release.
 ```bash
 undo update
 ```
+
+It downloads the release artifact for your platform, verifies it against the release's published `SHA256SUMS` before installing, and replaces the running binary atomically (a copy-then-rename so an interrupted update can't leave a half-written executable). If the checksum file is missing or the hash doesn't match, the update aborts without touching the installed binary.
 
 ---
 
@@ -287,7 +293,7 @@ undo automatically ignores noisy and sensitive paths:
 - `node_modules/`, `__pycache__/`
 - `target/`, `dist/`, `build/`, `.next/`
 - `.DS_Store`, `.idea/`, `.vscode/`
-- `.env`, `.env.local`, `.env.production`, `.ssh/`
+- `.env` and any `.env.*` variant (e.g. `.env.local`, `.env.production`, `.env.staging`), `.ssh/`
 - `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`
 
 ### Custom ignore patterns
@@ -357,6 +363,9 @@ All data is stored locally at `~/.undo/`:
 | `pids/<hash>.pid` | Per-project daemon PID files |
 | `backups/` | Safety backups created before restoring a file |
 | `config.toml` | Global configuration (optional) |
+| `undo.log` | Daemon log (errors, crashes, prune/lifecycle notices); rotates to `undo.log.1` at 5 MB |
+
+Everything under `~/.undo/` is created owner-only: the directory is `0700` and the database, snapshots, backups, PID files, and log are `0600`, so snapshot contents are never readable by other users on the machine.
 
 Snapshots are content-addressed: if two files have the same content, only one snapshot is stored.
 
@@ -414,6 +423,45 @@ Binary files (images, compiled assets, databases, etc.) are fully supported:
 - **Snapshot and restore** work on raw bytes — content round-trips perfectly
 - **Events** are tracked the same as text files (hash, timestamp, event type)
 - **Diff** detects binary content (NUL bytes in the first 8 KB) and prints "Binary file — text diff not available" instead of attempting a text diff
+
+---
+
+## Troubleshooting
+
+### Where to look first: the log
+
+The daemon writes to `~/.undo/undo.log` (shown in `undo status` as the `Log:` line). Errors, crashes, pause/resume notices, and auto-prune summaries all land there, each line tagged with the daemon's PID so multiple projects stay attributable. The log rotates to `undo.log.1` once it passes 5 MB.
+
+### "undo is already running"
+
+A daemon already holds the lock for this directory. Liveness is verified by an advisory lock on the PID file (not just by the PID existing), so this message means a live daemon — not a stale file. Use `undo status` to see its PID, or `undo stop` to stop it.
+
+### "directory overlaps with an already-watched path"
+
+Another daemon is watching a parent or child of this directory, which would double-record events. Stop the other daemon, watch a non-overlapping directory, or pass `--force` to override (you'll get duplicate events for the overlapping subtree).
+
+### "refusing to run as root" / "owned by root" / "owned by a system account"
+
+Safety guards (see [Safety Guards](#safety-guards)). Run as your normal user from a directory you own, or pass `--force` if you understand the consequences.
+
+### "directory contains more than 50,000 files"
+
+The file-count guard tripped — usually because `undo start` was run somewhere very broad (a home directory, `/`). Watch a specific project directory, add ignore rules in `.undoignore`, or pass `--force` to watch it anyway.
+
+### A restore says "No snapshots found for this file"
+
+There is no recorded history for that path within reach. This happens if the file was never captured (e.g. it matches an ignore rule, or it was always larger than the 100 MB snapshot limit), or if its history has aged out of the retention window. `undo timeline` shows what is recorded.
+
+### Changes aren't being recorded
+
+- Confirm the daemon is running for this directory: `undo status`.
+- Check the path isn't ignored (`.gitignore`, `.undoignore`, or a builtin like `node_modules/`, `target/`, `.env*`).
+- On network/FUSE filesystems, real-time events may not fire — see [Platform Support](#platform-support). The startup reconciliation scan still catches missed changes when the daemon restarts.
+- Check `~/.undo/undo.log` for paused-recording or watcher errors.
+
+### Verifying snapshot integrity after a crash
+
+Snapshots are written before the database rows that reference them, and the database uses SQLite WAL, so an interrupted write self-heals (at worst an unreferenced snapshot that the next prune reclaims). If you suspect a problem after a hard crash, restarting the daemon runs a full reconciliation scan that brings the database back in line with what's on disk.
 
 ---
 

@@ -43,13 +43,16 @@ That's it. No commits, no staging, no ceremony.
 | `undo restore <file> <time>` | Restore a file from the past |
 | `undo status` | Daemon status, disk usage, retention info |
 | `undo prune` | Clean up old history |
-| `undo stop` | Stop watching |
+| `undo stop` | Stop watching (`--all` stops every daemon) |
+| `undo update` | Update to the latest release |
 
 ## How it works
 
 Undo runs a tiny background daemon that uses native OS file watching. When a file changes, it hashes the content, saves a compressed snapshot, and logs the event to a local SQLite database. Everything stays on your machine at `~/.undo/`.
 
 Snapshots are gzip-compressed and content-deduplicated. It auto-prunes old history (default: 7 days, 1 GB cap), skips noisy directories like `node_modules` and `target` out of the box, and respects your root `.gitignore` and `.undoignore` for custom ignore rules. (Nested `.gitignore` files in subdirectories are not yet supported.)
+
+The daemon logs to `~/.undo/undo.log`, so errors and crashes survive the terminal that launched it. If something looks off, check there first (and see [Troubleshooting](docs/detailed.md#troubleshooting)).
 
 ## Configuration
 
@@ -61,6 +64,13 @@ max_size_mb = 1024
 ```
 
 For the full reference — every command flag, how pruning works, data storage layout, safety guards, multi-project support — see the [detailed docs](docs/detailed.md).
+
+## More
+
+- [Detailed documentation](docs/detailed.md) — full command reference, internals, platform support, troubleshooting
+- [Contributing](CONTRIBUTING.md) — build, test, and the project layout
+- [Changelog](CHANGELOG.md) — release history
+- [Security policy](SECURITY.md) — threat model and how to report a vulnerability
 
 ## License
 
