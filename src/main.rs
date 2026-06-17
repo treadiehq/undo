@@ -9,6 +9,7 @@ mod db;
 mod diff;
 mod duration;
 mod ignore;
+mod logging;
 mod models;
 mod restore;
 mod retention;
@@ -225,7 +226,9 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("{}error:{} {}", RED, RESET, e);
+        // Tees to stderr (unchanged UX) and, when the daemon logger is active,
+        // records the failure in ~/.undo/undo.log so crashes are diagnosable.
+        logging::error(&e.to_string());
         std::process::exit(1);
     }
 }

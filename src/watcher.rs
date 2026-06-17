@@ -262,17 +262,12 @@ pub fn watch_directory(
             let accessible = root_is_accessible(root);
 
             if !accessible && !paused {
-                eprintln!(
-                    "warning: watched directory is no longer accessible — pausing recording"
-                );
+                crate::log_warn!("watched directory is no longer accessible — pausing recording");
                 paused = true;
             } else if accessible && paused {
-                eprintln!("watched directory is accessible again — resuming");
+                crate::log_notice!("watched directory is accessible again — resuming");
                 if let Err(e) = initial_scan(db, project, root, verbose, true) {
-                    eprintln!(
-                        "{}warning:{} reconciliation scan failed: {}",
-                        crate::YELLOW, crate::RESET, e
-                    );
+                    crate::log_warn!("reconciliation scan failed: {}", e);
                 }
                 paused = false;
             }
@@ -287,17 +282,15 @@ pub fn watch_directory(
                     if stats.events_deleted + stats.snapshots_deleted + stats.backups_deleted
                         > 0 =>
                 {
-                    eprintln!(
-                        "{}auto-prune:{} removed {} events, {} snapshots, {} backups (freed {})",
-                        crate::YELLOW, crate::RESET,
-                        stats.events_deleted, stats.snapshots_deleted, stats.backups_deleted,
+                    crate::log_notice!(
+                        "auto-prune: removed {} events, {} snapshots, {} backups (freed {})",
+                        stats.events_deleted,
+                        stats.snapshots_deleted,
+                        stats.backups_deleted,
                         crate::retention::format_size(stats.bytes_freed),
                     );
                 }
-                Err(e) => eprintln!(
-                    "{}warning:{} auto-prune failed: {}",
-                    crate::YELLOW, crate::RESET, e
-                ),
+                Err(e) => crate::log_warn!("auto-prune failed: {}", e),
                 _ => {}
             }
         }
@@ -318,26 +311,18 @@ pub fn watch_directory(
                     EventOutcome::Failed(e) => {
                         // Always surface errors — a silent failure means the user
                         // believes changes are being recorded when they aren't.
-                        eprintln!(
-                            "{}warning:{} failed to record event: {}",
-                            crate::YELLOW, crate::RESET, e
-                        );
+                        crate::log_warn!("failed to record event: {}", e);
                     }
                     EventOutcome::Panicked => {
-                        eprintln!(
-                            "{}warning:{} panicked while processing an event — \
-                             skipping it; daemon continues",
-                            crate::YELLOW, crate::RESET
+                        crate::log_warn!(
+                            "panicked while processing an event — skipping it; daemon continues"
                         );
                     }
                 }
             }
             Ok(Err(e)) => {
                 // Always surface watcher errors too.
-                eprintln!(
-                    "{}warning:{} file watcher error: {}",
-                    crate::YELLOW, crate::RESET, e
-                );
+                crate::log_warn!("file watcher error: {}", e);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,

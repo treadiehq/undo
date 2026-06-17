@@ -151,6 +151,11 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let bt_dir = backtrack_dir()?;
 
+    // Route daemon errors and crashes to ~/.undo/undo.log before anything else
+    // can fail, so even early startup problems leave a trace.
+    crate::logging::init(&bt_dir);
+    crate::logging::install_panic_hook();
+
     if !force {
         check_not_root()?;
         check_directory_ownership(&cwd)?;
@@ -207,6 +212,12 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
 
     crate::ignore::init(&cwd);
 
+    crate::log_info!(
+        "daemon started (PID {}) watching {}",
+        std::process::id(),
+        cwd.display()
+    );
+
     println!("{}undo{} — filesystem history", BOLD, RESET);
     println!("Watching: {}", cwd.display());
     println!("Recording changes...");
@@ -217,14 +228,15 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     let retention_cfg = crate::retention::load_config(Some(&cwd));
     match crate::retention::prune(&db, project.id, &retention_cfg, false) {
         Ok(stats) if stats.events_deleted + stats.snapshots_deleted + stats.backups_deleted > 0 => {
-            eprintln!(
-                "{}auto-prune:{} removed {} events, {} snapshots, {} backups (freed {})",
-                YELLOW, RESET,
-                stats.events_deleted, stats.snapshots_deleted, stats.backups_deleted,
+            crate::log_notice!(
+                "auto-prune: removed {} events, {} snapshots, {} backups (freed {})",
+                stats.events_deleted,
+                stats.snapshots_deleted,
+                stats.backups_deleted,
                 crate::retention::format_size(stats.bytes_freed),
             );
         }
-        Err(e) => eprintln!("{}warning:{} auto-prune failed: {}", YELLOW, RESET, e),
+        Err(e) => crate::log_warn!("auto-prune failed: {}", e),
         _ => {}
     }
 
@@ -233,6 +245,7 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
 
     let _ = std::fs::remove_file(&pid_path);
     drop(pid_file);
+    crate::log_info!("daemon stopped (PID {})", std::process::id());
     eprintln!("\nundo stopped.");
 
     Ok(())
@@ -383,6 +396,8 @@ pub fn cmd_status() -> Result<()> {
                 crate::retention::format_size(usage.backups),
                 crate::retention::format_size(db_size),
             );
+
+            println!("Log:       {}", crate::logging::log_path(&bt_dir).display());
         }
         None => {
             println!("No project being watched for this directory.");
