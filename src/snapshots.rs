@@ -4,15 +4,19 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_SNAPSHOT_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 
-fn snapshot_dir(project_id: i64) -> Result<PathBuf> {
+/// Process-wide counter giving each in-flight temp file a unique name, so the
+/// parallel initial scan can have several workers writing distinct snapshots
+/// (or even the same hash) at once without colliding on a shared `.gz.tmp` path.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn snapshot_dir_in(base: &Path, project_id: i64) -> Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    let dir = crate::backtrack_dir()?
-        .join("snapshots")
-        .join(project_id.to_string());
+    let dir = base.join("snapshots").join(project_id.to_string());
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -20,21 +24,32 @@ fn snapshot_dir(project_id: i64) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn snapshot_dir(project_id: i64) -> Result<PathBuf> {
+    snapshot_dir_in(&crate::backtrack_dir()?, project_id)
+}
+
 /// Full filesystem path for a snapshot identified by content hash.
 pub fn snapshot_path(project_id: i64, hash: &str) -> Result<PathBuf> {
     Ok(snapshot_dir(project_id)?.join(format!("{}.gz", hash)))
 }
 
-/// Compress and store file content. Returns the path string for DB storage.
-/// Deduplicates automatically — if a snapshot with the same hash exists, skips the write.
-pub fn save(project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
-    let path = snapshot_path(project_id, hash)?;
+/// Compress and store file content under an explicit data-dir `base`. Returns the
+/// path string for DB storage. Deduplicates automatically — if a snapshot with the
+/// same hash exists, skips the write.
+///
+/// Taking `base` explicitly (rather than resolving `backtrack_dir()` internally)
+/// lets the parallel initial scan call this from worker threads, which do not
+/// inherit the test data-dir thread-local override.
+pub fn save_in(base: &Path, project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
+    let path = snapshot_dir_in(base, project_id)?.join(format!("{}.gz", hash));
     if !path.exists() {
-        // Write to a temp file then rename atomically. POSIX guarantees rename
-        // is atomic on the same filesystem, so a crash mid-write can never
-        // leave a partial file at the final path that would be mistaken for a
-        // valid snapshot on the next run.
-        let tmp = path.with_extension("gz.tmp");
+        // Write to a uniquely-named temp file then rename atomically. POSIX
+        // guarantees rename is atomic on the same filesystem, so a crash mid-write
+        // can never leave a partial file at the final path that would be mistaken
+        // for a valid snapshot. The unique suffix keeps concurrent writers of the
+        // same hash from racing on a shared temp path.
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_file_name(format!("{}.gz.tmp.{}.{}", hash, std::process::id(), seq));
         let _ = fs::remove_file(&tmp); // remove stale temp if present
         let write_result = (|| -> Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
@@ -55,6 +70,12 @@ pub fn save(project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
         write_result?;
     }
     Ok(path.to_string_lossy().to_string())
+}
+
+/// Compress and store file content. Returns the path string for DB storage.
+/// Deduplicates automatically — if a snapshot with the same hash exists, skips the write.
+pub fn save(project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
+    save_in(&crate::backtrack_dir()?, project_id, hash, content)
 }
 
 /// Load and decompress a snapshot, returning the original file content.

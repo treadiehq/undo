@@ -96,6 +96,24 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Run `f` inside a single SQLite transaction, committing on `Ok` and rolling
+    /// back on `Err`. Batching the initial scan's many inserts into one commit
+    /// avoids a per-statement WAL commit on the on-disk database, which dominates
+    /// scan time for large repositories.
+    pub fn transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        self.conn.execute_batch("BEGIN")?;
+        match f(self) {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// Insert an event with an explicit timestamp. Test-only helper used by
     /// retention tests that need to seed events at controlled points in time.
     #[cfg(test)]
