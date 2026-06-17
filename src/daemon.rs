@@ -238,25 +238,22 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         _ => {}
     }
 
-    // Startup integrity pass: verify the snapshots referenced by surviving history
-    // are present and decompress. Report-only (never deletes), so a power-loss-torn
-    // or hand-deleted snapshot is surfaced in the log instead of failing later at
-    // restore time (#41). verify_project already logs each problem; summarise here.
-    match crate::integrity::verify_project(&db, project.id, true) {
-        Ok(report) if report.problems() > 0 => crate::log_warn!(
-            "integrity: {} of {} referenced snapshots unreadable ({} missing, {} corrupt) — \
-             affected versions cannot be restored",
-            report.problems(),
-            report.checked,
+    // Startup integrity pass: a SHALLOW (existence-only) check that every snapshot
+    // referenced by surviving history is present on disk. Report-only (never
+    // deletes), so a power-loss-torn or hand-deleted snapshot is surfaced in the log
+    // instead of failing later at restore time (#41). Kept shallow so startup stays a
+    // stat-per-hash; the deep decompress/CRC check runs on demand in `undo status`.
+    match crate::integrity::verify_project(&db, project.id, false, true) {
+        Ok(report) if report.missing > 0 => crate::log_warn!(
+            "integrity: {} of {} referenced snapshots missing on disk — affected versions \
+             cannot be restored (run `undo status` for a deep decompress check)",
             report.missing,
-            report.corrupt,
+            report.checked,
         ),
-        Ok(report) => {
-            crate::log_info!(
-                "integrity: {} snapshots verified, all readable",
-                report.checked
-            )
-        }
+        Ok(report) => crate::log_info!(
+            "integrity: {} referenced snapshots present (existence check)",
+            report.checked
+        ),
         Err(e) => crate::log_warn!("integrity check failed: {}", e),
     }
 
@@ -400,11 +397,12 @@ pub fn cmd_status() -> Result<()> {
             println!("Events:    {}", event_count);
             println!("Snapshots: {}", snapshot_count);
 
-            // Verify referenced snapshots are present + readable. Silent per-problem
-            // (log_problems = false) so status shows one summary line rather than a
-            // warning per bad snapshot (#41).
+            // Deep check (decompress/CRC) since the user is here and asking — this is
+            // the expensive read-per-snapshot pass the daemon startup deliberately
+            // skips. Silent per-problem (log_problems = false) so status shows one
+            // summary line rather than a warning per bad snapshot (#41).
             let integrity =
-                crate::integrity::verify_project(&db, project.id, false).unwrap_or_default();
+                crate::integrity::verify_project(&db, project.id, true, false).unwrap_or_default();
             let integrity_line = if integrity.is_clean() {
                 format!("{}OK{} ({} verified)", GREEN, RESET, integrity.checked)
             } else {
