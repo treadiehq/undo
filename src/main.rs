@@ -321,7 +321,9 @@ fn cmd_what_changed(duration_str: &str) -> Result<()> {
     let db = db::Database::open()?;
     let project = find_project(&db, &cwd)?;
 
-    let since = chrono::Utc::now().timestamp() - secs;
+    // saturating_sub: parse_duration accepts up to i64::MAX seconds, so a bare
+    // `now - secs` underflows (debug panic / release wrap). Saturate instead.
+    let since = chrono::Utc::now().timestamp().saturating_sub(secs);
     let events = db.get_events_since(project.id, since)?;
 
     if events.is_empty() {

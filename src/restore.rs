@@ -27,7 +27,10 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;
     let abs_path_str = abs_path.to_string_lossy().to_string();
 
-    let target_time = Utc::now().timestamp() - secs;
+    // saturating_sub: `secs` can be up to i64::MAX (parse_duration accepts it),
+    // so a bare `now - secs` underflows — a debug-build panic, and in release a
+    // wrap to a large positive time. Saturate to i64::MIN instead.
+    let target_time = Utc::now().timestamp().saturating_sub(secs);
 
     let source = match resolve_restore_source(&db, project.id, &abs_path_str, target_time)? {
         Some(s) => s,
