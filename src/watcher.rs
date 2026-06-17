@@ -384,7 +384,9 @@ fn initial_scan_with_limit(
                 max_files
             );
         }
-        let path_str = entry.path().to_string_lossy().to_string();
+        let Some(path_str) = db_key(entry.path()) else {
+            continue;
+        };
         seen_paths.insert(path_str.clone());
         paths.push(path_str);
     }
@@ -801,6 +803,25 @@ fn read_within_limit(path: &Path, len: u64) -> Option<Vec<u8>> {
     fs_with_timeout(move || std::fs::read(&p).ok())?
 }
 
+/// The database key for a path: its UTF-8 string, or None if the path is not
+/// valid UTF-8. Paths live in TEXT columns, and `to_string_lossy` would silently
+/// remap non-UTF8 bytes to U+FFFD — a key that no longer matches the real file
+/// and can even collide with another mangled name, so the file would be tracked,
+/// diffed, or restored wrongly without any sign. Rather than store a corrupt key,
+/// skip the file and surface a warning so the gap is visible (#34).
+fn db_key(path: &Path) -> Option<String> {
+    match path.to_str() {
+        Some(s) => Some(s.to_string()),
+        None => {
+            crate::log_warn!(
+                "skipping file with a non-UTF8 path — it cannot be tracked safely: {}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn handle_create(
     db: &Database,
     project: &WatchedProject,
@@ -809,12 +830,14 @@ fn handle_create(
     mtime_nanos: Option<i64>,
     verbose: bool,
 ) -> Result<()> {
+    let Some(path_str) = db_key(path) else {
+        return Ok(());
+    };
     let content = match read_within_limit(path, len) {
         Some(c) => c,
         None => return Ok(()),
     };
     let hash = compute_hash(&content);
-    let path_str = path.to_string_lossy().to_string();
 
     let state = db.get_file_state(project.id, &path_str)?;
 
@@ -882,7 +905,9 @@ fn handle_modify(
     mtime_nanos: Option<i64>,
     verbose: bool,
 ) -> Result<()> {
-    let path_str = path.to_string_lossy().to_string();
+    let Some(path_str) = db_key(path) else {
+        return Ok(());
+    };
     let state = db.get_file_state(project.id, &path_str)?;
 
     // Fast path (#26): a recorded file whose size *and* mtime are unchanged has
@@ -963,7 +988,9 @@ fn handle_delete(
     path: &Path,
     verbose: bool,
 ) -> Result<()> {
-    let path_str = path.to_string_lossy().to_string();
+    let Some(path_str) = db_key(path) else {
+        return Ok(());
+    };
 
     let prev_hash = db
         .get_file_state(project.id, &path_str)?
@@ -1004,8 +1031,12 @@ fn handle_rename(
     mtime_nanos: Option<i64>,
     verbose: bool,
 ) -> Result<()> {
-    let old_str = old_path.to_string_lossy().to_string();
-    let new_str = new_path.to_string_lossy().to_string();
+    // Both names must round-trip: a mangled key would mis-track the new file or
+    // store a corrupt previous_path (#34). If either side is non-UTF8, skip — the
+    // new file, if valid, is picked up by its next event or the next scan.
+    let (Some(old_str), Some(new_str)) = (db_key(old_path), db_key(new_path)) else {
+        return Ok(());
+    };
 
     let content = match read_within_limit(new_path, len) {
         Some(c) => c,
@@ -1375,6 +1406,28 @@ mod tests {
         let file = dir.path().join("not_a_dir");
         std::fs::write(&file, "data").unwrap();
         assert!(!root_is_accessible(&file));
+    }
+
+    /// #34: a valid UTF-8 path becomes its own key; a non-UTF8 path is rejected
+    /// (None) so it's skipped rather than stored under a lossily-mangled key that
+    /// can't round-trip. Constructed purely from bytes — no filesystem — since
+    /// macOS won't even let a non-UTF8 filename exist on disk.
+    #[test]
+    fn db_key_rejects_non_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            db_key(Path::new("/home/user/project/src/main.rs")).as_deref(),
+            Some("/home/user/project/src/main.rs"),
+            "a valid UTF-8 path must round-trip as its own key"
+        );
+
+        let non_utf8 = Path::new(OsStr::from_bytes(b"/home/user/project/\xff\xfe.rs"));
+        assert!(
+            db_key(non_utf8).is_none(),
+            "a non-UTF8 path must be rejected, not lossily mangled"
+        );
     }
 
     /// #28: the timeout-guarded stat returns the metadata for a real file. This is
