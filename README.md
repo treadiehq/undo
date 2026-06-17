@@ -2,6 +2,8 @@
 
 **Ctrl+Z for your filesystem. Protecting working directories from accidents, made simple.**
 
+> Lightweight disaster prevention tool to avoid irreversible damage to file systems. It's easier and faster than git. No server config necessary.
+
 You deleted a file. You changed something 10 minutes ago and can't remember what. You haven't committed yet. It's gone.
 
 Not anymore. Undo watches your project directory and records every change. See what happened, diff it, restore it, instantly.
