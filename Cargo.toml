@@ -2,7 +2,14 @@
 name = "undo"
 version = "0.1.12"
 edition = "2024"
+rust-version = "1.85"
 description = "Ctrl+Z for your filesystem"
+repository = "https://github.com/treadiehq/undo"
+homepage = "https://github.com/treadiehq/undo"
+readme = "README.md"
+license-file = "LICENSE"
+keywords = ["filesystem", "history", "snapshot", "restore", "undo"]
+categories = ["command-line-utilities", "filesystem", "development-tools"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
