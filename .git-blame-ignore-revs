@@ -1,0 +1,7 @@
+# Revisions to skip in `git blame` (bulk mechanical reformatting).
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub honours this file automatically.
+
+# Make tree rustfmt-clean and add CI gate (#21)
+677ba6d0dbc50ec1bc170e59823b2cccef3731ce
