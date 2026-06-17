@@ -151,7 +151,44 @@ pub fn initial_scan(
     force: bool,
 ) -> Result<()> {
     let max_files = if force { usize::MAX } else { MAX_FILES_DEFAULT };
-    initial_scan_with_limit(db, project, root, verbose, max_files)
+    // Startup may legitimately observe files deleted while the daemon was off, so
+    // deletions are trusted here — the empty-tree guard inside still protects
+    // against starting against an empty/wrong mount (#31).
+    initial_scan_with_limit(db, project, root, verbose, max_files, true)
+}
+
+/// Reconcile after the watched root became accessible again following a pause.
+///
+/// `start_dev` is the root's device id captured when watching began. If it no
+/// longer matches, the root is a *different* filesystem object (swapped disk or
+/// fresh remount) and the now-missing files must not be recorded as deletions —
+/// doing so would let prune reclaim their snapshots and lose history for what is
+/// really a transient mount event (#31). We still reconcile any files actually
+/// present so recording resumes; we just don't trust the disappearances.
+fn reconcile_after_resume(
+    db: &Database,
+    project: &WatchedProject,
+    root: &Path,
+    start_dev: Option<u64>,
+    verbose: bool,
+) -> Result<()> {
+    let same_device = match (start_dev, root_device_id(root)) {
+        (Some(a), Some(b)) => a == b,
+        // Unknown device on either side (stat failed/timed out): be conservative
+        // and don't record deletions.
+        _ => false,
+    };
+    // Resume was already accepted at startup, so don't re-trip the file-count cap.
+    initial_scan_with_limit(db, project, root, verbose, usize::MAX, same_device)
+}
+
+/// Device id (`st_dev`) of the watched root, taken through the fs watchdog so it
+/// can't hang on a wedged mount (#28/#29). Used to tell whether the root is still
+/// the same filesystem object across a pause/resume (#31).
+fn root_device_id(root: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let r = root.to_path_buf();
+    fs_with_timeout(move || std::fs::metadata(&r).ok().map(|m| m.dev()))?
 }
 
 /// A single file's contribution to the scan, computed off the DB thread (read +
@@ -315,6 +352,7 @@ fn initial_scan_with_limit(
     root: &Path,
     verbose: bool,
     max_files: usize,
+    trust_deletions: bool,
 ) -> Result<()> {
     let existing_states = db.get_all_file_states(project.id)?;
     let existing: HashMap<&str, &FileState> = existing_states
@@ -420,27 +458,55 @@ fn initial_scan_with_limit(
             }
         }
 
-        // Detect deletions that happened while the daemon was stopped.
+        // Detect deletions that happened while the daemon was stopped — but guard
+        // against a mount anomaly masquerading as mass deletion (#31). If the tree
+        // came back empty, or the root is a different filesystem object than when
+        // watching started (`trust_deletions == false`), treat the vanished files
+        // as a transient mount event, not real deletions: recording them would
+        // flip `exists_now` to 0, and `get_live_hashes` only pins a snapshot via
+        // `file_state` while `exists_now = 1`, so prune would then reclaim the
+        // snapshots — turning a remount into permanent history loss. Leaving the
+        // files tracked preserves history; the worst case if they really were
+        // deleted is slightly stale "exists" state until the next scan.
+        let would_delete = existing_states
+            .iter()
+            .filter(|s| s.exists_now && !seen_paths.contains(&s.path))
+            .count();
+        let mount_anomaly = would_delete > 0 && (seen_paths.is_empty() || !trust_deletions);
+
         let mut deletions = 0usize;
-        for state in &existing_states {
-            if state.exists_now && !seen_paths.contains(&state.path) {
-                db.insert_event(
-                    project.id,
-                    &state.path,
-                    "DELETED",
-                    None,
-                    state.latest_hash.as_deref(),
-                    None,
-                    None,
-                    None,
-                )?;
-                db.mark_deleted(project.id, &state.path)?;
-                deletions += 1;
-                if verbose {
-                    eprintln!(
-                        "  scan: DELETED {}",
-                        crate::relative_path(&state.path, &project.root_path)
-                    );
+        if mount_anomaly {
+            crate::log_warn!(
+                "skipping {} apparent deletion(s) on reconcile: the watched root {} — \
+                 preserving history rather than recording deletions (#31)",
+                would_delete,
+                if seen_paths.is_empty() {
+                    "came back empty (likely an empty remount)"
+                } else {
+                    "is a different filesystem than at startup (likely a swapped mount)"
+                }
+            );
+        } else {
+            for state in &existing_states {
+                if state.exists_now && !seen_paths.contains(&state.path) {
+                    db.insert_event(
+                        project.id,
+                        &state.path,
+                        "DELETED",
+                        None,
+                        state.latest_hash.as_deref(),
+                        None,
+                        None,
+                        None,
+                    )?;
+                    db.mark_deleted(project.id, &state.path)?;
+                    deletions += 1;
+                    if verbose {
+                        eprintln!(
+                            "  scan: DELETED {}",
+                            crate::relative_path(&state.path, &project.root_path)
+                        );
+                    }
                 }
             }
         }
@@ -488,6 +554,11 @@ pub fn watch_directory(
 
     watcher.watch(root, RecursiveMode::Recursive)?;
 
+    // Identity of the watched filesystem when recording began. If the root comes
+    // back as a different device after a pause, the resume scan must not treat the
+    // vanished files as deletions (#31).
+    let start_dev = root_device_id(root);
+
     let mut debouncer = Debouncer::new();
     let mut paused = false;
     let mut last_health_check = Instant::now();
@@ -508,7 +579,7 @@ pub fn watch_directory(
                 paused = true;
             } else if accessible && paused {
                 crate::log_notice!("watched directory is accessible again — resuming");
-                if let Err(e) = initial_scan(db, project, root, verbose, true) {
+                if let Err(e) = reconcile_after_resume(db, project, root, start_dev, verbose) {
                     crate::log_warn!("reconciliation scan failed: {}", e);
                 }
                 paused = false;
@@ -1034,7 +1105,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project = db.get_or_create_project(dir.path()).unwrap();
 
-        let err = initial_scan_with_limit(&db, &project, dir.path(), false, 5);
+        let err = initial_scan_with_limit(&db, &project, dir.path(), false, 5, true);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
         assert!(msg.contains("too large to watch"), "got: {}", msg);
@@ -1085,7 +1156,7 @@ mod tests {
         let project = db.get_or_create_project(tree.path()).unwrap();
 
         let started = Instant::now();
-        initial_scan_with_limit(&db, &project, tree.path(), false, usize::MAX).unwrap();
+        initial_scan_with_limit(&db, &project, tree.path(), false, usize::MAX, true).unwrap();
         let scan = started.elapsed();
         let scan_ms = scan.as_secs_f64() * 1000.0;
 
@@ -1185,7 +1256,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project = db.get_or_create_project(dir.path()).unwrap();
 
-        let result = initial_scan_with_limit(&db, &project, dir.path(), false, 100);
+        let result = initial_scan_with_limit(&db, &project, dir.path(), false, 100, true);
         assert!(result.is_ok());
     }
 
@@ -1228,7 +1299,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project = db.get_or_create_project(dir.path()).unwrap();
 
-        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX).unwrap();
+        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX, true).unwrap();
 
         let states = db.get_all_file_states(project.id).unwrap();
         assert_eq!(states.len(), n, "every file must have a recorded state");
@@ -1271,7 +1342,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project = db.get_or_create_project(dir.path()).unwrap();
 
-        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX).unwrap();
+        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX, true).unwrap();
 
         let states = db.get_all_file_states(project.id).unwrap();
         assert_eq!(states.len(), distinct * copies, "all files tracked");
@@ -1437,7 +1508,9 @@ mod tests {
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    /// A file tracked in the DB but absent from disk triggers a DELETED event and marks exists_now false.
+    /// A file tracked in the DB but absent from disk triggers a DELETED event and
+    /// marks exists_now false — as long as the tree is otherwise intact (a real
+    /// `keep.rs` survives so this isn't mistaken for an empty remount, #31).
     #[test]
     fn initial_scan_records_deletion_for_missing_file() {
         let data_dir = tempfile::tempdir().unwrap();
@@ -1447,13 +1520,16 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let project = db.get_or_create_project(dir.path()).unwrap();
 
+        // A surviving file keeps the tree non-empty, so the missing file reads as
+        // a genuine deletion rather than a wholesale disappearance.
+        std::fs::write(dir.path().join("keep.rs"), b"still here").unwrap();
+
         // Seed the DB with a file that no longer exists on disk.
         let phantom_path = dir.path().join("phantom.rs").to_string_lossy().to_string();
         db.upsert_file_state(project.id, &phantom_path, "deadbeef", true, 0, None)
             .unwrap();
 
-        // Run the scan on the empty directory — phantom.rs is missing.
-        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX).unwrap();
+        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX, true).unwrap();
 
         // The file's state must now be marked deleted.
         let state = db
@@ -1468,5 +1544,88 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(event.event_type, "DELETED");
+    }
+
+    /// #31: when the entire watched tree comes back empty (e.g. a network share
+    /// remounts empty), the scan must NOT record every tracked file as deleted —
+    /// that would flip `exists_now` to 0 and let prune reclaim the snapshots,
+    /// turning a transient mount event into permanent history loss. History is
+    /// preserved: states stay alive and no DELETED events are written.
+    #[test]
+    fn initial_scan_skips_mass_deletion_when_tree_came_back_empty() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+
+        // Seed several tracked-and-alive files; the dir on disk stays empty.
+        for i in 0..5 {
+            let p = dir
+                .path()
+                .join(format!("f{i}.rs"))
+                .to_string_lossy()
+                .to_string();
+            db.upsert_file_state(project.id, &p, &format!("hash{i}"), true, 0, None)
+                .unwrap();
+        }
+
+        // Even trusting deletions, an empty tree is treated as a mount anomaly.
+        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX, true).unwrap();
+
+        for i in 0..5 {
+            let p = dir
+                .path()
+                .join(format!("f{i}.rs"))
+                .to_string_lossy()
+                .to_string();
+            let state = db.get_file_state(project.id, &p).unwrap().unwrap();
+            assert!(
+                state.exists_now,
+                "f{i}.rs must stay alive after empty remount"
+            );
+            assert!(
+                db.get_latest_event(project.id, &p).unwrap().is_none(),
+                "no DELETED event may be recorded for f{i}.rs"
+            );
+        }
+    }
+
+    /// #31: when deletions are untrusted (the resume path detected the root is a
+    /// different filesystem object — a swapped disk), missing files are not
+    /// recorded as deleted even though new files are present and recorded.
+    #[test]
+    fn initial_scan_skips_deletions_when_untrusted() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(dir.path()).unwrap();
+
+        // An old tracked file (from the original disk) that isn't on this disk.
+        let old = dir.path().join("old.rs").to_string_lossy().to_string();
+        db.upsert_file_state(project.id, &old, "oldhash", true, 0, None)
+            .unwrap();
+
+        // A file that IS present on the swapped-in disk.
+        std::fs::write(dir.path().join("new.rs"), b"foreign content").unwrap();
+
+        // trust_deletions = false → the swapped disk's absence of old.rs must not
+        // be recorded as a deletion.
+        initial_scan_with_limit(&db, &project, dir.path(), false, usize::MAX, false).unwrap();
+
+        let old_state = db.get_file_state(project.id, &old).unwrap().unwrap();
+        assert!(old_state.exists_now, "old.rs history must be preserved");
+        assert!(
+            db.get_latest_event(project.id, &old).unwrap().is_none(),
+            "no DELETED event may be recorded for old.rs"
+        );
+
+        // The present file is still recorded normally.
+        let new = dir.path().join("new.rs").to_string_lossy().to_string();
+        let new_ev = db.get_latest_event(project.id, &new).unwrap().unwrap();
+        assert_eq!(new_ev.event_type, "CREATED");
     }
 }

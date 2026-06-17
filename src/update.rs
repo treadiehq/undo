@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::process::Command;
 
 const REPO: &str = "treadiehq/undo";
@@ -44,6 +45,11 @@ pub fn cmd_update() -> Result<()> {
             target
         );
     }
+
+    // Verify integrity before we extract or install anything (#33). For a tool
+    // that overwrites its own executable, refusing to install an artifact we
+    // can't verify is the expected posture.
+    verify_checksum(&tarball, &latest_tag, &target, tmpdir.path())?;
 
     let tar_status = Command::new("tar")
         .args(["xzf"])
@@ -119,6 +125,72 @@ fn fetch_latest_tag() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("could not parse latest release tag from GitHub API"))?;
 
     Ok(tag)
+}
+
+/// Verify the downloaded tarball against the release's published `SHA256SUMS`
+/// before it is extracted or installed (#33). A missing checksum file, a missing
+/// entry for this artifact, or a hash mismatch all abort the update — we never
+/// install bytes we couldn't verify.
+fn verify_checksum(
+    tarball: &std::path::Path,
+    tag: &str,
+    target: &str,
+    tmpdir: &std::path::Path,
+) -> Result<()> {
+    let sums_url = format!("https://github.com/{REPO}/releases/download/{tag}/SHA256SUMS");
+    let sums_path = tmpdir.join("SHA256SUMS");
+
+    let status = Command::new("curl")
+        .args(["-fsSL", &sums_url, "-o"])
+        .arg(&sums_path)
+        .status()
+        .context("failed to run curl — is it installed?")?;
+    if !status.success() {
+        anyhow::bail!(
+            "could not download SHA256SUMS for {tag} — refusing to install an unverified binary"
+        );
+    }
+
+    let sums = std::fs::read_to_string(&sums_path).context("failed to read SHA256SUMS")?;
+    let bytes = std::fs::read(tarball).context("failed to read downloaded archive")?;
+    let actual = crate::to_hex(&Sha256::digest(&bytes));
+
+    let artifact = format!("undo-{tag}-{target}.tar.gz");
+    verify_against_sums(&sums, &artifact, &actual)?;
+
+    println!("  Verified SHA-256 checksum.");
+    Ok(())
+}
+
+/// Pure check: confirm `SHA256SUMS` lists `artifact` with hash `actual_hex`.
+///
+/// Accepts the GNU `sha256sum` text format (`<hex>  <name>`) and the binary
+/// marker form (`<hex> *<name>`), and matches on the file's basename so a
+/// path-qualified entry still resolves. Kept I/O-free so it can be unit-tested.
+fn verify_against_sums(sums: &str, artifact: &str, actual_hex: &str) -> Result<()> {
+    let expected = sums
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let name = parts.next()?.trim_start_matches('*');
+            let base = name.rsplit('/').next().unwrap_or(name);
+            (base == artifact).then(|| hash.to_ascii_lowercase())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "SHA256SUMS has no entry for {artifact} — refusing to install an unverified binary"
+            )
+        })?;
+
+    if actual_hex.to_ascii_lowercase() != expected {
+        anyhow::bail!(
+            "checksum mismatch for {artifact}\n  expected: {expected}\n  actual:   {actual_hex}\n\
+             The download may be corrupt or tampered with — not installing."
+        );
+    }
+
+    Ok(())
 }
 
 /// Install `src` to `dest`, working across filesystems.
@@ -254,5 +326,55 @@ mod tests {
 
         install_binary(&src, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW");
+    }
+
+    /// A matching checksum line verifies the artifact (#33). Hash comparison is
+    /// case-insensitive and ignores other entries in the file.
+    #[test]
+    fn verify_against_sums_accepts_matching_hash() {
+        let sums = "\
+aaaa  undo-v1.0.0-x86_64-unknown-linux-gnu.tar.gz
+bbbb  undo-v1.0.0-aarch64-apple-darwin.tar.gz
+";
+        assert!(
+            verify_against_sums(sums, "undo-v1.0.0-aarch64-apple-darwin.tar.gz", "BBBB").is_ok(),
+            "matching hash (case-insensitive) must verify"
+        );
+    }
+
+    /// A wrong hash for an otherwise-present artifact must fail.
+    #[test]
+    fn verify_against_sums_rejects_mismatch() {
+        let sums = "dead  undo-v1.0.0-x86_64-apple-darwin.tar.gz\n";
+        let err = verify_against_sums(sums, "undo-v1.0.0-x86_64-apple-darwin.tar.gz", "beef")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("checksum mismatch"), "got: {err}");
+    }
+
+    /// No entry for the artifact must fail closed (strict posture) rather than
+    /// silently installing an unverified binary.
+    #[test]
+    fn verify_against_sums_rejects_missing_entry() {
+        let sums = "dead  some-other-file.tar.gz\n";
+        let err = verify_against_sums(sums, "undo-v1.0.0-x86_64-apple-darwin.tar.gz", "dead")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no entry"), "got: {err}");
+    }
+
+    /// The binary-marker form (`<hex> *<name>`) that `sha256sum -b` emits must
+    /// still parse and match.
+    #[test]
+    fn verify_against_sums_handles_binary_marker_format() {
+        let sums = "c0ffee *undo-v2.0.0-x86_64-unknown-linux-gnu.tar.gz\n";
+        assert!(
+            verify_against_sums(
+                sums,
+                "undo-v2.0.0-x86_64-unknown-linux-gnu.tar.gz",
+                "c0ffee"
+            )
+            .is_ok()
+        );
     }
 }
