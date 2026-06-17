@@ -5,12 +5,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 use crate::db::Database;
-use crate::ignore::{should_ignore, should_ignore_with_type};
+use crate::ignore::should_ignore_with_type;
 use crate::models::{FileState, WatchedProject};
 use crate::snapshots;
 
@@ -26,14 +26,63 @@ const FS_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── fs watchdog ─────────────────────────────────────────────────────
 
-/// Run a filesystem operation on a separate thread with a timeout.
-/// Returns None if the operation hangs beyond `FS_TIMEOUT`.
+/// A unit of work for the shared filesystem watchdog. The closure runs the op
+/// *and* delivers its own result, so the watchdog only has to execute it.
+type FsJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// Submission handle for the process-wide watchdog thread, started on first use.
+///
+/// A single long-lived worker — rather than spawning a thread per op — bounds the
+/// cost of a wedged filesystem (#29). If an op hangs in a syscall this one thread
+/// parks on it and ops queued behind it time out, but no *new* threads are ever
+/// spawned, so a sustained outage costs exactly one parked thread instead of
+/// leaking them without bound. Every caller runs on the single watch-loop thread,
+/// so ops are already submitted serially; the worker has no concurrent work to
+/// overlap and a single thread is sufficient.
+fn fs_watchdog() -> &'static Mutex<mpsc::Sender<FsJob>> {
+    static WATCHDOG: OnceLock<Mutex<mpsc::Sender<FsJob>>> = OnceLock::new();
+    WATCHDOG.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<FsJob>();
+        std::thread::Builder::new()
+            .name("undo-fs-watchdog".to_string())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    // A panicking op must not take down the shared watchdog —
+                    // that would disable fs timeouts process-wide. Catch it and
+                    // keep serving; the caller sees None because its result
+                    // channel is dropped during unwind, exactly as on a timeout.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            })
+            .expect("spawn fs watchdog thread");
+        Mutex::new(tx)
+    })
+}
+
+/// Run a filesystem operation on the shared watchdog thread with a timeout.
+/// Returns None if it doesn't finish within `FS_TIMEOUT` — because it hung, or
+/// because a prior op is still hanging ahead of it in the queue. Either way the
+/// caller skips the op rather than letting it wedge the watch loop.
 fn fs_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let job: FsJob = Box::new(move || {
         let _ = tx.send(f());
     });
+    if fs_watchdog().lock().ok()?.send(job).is_err() {
+        return None;
+    }
     rx.recv_timeout(FS_TIMEOUT).ok()
+}
+
+/// `symlink_metadata` under the fs watchdog (#28). A hung `stat()` on a flaky
+/// network mount would otherwise block `process_event` indefinitely — and since
+/// the watch loop runs event processing inline, that also starves the health
+/// check meant to detect the dead mount and pause recording. Returns None on a
+/// stat error *or* timeout; callers treat both the same as "skip this event",
+/// after which the (also timeout-guarded) health check pauses recording.
+fn symlink_metadata_timeout(path: &Path) -> Option<std::fs::Metadata> {
+    let p = path.to_path_buf();
+    fs_with_timeout(move || std::fs::symlink_metadata(&p).ok())?
 }
 
 // ── hashing ─────────────────────────────────────────────────────────
@@ -414,7 +463,11 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const AUTO_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 fn root_is_accessible(root: &Path) -> bool {
-    root.try_exists().unwrap_or(false) && root.is_dir()
+    // Guarded so the periodic health check itself can't hang on the very dead
+    // mount it exists to detect (#28). A timed-out probe counts as inaccessible,
+    // which pauses recording — exactly the intended response to a wedged mount.
+    let r = root.to_path_buf();
+    fs_with_timeout(move || r.try_exists().unwrap_or(false) && r.is_dir()).unwrap_or(false)
 }
 
 pub fn watch_directory(
@@ -558,7 +611,8 @@ fn process_event(
             for path in &event.paths {
                 // One stat per path: its type drives the ignore check (is_dir),
                 // the regular-file gate, and the snapshot size limit downstream.
-                let Ok(meta) = std::fs::symlink_metadata(path) else {
+                // Timeout-guarded so a hung mount can't wedge the loop (#28).
+                let Some(meta) = symlink_metadata_timeout(path) else {
                     continue;
                 };
                 if should_ignore_with_type(path, root, meta.is_dir()) || !meta.is_file() {
@@ -572,7 +626,7 @@ fn process_event(
 
         EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Any) => {
             for path in &event.paths {
-                let Ok(meta) = std::fs::symlink_metadata(path) else {
+                let Some(meta) = symlink_metadata_timeout(path) else {
                     continue;
                 };
                 if should_ignore_with_type(path, root, meta.is_dir()) || !meta.is_file() {
@@ -589,9 +643,11 @@ fn process_event(
                 return Ok(());
             }
             for path in &event.paths {
-                // The path is gone, so there is no type to stat; the matcher
-                // falls back to its name/extension rules.
-                if should_ignore(path, root) {
+                // The path is gone, so there is no type to stat; pass is_dir=false
+                // (a deleted path resolves the same way) and let the matcher fall
+                // back to its name/extension rules. Avoids an unguarded is_dir()
+                // stat that could hang on a dead mount (#28).
+                if should_ignore_with_type(path, root, false) {
                     continue;
                 }
                 if debouncer.should_process(path) {
@@ -604,10 +660,12 @@ fn process_event(
             if event.paths.len() >= 2 {
                 let old = &event.paths[0];
                 let new = &event.paths[1];
-                let new_meta = std::fs::symlink_metadata(new).ok();
+                let new_meta = symlink_metadata_timeout(new);
                 let new_is_dir = new_meta.as_ref().is_some_and(|m| m.is_dir());
                 if should_ignore_with_type(new, root, new_is_dir) {
-                    if !should_ignore(old, root) && debouncer.should_process(old) {
+                    // `old` has been renamed away, so its type is moot: pass
+                    // is_dir=false to avoid an unguarded stat (#28).
+                    if !should_ignore_with_type(old, root, false) && debouncer.should_process(old) {
                         handle_delete(db, project, old, verbose)?;
                     }
                 } else if debouncer.should_process(new) {
@@ -627,7 +685,7 @@ fn process_event(
                 }
             } else {
                 for path in &event.paths {
-                    let meta = std::fs::symlink_metadata(path).ok();
+                    let meta = symlink_metadata_timeout(path);
                     let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
                     if should_ignore_with_type(path, root, is_dir) {
                         continue;
@@ -1072,7 +1130,9 @@ mod tests {
         let collect_paths = || {
             WalkDir::new(tree.path())
                 .into_iter()
-                .filter_entry(|e| !should_ignore(e.path(), tree.path()))
+                .filter_entry(|e| {
+                    !should_ignore_with_type(e.path(), tree.path(), e.file_type().is_dir())
+                })
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file() && !e.path_is_symlink())
                 .map(|e| e.path().to_path_buf())
@@ -1244,6 +1304,43 @@ mod tests {
         let file = dir.path().join("not_a_dir");
         std::fs::write(&file, "data").unwrap();
         assert!(!root_is_accessible(&file));
+    }
+
+    /// #28: the timeout-guarded stat returns the metadata for a real file. This is
+    /// the happy path that runs on every live event after the guard was added.
+    #[test]
+    fn symlink_metadata_timeout_returns_metadata_for_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let meta = symlink_metadata_timeout(&file).expect("metadata for existing file");
+        assert!(meta.is_file());
+        assert_eq!(meta.len(), 5);
+    }
+
+    /// #28: a missing path yields None — the same signal a *timed-out* stat
+    /// produces. `process_event` treats both identically (skip the event), so a
+    /// hung mount degrades to "skip + let the health check pause" rather than
+    /// wedging the watch loop.
+    #[test]
+    fn symlink_metadata_timeout_returns_none_for_missing_path() {
+        assert!(symlink_metadata_timeout(Path::new("/nonexistent/path/xyz")).is_none());
+    }
+
+    /// #29: the shared watchdog worker is reused across ops and must survive a
+    /// panicking op. A bad op yields None for that call only — a subsequent op
+    /// still completes, proving one panic can't disable fs timeouts for the rest
+    /// of the process.
+    #[test]
+    fn fs_watchdog_survives_a_panicking_op_and_keeps_serving() {
+        let panicked: Option<()> = fs_with_timeout(|| panic!("boom inside fs op"));
+        assert!(panicked.is_none(), "a panicking op must return None");
+
+        assert_eq!(
+            fs_with_timeout(|| 7u32),
+            Some(7),
+            "the watchdog must keep serving after a panicking op"
+        );
     }
 
     /// #26 fast path: when the recorded size and mtime both match, `handle_modify`

@@ -138,16 +138,10 @@ fn should_ignore_with(
 /// Returns true if the path should be excluded from watching.
 /// Negation patterns in `.undoignore` (e.g. `!build/`) override the builtin list.
 ///
-/// Resolves directory-ness with a single `is_dir()` stat. Callers that already
-/// know whether the path is a directory should prefer [`should_ignore_with_type`].
-#[cfg(not(test))]
-pub fn should_ignore(path: &Path, project_root: &Path) -> bool {
-    should_ignore_with_type(path, project_root, path.is_dir())
-}
-
-/// As [`should_ignore`], but the caller supplies `is_dir`, avoiding a stat when
-/// the entry type is already known (WalkDir during the initial scan, or a
-/// `symlink_metadata` already taken on the live event path).
+/// The caller supplies `is_dir`, avoiding a stat when the entry type is already
+/// known (WalkDir during the initial scan, or a `symlink_metadata` already taken
+/// on the live event path). The watch loop depends on this to stay hang-safe on a
+/// flaky mount (#28): it never lets the ignore check trigger its own `stat()`.
 #[cfg(not(test))]
 pub fn should_ignore_with_type(path: &Path, project_root: &Path, is_dir: bool) -> bool {
     should_ignore_with(CUSTOM_IGNORE.get(), path, project_root, is_dir)
