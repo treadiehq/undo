@@ -10,6 +10,14 @@ pub struct Database {
     conn: Connection,
 }
 
+// Debug-only reentrancy guard for `Database::transaction`. The daemon drives its
+// single connection from one thread, so a thread-local flag is enough to catch a
+// nested `BEGIN` (a programming error) without touching the struct's constructors.
+#[cfg(debug_assertions)]
+thread_local! {
+    static IN_TRANSACTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -113,19 +121,42 @@ impl Database {
     /// Run `f` inside a single SQLite transaction, committing on `Ok` and rolling
     /// back on `Err`. Batching the initial scan's many inserts into one commit
     /// avoids a per-statement WAL commit on the on-disk database, which dominates
-    /// scan time for large repositories.
+    /// scan time for large repositories. The live-path handlers also use it so an
+    /// event and its `file_state` update commit all-or-nothing.
+    ///
+    /// Not reentrant: it issues raw `BEGIN`/`COMMIT`, so a nested call would emit
+    /// `BEGIN` inside an open transaction and SQLite would error. The daemon's
+    /// single connection makes nesting a programming error rather than a runtime
+    /// condition, so we catch it loudly in debug builds instead of letting it
+    /// surface as an opaque SQL error in production.
     pub fn transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
-        self.conn.execute_batch("BEGIN")?;
-        match f(self) {
-            Ok(value) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(value)
+        #[cfg(debug_assertions)]
+        IN_TRANSACTION.with(|flag| {
+            assert!(
+                !flag.get(),
+                "db.transaction() is not reentrant — a nested call would emit BEGIN within BEGIN"
+            );
+            flag.set(true);
+        });
+
+        let result = (|| {
+            self.conn.execute_batch("BEGIN")?;
+            match f(self) {
+                Ok(value) => {
+                    self.conn.execute_batch("COMMIT")?;
+                    Ok(value)
+                }
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
             }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        })();
+
+        #[cfg(debug_assertions)]
+        IN_TRANSACTION.with(|flag| flag.set(false));
+
+        result
     }
 
     /// Insert an event with an explicit timestamp. Test-only helper used by
@@ -668,6 +699,76 @@ mod tests {
             .unwrap();
         assert_eq!(found.id, child.id);
         assert_ne!(found.id, parent.id);
+    }
+
+    // ── transactions ─────────────────────────────────────────────────
+
+    /// A transaction that returns `Ok` commits every write inside it.
+    #[test]
+    fn transaction_commits_all_writes_on_success() {
+        let db = db();
+        let p = project(&db);
+        db.transaction(|db| {
+            db.insert_event(
+                p.id,
+                "/p/a.rs",
+                "CREATED",
+                Some("h"),
+                None,
+                None,
+                None,
+                Some(3),
+            )?;
+            db.upsert_file_state(p.id, "/p/a.rs", "h", true, 3, Some(1))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.count_events(p.id).unwrap(), 1);
+        assert!(db.get_file_state(p.id, "/p/a.rs").unwrap().is_some());
+    }
+
+    /// A transaction that returns `Err` rolls back ALL of its writes — the failure
+    /// window the live handlers close: an event must never be observed without its
+    /// matching `file_state` update (and vice versa).
+    #[test]
+    fn transaction_rolls_back_all_writes_on_error() {
+        let db = db();
+        let p = project(&db);
+        let result: Result<()> = db.transaction(|db| {
+            db.insert_event(
+                p.id,
+                "/p/a.rs",
+                "CREATED",
+                Some("h"),
+                None,
+                None,
+                None,
+                Some(3),
+            )?;
+            anyhow::bail!("injected failure between the two writes");
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            db.count_events(p.id).unwrap(),
+            0,
+            "the event inserted before the failure must be rolled back"
+        );
+        assert!(
+            db.get_file_state(p.id, "/p/a.rs").unwrap().is_none(),
+            "no file_state row should survive the rolled-back transaction"
+        );
+    }
+
+    /// `transaction` is not reentrant (raw BEGIN/COMMIT). Nesting is a programming
+    /// error caught by a debug assertion — verify it fires so the live handlers can
+    /// rely on the guard instead of producing an opaque SQL error. Debug-only: the
+    /// guard compiles out under `--release`, so this test does too.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not reentrant")]
+    fn nested_transaction_panics_in_debug() {
+        let db = db();
+        let _ = db.transaction(|db| db.transaction(|_| Ok(())));
     }
 
     // ── file_events ──────────────────────────────────────────────────

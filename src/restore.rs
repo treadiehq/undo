@@ -187,7 +187,7 @@ fn restore_atomic_temp_path(target: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Same pattern as `snapshots::save`: `create_new` temp, full write, `rename` into place.
+/// Same pattern as `snapshots::save_in`: `create_new` temp, full write, `rename` into place.
 fn write_restore_atomically(target: &Path, content: &[u8]) -> Result<()> {
     let tmp_path = restore_atomic_temp_path(target);
     let _ = std::fs::remove_file(&tmp_path);
@@ -202,6 +202,13 @@ fn write_restore_atomically(target: &Path, content: &[u8]) -> Result<()> {
         file.write_all(content)?;
         file.sync_all()?;
         std::fs::rename(&tmp_path, target)?;
+        // Persist the rename itself: fsync the parent directory so the restored
+        // file's dirent survives power loss, matching the durable snapshot write.
+        // Best-effort — some filesystems reject directory fsync, and a restore that
+        // otherwise succeeded should not fail on it.
+        if let Some(parent) = target.parent() {
+            let _ = crate::snapshots::fsync_dir(parent);
+        }
         Ok(())
     })();
 

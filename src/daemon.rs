@@ -238,6 +238,28 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         _ => {}
     }
 
+    // Startup integrity pass: verify the snapshots referenced by surviving history
+    // are present and decompress. Report-only (never deletes), so a power-loss-torn
+    // or hand-deleted snapshot is surfaced in the log instead of failing later at
+    // restore time (#41). verify_project already logs each problem; summarise here.
+    match crate::integrity::verify_project(&db, project.id, true) {
+        Ok(report) if report.problems() > 0 => crate::log_warn!(
+            "integrity: {} of {} referenced snapshots unreadable ({} missing, {} corrupt) — \
+             affected versions cannot be restored",
+            report.problems(),
+            report.checked,
+            report.missing,
+            report.corrupt,
+        ),
+        Ok(report) => {
+            crate::log_info!(
+                "integrity: {} snapshots verified, all readable",
+                report.checked
+            )
+        }
+        Err(e) => crate::log_warn!("integrity check failed: {}", e),
+    }
+
     // pid_file (and its lock) stays alive for the duration of the watch loop.
     watcher::watch_directory(&db, &project, &cwd, shutdown, verbose)?;
 
@@ -377,6 +399,26 @@ pub fn cmd_status() -> Result<()> {
             let snapshot_count = crate::snapshots::count(project.id)?;
             println!("Events:    {}", event_count);
             println!("Snapshots: {}", snapshot_count);
+
+            // Verify referenced snapshots are present + readable. Silent per-problem
+            // (log_problems = false) so status shows one summary line rather than a
+            // warning per bad snapshot (#41).
+            let integrity =
+                crate::integrity::verify_project(&db, project.id, false).unwrap_or_default();
+            let integrity_line = if integrity.is_clean() {
+                format!("{}OK{} ({} verified)", GREEN, RESET, integrity.checked)
+            } else {
+                format!(
+                    "{}{} unreadable{} ({} missing, {} corrupt, of {} checked)",
+                    RED,
+                    integrity.problems(),
+                    RESET,
+                    integrity.missing,
+                    integrity.corrupt,
+                    integrity.checked,
+                )
+            };
+            println!("Integrity: {}", integrity_line);
 
             let project_root = std::path::Path::new(&project.root_path);
             let cfg = crate::retention::load_config(Some(project_root));

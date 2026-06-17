@@ -37,11 +37,26 @@ pub fn snapshot_path(project_id: i64, hash: &str) -> Result<PathBuf> {
 /// path string for DB storage. Deduplicates automatically — if a snapshot with the
 /// same hash exists, skips the write.
 ///
+/// When `durable` is true the snapshot's bytes are fsync'd and the parent directory
+/// is fsync'd before returning, so both the content and the rename that publishes it
+/// survive power loss. The live watch path needs this because a snapshot can be the
+/// only surviving copy of content that has since been overwritten or deleted. The
+/// initial scan passes `durable = false`: its snapshots are regenerable from the
+/// still-present source file, so an fsync per file (up to `MAX_FILES`) would be a
+/// large, pointless throughput regression.
+///
 /// Taking `base` explicitly (rather than resolving `backtrack_dir()` internally)
 /// lets the parallel initial scan call this from worker threads, which do not
 /// inherit the test data-dir thread-local override.
-pub fn save_in(base: &Path, project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
-    let path = snapshot_dir_in(base, project_id)?.join(format!("{}.gz", hash));
+fn write_snapshot_in(
+    base: &Path,
+    project_id: i64,
+    hash: &str,
+    content: &[u8],
+    durable: bool,
+) -> Result<String> {
+    let dir = snapshot_dir_in(base, project_id)?;
+    let path = dir.join(format!("{}.gz", hash));
     if !path.exists() {
         // Write to a uniquely-named temp file then rename atomically. POSIX
         // guarantees rename is atomic on the same filesystem, so a crash mid-write
@@ -60,8 +75,20 @@ pub fn save_in(base: &Path, project_id: i64, hash: &str, content: &[u8]) -> Resu
                 .open(&tmp)?;
             let mut encoder = GzEncoder::new(file, Compression::fast());
             encoder.write_all(content)?;
-            encoder.finish()?;
+            let file = encoder.finish()?;
+            if durable {
+                // Flush the snapshot's bytes before the rename publishes it, so a
+                // committed `file_events` row can never reference a snapshot whose
+                // contents never reached disk.
+                file.sync_all()?;
+            }
             fs::rename(&tmp, &path)?;
+            if durable {
+                // Persist the directory entry created by the rename; without this
+                // the rename can be lost to power loss even though the file data is
+                // already durable.
+                fsync_dir(&dir)?;
+            }
             Ok(())
         })();
         if write_result.is_err() {
@@ -72,10 +99,25 @@ pub fn save_in(base: &Path, project_id: i64, hash: &str, content: &[u8]) -> Resu
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Compress and store file content. Returns the path string for DB storage.
-/// Deduplicates automatically — if a snapshot with the same hash exists, skips the write.
-pub fn save(project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
-    save_in(&crate::backtrack_dir()?, project_id, hash, content)
+/// Fast, non-durable snapshot write under an explicit data-dir `base`, used by the
+/// parallel initial scan (see [`write_snapshot_in`] for why the scan skips fsync).
+pub fn save_in(base: &Path, project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
+    write_snapshot_in(base, project_id, hash, content, false)
+}
+
+/// Durable snapshot write for the live watch path: fsyncs the snapshot file and its
+/// parent directory so a freshly captured version survives power loss. Use this for
+/// content that may be irreplaceable; the scan path uses the non-durable [`save_in`].
+pub fn save_durable(project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
+    write_snapshot_in(&crate::backtrack_dir()?, project_id, hash, content, true)
+}
+
+/// fsync a directory so a rename into it survives power loss. Best-effort across
+/// platforms: on Linux this persists the new dirent; on macOS plain `fsync` is
+/// weaker than `F_FULLFSYNC` but still flushes to the device cache (we accept that
+/// ceiling rather than pay `F_FULLFSYNC` on every write).
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
 }
 
 /// Load and decompress a snapshot, returning the original file content.
@@ -120,7 +162,7 @@ mod tests {
         crate::set_test_data_dir(data_dir.path().to_path_buf());
 
         let content = b"hello, snapshot world\n";
-        save(1, "roundtrip_hash", content).unwrap();
+        save_durable(1, "roundtrip_hash", content).unwrap();
         let loaded = load(1, "roundtrip_hash").unwrap();
         assert_eq!(loaded, content);
     }
@@ -132,9 +174,9 @@ mod tests {
         crate::set_test_data_dir(data_dir.path().to_path_buf());
 
         let content = b"duplicate content to save twice";
-        save(1, "dedup_hash", content).unwrap();
+        save_durable(1, "dedup_hash", content).unwrap();
         // Second call must succeed — path.exists() guard skips the write.
-        save(1, "dedup_hash", content).unwrap();
+        save_durable(1, "dedup_hash", content).unwrap();
         let loaded = load(1, "dedup_hash").unwrap();
         assert_eq!(loaded, content);
     }
@@ -158,12 +200,12 @@ mod tests {
         crate::set_test_data_dir(data_dir.path().to_path_buf());
 
         assert_eq!(count(42).unwrap(), 0, "no snapshots yet");
-        save(42, "hash_a", b"content a").unwrap();
+        save_durable(42, "hash_a", b"content a").unwrap();
         assert_eq!(count(42).unwrap(), 1);
-        save(42, "hash_b", b"content b").unwrap();
+        save_durable(42, "hash_b", b"content b").unwrap();
         assert_eq!(count(42).unwrap(), 2);
         // Saving the same hash again must not increase the count (deduplication).
-        save(42, "hash_a", b"content a").unwrap();
+        save_durable(42, "hash_a", b"content a").unwrap();
         assert_eq!(count(42).unwrap(), 2);
     }
 }

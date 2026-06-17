@@ -858,7 +858,9 @@ fn handle_create(
         return Ok(());
     }
 
-    let snap = Some(snapshots::save(project.id, &hash, &content)?);
+    // Durable: a live-path snapshot may be the only copy of this content, so it
+    // must survive power loss before the event that references it commits (#41).
+    let snap = Some(snapshots::save_durable(project.id, &hash, &content)?);
 
     // macOS FSEvents can report overwrites as CREATE events.
     // If the file is already tracked and alive, record MODIFIED instead.
@@ -867,24 +869,30 @@ fn handle_create(
         _ => ("CREATED", None),
     };
 
-    db.insert_event(
-        project.id,
-        &path_str,
-        event_type,
-        Some(&hash),
-        prev_hash.as_deref(),
-        snap.as_deref(),
-        None,
-        Some(content.len() as i64),
-    )?;
-    db.upsert_file_state(
-        project.id,
-        &path_str,
-        &hash,
-        true,
-        content.len() as i64,
-        mtime_nanos,
-    )?;
+    // One transaction so the event and the file_state update are all-or-nothing:
+    // a crash between them can't leave a dangling previous_hash chain or a stale
+    // exists_now flag (#41).
+    db.transaction(|db| {
+        db.insert_event(
+            project.id,
+            &path_str,
+            event_type,
+            Some(&hash),
+            prev_hash.as_deref(),
+            snap.as_deref(),
+            None,
+            Some(content.len() as i64),
+        )?;
+        db.upsert_file_state(
+            project.id,
+            &path_str,
+            &hash,
+            true,
+            content.len() as i64,
+            mtime_nanos,
+        )?;
+        Ok(())
+    })?;
 
     if verbose {
         eprintln!(
@@ -946,26 +954,30 @@ fn handle_modify(
                 return Ok(());
             }
 
-            let snap = Some(snapshots::save(project.id, &hash, &content)?);
+            // Durable snapshot before the committing event (#41).
+            let snap = Some(snapshots::save_durable(project.id, &hash, &content)?);
 
-            db.insert_event(
-                project.id,
-                &path_str,
-                "MODIFIED",
-                Some(&hash),
-                s.latest_hash.as_deref(),
-                snap.as_deref(),
-                None,
-                Some(content.len() as i64),
-            )?;
-            db.upsert_file_state(
-                project.id,
-                &path_str,
-                &hash,
-                true,
-                content.len() as i64,
-                mtime_nanos,
-            )?;
+            db.transaction(|db| {
+                db.insert_event(
+                    project.id,
+                    &path_str,
+                    "MODIFIED",
+                    Some(&hash),
+                    s.latest_hash.as_deref(),
+                    snap.as_deref(),
+                    None,
+                    Some(content.len() as i64),
+                )?;
+                db.upsert_file_state(
+                    project.id,
+                    &path_str,
+                    &hash,
+                    true,
+                    content.len() as i64,
+                    mtime_nanos,
+                )?;
+                Ok(())
+            })?;
 
             if verbose {
                 eprintln!(
@@ -1000,17 +1012,22 @@ fn handle_delete(
         return Ok(());
     }
 
-    db.insert_event(
-        project.id,
-        &path_str,
-        "DELETED",
-        None,
-        prev_hash.as_deref(),
-        None,
-        None,
-        None,
-    )?;
-    db.mark_deleted(project.id, &path_str)?;
+    // Event + mark_deleted commit together so a crash can't record the DELETED
+    // event without flipping exists_now, or vice versa (#41).
+    db.transaction(|db| {
+        db.insert_event(
+            project.id,
+            &path_str,
+            "DELETED",
+            None,
+            prev_hash.as_deref(),
+            None,
+            None,
+            None,
+        )?;
+        db.mark_deleted(project.id, &path_str)?;
+        Ok(())
+    })?;
 
     if verbose {
         eprintln!(
@@ -1048,28 +1065,33 @@ fn handle_rename(
         .get_file_state(project.id, &old_str)?
         .and_then(|s| if s.exists_now { s.latest_hash } else { None });
 
-    let snap = Some(snapshots::save(project.id, &hash, &content)?);
+    // Durable snapshot before the committing event (#41).
+    let snap = Some(snapshots::save_durable(project.id, &hash, &content)?);
 
-    db.insert_event(
-        project.id,
-        &new_str,
-        "RENAMED",
-        Some(&hash),
-        prev_hash.as_deref(),
-        snap.as_deref(),
-        Some(&old_str),
-        Some(content.len() as i64),
-    )?;
-
-    db.mark_deleted(project.id, &old_str)?;
-    db.upsert_file_state(
-        project.id,
-        &new_str,
-        &hash,
-        true,
-        content.len() as i64,
-        mtime_nanos,
-    )?;
+    // The RENAMED event, the old path's deletion, and the new path's state all
+    // commit together so a crash can't split the rename across two autocommits (#41).
+    db.transaction(|db| {
+        db.insert_event(
+            project.id,
+            &new_str,
+            "RENAMED",
+            Some(&hash),
+            prev_hash.as_deref(),
+            snap.as_deref(),
+            Some(&old_str),
+            Some(content.len() as i64),
+        )?;
+        db.mark_deleted(project.id, &old_str)?;
+        db.upsert_file_state(
+            project.id,
+            &new_str,
+            &hash,
+            true,
+            content.len() as i64,
+            mtime_nanos,
+        )?;
+        Ok(())
+    })?;
 
     if verbose {
         eprintln!(

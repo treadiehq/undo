@@ -9,6 +9,7 @@ mod db;
 mod diff;
 mod duration;
 mod ignore;
+mod integrity;
 mod logging;
 mod models;
 mod restore;
