@@ -166,7 +166,7 @@ Auto-pruning also runs at daemon startup and every hour while the daemon is runn
 
 ### `undo status`
 
-Show daemon status, event counts, retention config, and disk usage.
+Show daemon status, event counts, retention config, disk usage, and a snapshot-integrity check.
 
 ```bash
 undo status
@@ -180,10 +180,13 @@ Daemon:    running (PID 12345)
 Database:  /Users/me/.undo/database.db (24.0 KB)
 Events:    142
 Snapshots: 87
+Integrity: OK (87 verified)
 Retention: 7 days, 1.0 GB max
 Disk:      45.2 MB (snapshots: 38.1 MB, backups: 5.8 MB, db: 1.3 MB)
 Log:       /Users/me/.undo/undo.log
 ```
+
+The `Integrity:` line runs a deep verification of the snapshots referenced by your current files — each one is decompressed and checked, the expensive read-per-snapshot pass the daemon deliberately skips at startup. A clean store reads `OK (N verified)`. If anything is wrong it reads `X unreadable (M missing, C corrupt, of N checked)`, distinguishing snapshots whose file is gone from snapshots that fail to decompress.
 
 ### `undo stop`
 
