@@ -10,7 +10,11 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+- Prune now reclaims leaked snapshot temp files (`<hash>.gz.tmp.*`) left behind
+  when a durable write is interrupted by a hard kill or power loss. Previously
+  nothing reclaimed them and they inflated disk usage indefinitely; reaping is
+  age-guarded so an in-flight write is never touched. `undo status` also no
+  longer counts such temp files toward the snapshot total.
 
 ## [0.1.12] — 2026-06-17
 

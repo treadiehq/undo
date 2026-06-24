@@ -9,6 +9,14 @@ use crate::db::Database;
 const DEFAULT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_SIZE_MB: u64 = 1024;
 
+/// Minimum age before a leftover snapshot temp file (`<hash>.gz.tmp.<pid>.<seq>`)
+/// is treated as leaked and reclaimable. A durable snapshot write creates the
+/// temp, fsyncs, and renames it into place within milliseconds, removing it on
+/// error — so any temp older than this can only be the residue of a hard kill or
+/// power loss between create and rename. The generous margin guarantees an
+/// in-flight write from a concurrent `undo` process is never mistaken for leaked.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[derive(Debug, Deserialize, Default)]
 struct RawConfig {
     retention_days: Option<u64>,
@@ -109,6 +117,16 @@ pub fn load_config(project_root: Option<&Path>) -> RetentionConfig {
     cfg
 }
 
+/// True if `path` names an unpublished snapshot temp file, i.e. the
+/// `<hash>.gz.tmp.<pid>.<seq>` form written by `snapshots::write_snapshot_in`
+/// before the atomic rename. Real snapshots are `<hash>.gz`; hashes are hex, so
+/// they never contain `.gz.tmp.`, making the substring an unambiguous marker.
+fn is_snapshot_temp(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".gz.tmp."))
+}
+
 /// Run the full prune cycle for one project.
 pub fn prune(
     db: &Database,
@@ -143,9 +161,30 @@ pub fn prune(
     let snap_dir = bt_dir.join("snapshots").join(project_id.to_string());
 
     if snap_dir.exists() {
+        // Anything created before this instant minus the staleness margin is old
+        // enough to be a leaked temp rather than an in-flight write. `checked_sub`
+        // guards the (pathological) case of a system clock near the epoch.
+        let stale_temp_cutoff = std::time::SystemTime::now().checked_sub(STALE_TEMP_AGE);
         for entry in std::fs::read_dir(&snap_dir)? {
             let entry = entry?;
             let path = entry.path();
+            // Reap leaked snapshot temp files (`<hash>.gz.tmp.<pid>.<seq>`) from
+            // writes interrupted by a hard kill or power loss. Nothing else ever
+            // reclaims them — the `.gz`-only filter below skips them — so without
+            // this they accumulate across crashes and permanently inflate disk
+            // usage. Age-guarded so a concurrent in-flight write is never touched.
+            if is_snapshot_temp(&path) {
+                if let Some(meta) = entry.metadata().ok().filter(|m| {
+                    stale_temp_cutoff
+                        .is_some_and(|cutoff| m.modified().is_ok_and(|mtime| mtime < cutoff))
+                }) {
+                    if !dry_run {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    stats.bytes_freed += meta.len();
+                }
+                continue;
+            }
             if path.extension().and_then(|e| e.to_str()) != Some("gz") {
                 continue;
             }
@@ -587,5 +626,102 @@ mod tests {
             1,
             "a huge retention window must keep everything, not delete it"
         );
+    }
+
+    /// `is_snapshot_temp` recognises the `<hash>.gz.tmp.<pid>.<seq>` form and
+    /// nothing else — a published `<hash>.gz` snapshot must never match.
+    #[test]
+    fn is_snapshot_temp_matches_only_temp_writes() {
+        assert!(is_snapshot_temp(Path::new("/s/1/deadbeef.gz.tmp.123.4")));
+        assert!(!is_snapshot_temp(Path::new("/s/1/deadbeef.gz")));
+        assert!(!is_snapshot_temp(Path::new("/s/1/deadbeef")));
+    }
+
+    /// A leaked snapshot temp file (from a write killed between create and rename)
+    /// must be reaped by prune once it ages past `STALE_TEMP_AGE`, while a fresh
+    /// in-flight temp is preserved. Before the fix nothing ever reclaimed these —
+    /// the `.gz`-only extension filter skipped them — so they accumulated across
+    /// crashes and inflated disk usage indefinitely.
+    /// (Red before the reaping branch: the stale temp survives prune.)
+    #[test]
+    fn prune_reaps_stale_snapshot_temp_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+
+        let snap_dir = crate::backtrack_dir()
+            .unwrap()
+            .join("snapshots")
+            .join(project.id.to_string());
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        // A leaked temp from an interrupted durable write, backdated well past the
+        // staleness threshold.
+        let stale = snap_dir.join("deadbeef.gz.tmp.999.1");
+        std::fs::write(&stale, b"half-written gzip").unwrap();
+        set_mtime_secs_ago(&stale, STALE_TEMP_AGE.as_secs() * 2);
+
+        // A fresh temp from a write happening right now must be left untouched.
+        let fresh = snap_dir.join("cafef00d.gz.tmp.1000.2");
+        std::fs::write(&fresh, b"in flight").unwrap();
+
+        let stats = prune(&db, project.id, &RetentionConfig::default(), false).unwrap();
+
+        assert!(!stale.exists(), "a stale leaked temp file must be reaped");
+        assert!(
+            fresh.exists(),
+            "a fresh in-flight temp file must be preserved"
+        );
+        assert!(
+            stats.bytes_freed >= b"half-written gzip".len() as u64,
+            "reaped temp bytes must be reported as freed"
+        );
+    }
+
+    /// A dry run must report-but-not-delete a stale temp, mirroring how the rest of
+    /// prune treats `--dry-run`.
+    #[test]
+    fn prune_dry_run_keeps_stale_temp_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+
+        let snap_dir = crate::backtrack_dir()
+            .unwrap()
+            .join("snapshots")
+            .join(project.id.to_string());
+        std::fs::create_dir_all(&snap_dir).unwrap();
+
+        let stale = snap_dir.join("deadbeef.gz.tmp.999.1");
+        std::fs::write(&stale, b"half-written gzip").unwrap();
+        set_mtime_secs_ago(&stale, STALE_TEMP_AGE.as_secs() * 2);
+
+        prune(&db, project.id, &RetentionConfig::default(), true).unwrap();
+
+        assert!(stale.exists(), "dry run must not delete the stale temp");
+    }
+
+    /// Backdate a file's mtime by `secs_ago` seconds via `utimes(2)` so the
+    /// staleness check in prune can be exercised deterministically without
+    /// sleeping. Unix-only, which matches the rest of the crate.
+    fn set_mtime_secs_ago(path: &Path, secs_ago: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let tv = libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes must succeed to set up the test");
     }
 }
