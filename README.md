@@ -11,7 +11,7 @@ Not anymore. Undo keeps local history, then lets you bring files back instantly.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/treadiehq/undo/main/install.sh | sh
+curl -fsSL https://useundo.co/install.sh | bash
 ```
 
 You can also download a binary from the [Releases page](https://github.com/treadiehq/undo/releases). macOS (ARM + Intel) and Linux are supported.
