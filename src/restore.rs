@@ -35,7 +35,7 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     let source = match resolve_restore_source(&db, project.id, &abs_path_str, target_time)? {
         Some(s) => s,
         None => {
-            println!("No snapshots found for this file.");
+            println!("No saved versions found for this file.");
             return Ok(());
         }
     };
@@ -45,7 +45,7 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
         RestoreKind::OldestFallback => {
             let age = Utc::now().timestamp() - source.timestamp;
             println!(
-                "No snapshot from {} ago — falling back to earliest available (from {}).",
+                "No saved version from {} ago. Using the earliest one available (from {}).",
                 duration_str,
                 duration::format_elapsed(age)
             );
@@ -99,7 +99,7 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     let rel = crate::relative_path(&abs_path_str, &project.root_path);
 
     println!(
-        "{}Restored{} {} from snapshot captured {}.",
+        "{}Restored{} {} from the version saved {}.",
         GREEN, RESET, rel, ago
     );
 

@@ -1,6 +1,6 @@
-# Undo — Detailed Documentation
+# Undo Detailed Docs
 
-Complete reference for undo's features, internals, and configuration.
+Commands, settings, storage, and troubleshooting for Undo.
 
 ## Table of Contents
 
@@ -8,7 +8,7 @@ Complete reference for undo's features, internals, and configuration.
 - [Commands](#commands)
 - [How It Works](#how-it-works)
 - [Configuration](#configuration)
-- [Retention and Pruning](#retention-and-pruning)
+- [Cleanup Rules](#cleanup-rules)
 - [Ignored Paths](#ignored-paths)
 - [Safety Guards](#safety-guards)
 - [Data Storage](#data-storage)
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/treadiehq/undo/main/install.sh | sh
 
 ### Download binaries
 
-Prebuilt binaries for macOS (ARM + Intel) and Linux (x86_64) are available on the
+Prebuilt binaries are available for macOS (ARM + Intel) and Linux (x86_64) on the
 [Releases page](https://github.com/treadiehq/undo/releases).
 
 ### Build from source
@@ -50,7 +50,7 @@ See [CONTRIBUTING.md](../CONTRIBUTING.md) for the development workflow (tests, l
 
 ### `undo start`
 
-Start watching the current directory.
+Start saving history for the current folder.
 
 ```bash
 cd your-project/
@@ -58,20 +58,20 @@ undo start
 ```
 
 ```
-undo — filesystem history
+undo: give your files an undo button
 Watching: /Users/me/my-project
 Recording changes...
 ```
 
-The daemon runs in the foreground. Use `Ctrl+C` to stop, or run it in the background:
+Undo runs in the foreground by default. Use `Ctrl+C` to stop it, or run it in the background:
 
 ```bash
 undo start &
 ```
 
-You can run multiple daemons simultaneously for different projects — each gets its own PID file.
+You can run Undo in several projects at the same time. Each project is tracked separately.
 
-Use `--force` to skip safety checks (ownership, file-count limit):
+Use `--force` to skip startup safety checks, such as ownership and file-count checks:
 
 ```bash
 undo start --force
@@ -79,7 +79,7 @@ undo start --force
 
 ### `undo what-changed <duration>`
 
-Show what changed in a time window.
+Show what changed recently.
 
 ```bash
 undo what-changed 5m
@@ -103,7 +103,7 @@ DELETED
 
 ### `undo timeline`
 
-Show a chronological log of recent file activity.
+Show recent file activity in order.
 
 ```bash
 undo timeline
@@ -121,7 +121,7 @@ undo — recent activity
 
 ### `undo diff <path>`
 
-Show a unified diff between the current file and its latest captured snapshot.
+Compare the current file with the latest saved version.
 
 ```bash
 undo diff src/server.rs
@@ -129,7 +129,7 @@ undo diff src/server.rs
 
 ### `undo restore <path> <duration>`
 
-Restore a file from a past snapshot.
+Bring back an older version of a file.
 
 ```bash
 undo restore src/server.rs 10m
@@ -137,14 +137,14 @@ undo restore src/server.rs 10m
 
 ```
 Backup of current file saved to /Users/me/.undo/backups/server.rs_1713200000.bak
-Restored src/server.rs from snapshot captured 9 minute(s) ago.
+Restored src/server.rs from the version saved 9 minute(s) ago.
 ```
 
-A safety backup is always created in `~/.undo/backups/` before overwriting, so it survives reboots.
+Before Undo overwrites a file, it saves a backup in `~/.undo/backups/`.
 
 ### `undo prune`
 
-Remove old history beyond the retention window.
+Delete saved history that is older than your cleanup rules.
 
 ```bash
 undo prune
@@ -153,20 +153,20 @@ undo prune --dry-run
 ```
 
 ```
-Pruned 342 events, 89 snapshots, 3 backups.
-Freed 12.4 MB. Current usage: 45.2 MB.
+Deleted 342 events, 89 saved copies, 3 backups.
+Freed 12.4 MB. Current storage: 45.2 MB.
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Preview what would be deleted without deleting |
-| `--keep <duration>` | Override retention period (e.g. `30d`, `12h`) |
+| `--keep <duration>` | Keep this much history for this cleanup run (e.g. `30d`, `12h`) |
 
-Auto-pruning also runs at daemon startup and every hour while the daemon is running.
+Cleanup also runs when Undo starts and then once an hour while it is running.
 
 ### `undo status`
 
-Show daemon status, event counts, retention config, and disk usage.
+Show whether Undo is running, how much history it has saved, how much space it uses, and whether referenced snapshots are readable.
 
 ```bash
 undo status
@@ -176,50 +176,53 @@ undo status
 undo — status
 
 Project:   /Users/me/my-project
-Daemon:    running (PID 12345)
+Status:    running (PID 12345)
 Database:  /Users/me/.undo/database.db (24.0 KB)
 Events:    142
-Snapshots: 87
-Retention: 7 days, 1.0 GB max
-Disk:      45.2 MB (snapshots: 38.1 MB, backups: 5.8 MB, db: 1.3 MB)
+Saved:     87 versions
+Integrity: OK (87 verified)
+Keep:      7 days, 1.0 GB max
+Storage:   45.2 MB (saved: 38.1 MB, backups: 5.8 MB, db: 1.3 MB)
 Log:       /Users/me/.undo/undo.log
 ```
 
+The `Integrity:` line runs a deep verification of the snapshots referenced by retained history for this project. Each one is decompressed and checked, the expensive read-per-snapshot pass the daemon deliberately skips at startup. A clean store reads `OK (N verified)`. If anything is wrong it reads `X unreadable (M missing, C corrupt, of N checked)`, distinguishing snapshots whose file is gone from snapshots that fail to decompress.
+
 ### `undo stop`
 
-Stop the daemon.
+Stop saving history.
 
 ```bash
-undo stop          # stop daemon for this project
-undo stop --all    # stop all running undo daemons
+undo stop          # stop Undo for this project
+undo stop --all    # stop Undo in every watched folder
 ```
 
 ### `undo update`
 
-Update undo to the latest release.
+Update Undo to the latest release.
 
 ```bash
 undo update
 ```
 
-It downloads the release artifact for your platform, verifies it against the release's published `SHA256SUMS` before installing, and replaces the running binary atomically (a copy-then-rename so an interrupted update can't leave a half-written executable). If the checksum file is missing or the hash doesn't match, the update aborts without touching the installed binary.
+Undo downloads the release for your platform, checks it against the published `SHA256SUMS`, then installs it with a copy-and-rename step. If the checksum is missing or does not match, the update stops without touching your current install.
 
 ---
 
 ## How It Works
 
-undo runs a lightweight daemon that watches your project directory using OS-native file watching (FSEvents on macOS, inotify on Linux).
+Undo runs as a small background process that watches your project for file changes. It uses FSEvents on macOS and inotify on Linux.
 
-When files change, undo:
+When files change, Undo:
 
-1. Hashes the file content (SHA-256)
-2. Compares against the last known hash
-3. Saves a compressed snapshot atomically (write to temp file, then rename) if the content changed
-4. Records the event in a local SQLite database
+1. Reads the file
+2. Checks whether the content changed
+3. Saves a compressed copy when there is a new version
+4. Records the change in a local SQLite database
 
-On startup, undo performs a reconciliation scan to detect any changes that happened while the daemon was stopped — so you never have a gap in history.
+When Undo starts, it scans once to catch changes that happened while it was stopped.
 
-If the watched directory becomes inaccessible (e.g. a remote filesystem unmount), undo pauses recording and resumes automatically with a full reconciliation when the directory reappears.
+If the watched folder disappears, such as when a remote mount disconnects, Undo pauses. When the folder comes back, Undo scans again and resumes.
 
 ---
 
@@ -238,7 +241,7 @@ max_size_mb = 1024
 retention_days = 30
 ```
 
-Per-project values override global values. If neither file exists, the hardcoded defaults apply.
+Project settings override global settings. If neither file exists, Undo uses its built-in defaults.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -247,24 +250,24 @@ Per-project values override global values. If neither file exists, the hardcoded
 
 ---
 
-## Retention and Pruning
+## Cleanup Rules
 
-undo automatically prunes old history to prevent unbounded disk usage.
+Undo deletes old history automatically so `~/.undo/` does not grow forever.
 
-### What gets pruned
+### What gets cleaned up
 
-Three things, in this order:
+Undo cleans up three things, in this order:
 
-1. **Events** — database records older than the retention window are deleted
-2. **Orphaned snapshots** — `.gz` snapshot files no longer referenced by any remaining event
-3. **Backups** — files in `~/.undo/backups/` older than the retention window (by file mtime)
+1. **Events** — old database records
+2. **Unused saved copies** — `.gz` files no remaining event points to
+3. **Backups** — old files in `~/.undo/backups/`
 
-After TTL pruning, if total `~/.undo/` size still exceeds `max_size_mb`, the oldest snapshots are deleted across all projects until under the cap.
+If `~/.undo/` is still over `max_size_mb`, Undo deletes the oldest saved copies until it is under the limit.
 
-### When pruning runs
+### When cleanup runs
 
-- At daemon startup (after the initial reconciliation scan)
-- Every hour while the daemon is running
+- When Undo starts
+- Every hour while Undo is running
 - Manually with `undo prune`
 
 ### Dry run
@@ -273,21 +276,21 @@ After TTL pruning, if total `~/.undo/` size still exceeds `max_size_mb`, the old
 undo prune --dry-run
 ```
 
-Shows what would be deleted without actually deleting anything.
+Shows what would be deleted without deleting it.
 
-### Override retention
+### Override the cleanup window
 
 ```bash
 undo prune --keep 30d
 ```
 
-Temporarily overrides the configured retention period for this prune run.
+Uses a different cleanup window for this one run.
 
 ---
 
 ## Ignored Paths
 
-undo automatically ignores noisy and sensitive paths:
+Undo automatically skips noisy and sensitive paths:
 
 - `.git/`, `.undo/`
 - `node_modules/`, `__pycache__/`
@@ -298,7 +301,7 @@ undo automatically ignores noisy and sensitive paths:
 
 ### Custom ignore patterns
 
-Add a `.undoignore` file to your project root with additional patterns (one per line, same syntax as `.gitignore`):
+Add a `.undoignore` file to your project root for extra ignore rules. Use one pattern per line, with the same syntax as `.gitignore`:
 
 ```
 *.log
@@ -306,7 +309,7 @@ tmp/
 *.sqlite
 ```
 
-If a root `.gitignore` file exists, undo respects it too. `.undoignore` patterns take precedence. Note: only the root `.gitignore` is loaded; nested `.gitignore` files in subdirectories are not currently supported. If you need to exclude files matched by nested gitignores, add those patterns to your root `.undoignore`.
+Undo also follows your root `.gitignore`. `.undoignore` wins when both files match a path. Only the root `.gitignore` is loaded for now; nested `.gitignore` files are not supported. Add those patterns to `.undoignore` if you need them.
 
 ### Overriding the defaults
 
@@ -318,69 +321,69 @@ If a default-ignored path is actually something you want tracked, use a negation
 !dist/
 ```
 
-Negation patterns override the builtin ignore list. This is useful when a default like `build/` or `dist/` is actually source code in your project, or when you intentionally want to track `.env` changes.
+Negation patterns override the built-in ignore list. This is useful when a default like `build/` or `dist/` is source code in your project, or when you intentionally want to track `.env` changes.
 
 ### Large files
 
-Files larger than **100 MB** are tracked (events recorded) but not snapshotted, to keep disk usage reasonable.
+Files larger than **100 MB** appear in history, but Undo does not save their contents. This keeps disk usage under control.
 
 ---
 
 ## Safety Guards
 
-undo refuses to start when it detects dangerous conditions:
+Undo refuses to start when it detects a risky location:
 
 | Guard | Why |
 |-------|-----|
-| **Root/sudo** | Running as root writes data to root's home, invisible to your normal user |
+| **Root/sudo** | Running as root stores data where your normal user may not see it |
 | **System directories** | Directories owned by root or system accounts (`/`, `/etc`, `/usr`, etc.) |
-| **Oversized directories** | More than 50,000 files (catches `~/` and similar broad directories) |
+| **Oversized directories** | More than 50,000 files, which usually means the folder is too broad |
 
 All guards can be overridden with `--force`.
 
 ### Overlapping directories
 
-Undo prevents starting a daemon if another daemon is already watching a parent or child directory. For example, if you're watching `/foo/bar`, starting a second daemon on `/foo` would cause both to record events for files in `/foo/bar`, producing duplicates. Undo detects this and refuses to start with a message pointing to the conflicting daemon.
+Undo will not start if another Undo process is already watching a parent or child folder. For example, if `/foo/bar` is already being watched, starting Undo on `/foo` would record some changes twice. Undo stops and points you to the conflicting process.
 
 ### Remote file clobbers (SCP, rsync, etc.)
 
-Undo watches at the filesystem level, not the process level. If someone overwrites a file via `scp`, `rsync`, or any other remote tool, undo records the change like any other modification. The previous version is snapshotted and restorable with `undo restore`.
+Undo watches files, not apps. If `scp`, `rsync`, or another tool overwrites a file, Undo records it like any other change. The previous version can be restored with `undo restore`.
 
-This makes undo a natural safety net for remote deployments and shared development servers — if a file gets clobbered by a remote write, you can get it back.
+This makes Undo useful on shared development servers and deployment boxes. If a remote write clobbers a file, you can get it back.
 
-One caveat: if the file is owned by root or has restricted permissions, undo (running as your normal user) may not be able to read it for snapshotting. The event is still recorded, but no snapshot is saved.
+One caveat: if the file is owned by root or has restricted permissions, Undo may not be able to read it. The change is still recorded, but the file contents are not saved.
 
 ---
 
 ## Data Storage
 
-All data is stored locally at `~/.undo/`:
+Undo stores all data locally at `~/.undo/`:
 
 | Path | Purpose |
 |------|---------|
-| `database.db` | Event history and file state (SQLite) |
-| `snapshots/<project_id>/` | Gzip-compressed file snapshots, named by content hash |
-| `pids/<hash>.pid` | Per-project daemon PID files |
+| `database.db` | Change history and file state (SQLite) |
+| `snapshots/<project_id>/` | Compressed saved copies, named by content |
+| `pids/<hash>.pid` | Per-project process ID files |
 | `backups/` | Safety backups created before restoring a file |
 | `config.toml` | Global configuration (optional) |
-| `undo.log` | Daemon log (errors, crashes, prune/lifecycle notices); rotates to `undo.log.1` at 5 MB |
+| `undo.log` | Logs for errors, crashes, cleanup, and start/stop notices; rotates to `undo.log.1` at 5 MB |
 
-Everything under `~/.undo/` is created owner-only: the directory is `0700` and the database, snapshots, backups, PID files, and log are `0600`, so snapshot contents are never readable by other users on the machine.
+Everything under `~/.undo/` is owner-only: the directory is `0700` and the database, saved copies, backups, PID files, and log are `0600`. Other users on the machine cannot read your saved file contents.
 
-Snapshots are content-addressed: if two files have the same content, only one snapshot is stored.
+If two files have the same content, Undo stores that content once.
 
-Snapshots are written atomically (write to `.tmp`, then rename) to prevent partial snapshots from being treated as valid data.
+Saved copies are written to a `.tmp` file first, then renamed into place, so partial writes are not treated as valid history.
 
 ---
 
 ## Multi-Project Support
 
-You can run undo on multiple projects simultaneously. Each project gets:
+You can run Undo on multiple projects at the same time. Each project gets:
 
-- Its own PID file in `~/.undo/pids/`
-- Its own snapshot directory in `~/.undo/snapshots/<project_id>/`
-- Its own events in the shared SQLite database (partitioned by `project_id`)
-- Its own retention config via `.undorc`
+- Its own process ID file in `~/.undo/pids/`
+- Its own saved-copy directory in `~/.undo/snapshots/<project_id>/`
+- Its own events in the shared SQLite database
+- Its own cleanup settings via `.undorc`
 
 ```bash
 # Terminal 1
@@ -406,23 +409,23 @@ undo stop --all
 |------------|--------|-------|
 | APFS, HFS+ (macOS) | Works | Full support via FSEvents |
 | ext4, btrfs, xfs, zfs (Linux) | Works | Full support via inotify |
-| NFS, SMB/CIFS | No events | inotify only fires for local changes; remote writes are invisible to the daemon |
+| NFS, SMB/CIFS | No events | inotify only fires for local changes; remote writes are invisible to Undo |
 | sshfs, FUSE mounts | Varies | Depends on the FUSE implementation; some emit events, some don't |
 | NTFS (via ntfs-3g) | Unreliable | FUSE-based on Linux, no native notifications |
 
-For filesystems that don't emit events, the reconciliation scan at daemon startup will detect any changes that were missed — you get eventual consistency, but not real-time tracking.
+For filesystems that do not send events, Undo will not see changes immediately. The startup scan still catches missed changes the next time Undo starts.
 
 ### ZFS rollbacks
 
-If a ZFS snapshot restore (`zfs rollback`) happens while the daemon is running, it may see a flood of change events or miss changes entirely depending on how the rollback interacts with inotify. Restarting the daemon after a rollback triggers a full reconciliation scan that brings the database back in sync.
+If a ZFS rollback happens while Undo is running, Undo may see many change events or miss some changes, depending on how the rollback interacts with inotify. Restart Undo after a rollback so it can scan and get back in sync.
 
 ### Binary files
 
-Binary files (images, compiled assets, databases, etc.) are fully supported:
+Binary files, such as images, compiled assets, and databases, are supported:
 
-- **Snapshot and restore** work on raw bytes — content round-trips perfectly
-- **Events** are tracked the same as text files (hash, timestamp, event type)
-- **Diff** detects binary content (NUL bytes in the first 8 KB) and prints "Binary file — text diff not available" instead of attempting a text diff
+- **Save and restore** work on raw bytes
+- **Events** are tracked the same as text files
+- **Diff** detects binary content and prints "Binary file — text comparison not available"
 
 ---
 
@@ -430,38 +433,38 @@ Binary files (images, compiled assets, databases, etc.) are fully supported:
 
 ### Where to look first: the log
 
-The daemon writes to `~/.undo/undo.log` (shown in `undo status` as the `Log:` line). Errors, crashes, pause/resume notices, and auto-prune summaries all land there, each line tagged with the daemon's PID so multiple projects stay attributable. The log rotates to `undo.log.1` once it passes 5 MB.
+Undo writes to `~/.undo/undo.log`, which is shown in `undo status` as the `Log:` line. Errors, crashes, pause/resume notices, and cleanup summaries all go there. The log rotates to `undo.log.1` after 5 MB.
 
-### "undo is already running"
+### "Undo is already saving history"
 
-A daemon already holds the lock for this directory. Liveness is verified by an advisory lock on the PID file (not just by the PID existing), so this message means a live daemon — not a stale file. Use `undo status` to see its PID, or `undo stop` to stop it.
+Undo is already running for this folder. Use `undo status` to see its process ID, or `undo stop` to stop it.
 
 ### "directory overlaps with an already-watched path"
 
-Another daemon is watching a parent or child of this directory, which would double-record events. Stop the other daemon, watch a non-overlapping directory, or pass `--force` to override (you'll get duplicate events for the overlapping subtree).
+Another Undo process is watching a parent or child folder, which would record some changes twice. Stop the other process, watch a different folder, or pass `--force` if duplicate events are acceptable.
 
 ### "refusing to run as root" / "owned by root" / "owned by a system account"
 
-Safety guards (see [Safety Guards](#safety-guards)). Run as your normal user from a directory you own, or pass `--force` if you understand the consequences.
+Undo hit a safety guard. Run it as your normal user from a folder you own, or pass `--force` if you understand the risk.
 
 ### "directory contains more than 50,000 files"
 
-The file-count guard tripped — usually because `undo start` was run somewhere very broad (a home directory, `/`). Watch a specific project directory, add ignore rules in `.undoignore`, or pass `--force` to watch it anyway.
+This usually means `undo start` was run somewhere too broad, such as your home folder or `/`. Watch a specific project folder, add ignore rules in `.undoignore`, or pass `--force`.
 
-### A restore says "No snapshots found for this file"
+### A restore says "No saved versions found for this file"
 
-There is no recorded history for that path within reach. This happens if the file was never captured (e.g. it matches an ignore rule, or it was always larger than the 100 MB snapshot limit), or if its history has aged out of the retention window. `undo timeline` shows what is recorded.
+Undo has no saved version for that path. This can happen if the file was ignored, was always larger than 100 MB, or its history was already cleaned up. `undo timeline` shows what Undo has recorded.
 
 ### Changes aren't being recorded
 
-- Confirm the daemon is running for this directory: `undo status`.
+- Confirm Undo is running for this folder: `undo status`.
 - Check the path isn't ignored (`.gitignore`, `.undoignore`, or a builtin like `node_modules/`, `target/`, `.env*`).
-- On network/FUSE filesystems, real-time events may not fire — see [Platform Support](#platform-support). The startup reconciliation scan still catches missed changes when the daemon restarts.
+- On network/FUSE filesystems, real-time events may not fire; see [Platform Support](#platform-support). The startup scan still catches missed changes when Undo restarts.
 - Check `~/.undo/undo.log` for paused-recording or watcher errors.
 
-### Verifying snapshot integrity after a crash
+### Checking saved versions after a crash
 
-Snapshots are written before the database rows that reference them, and the database uses SQLite WAL, so an interrupted write self-heals (at worst an unreferenced snapshot that the next prune reclaims). If you suspect a problem after a hard crash, restarting the daemon runs a full reconciliation scan that brings the database back in line with what's on disk.
+Undo writes saved copies before it records them in the database, and SQLite WAL helps interrupted writes recover cleanly. At worst, a crash may leave an unused saved copy that the next cleanup removes. If you suspect a problem after a hard crash, restart Undo so it can scan and match the database to what is on disk.
 
 ---
 

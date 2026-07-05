@@ -141,6 +141,11 @@ pub fn load(project_id: i64, hash: &str) -> Result<Vec<u8>> {
 }
 
 /// Count snapshot files on disk for a project.
+///
+/// Counts only `*.gz` files — a published snapshot is always named `<hash>.gz`.
+/// In-flight or leaked temp writes are named `<hash>.gz.tmp.<pid>.<seq>` (so
+/// their extension is the sequence number, not `gz`); counting those would
+/// inflate the `Snapshots:` figure in `undo status` after an interrupted write.
 pub fn count(project_id: i64) -> Result<usize> {
     let dir = crate::backtrack_dir()?
         .join("snapshots")
@@ -148,7 +153,10 @@ pub fn count(project_id: i64) -> Result<usize> {
     if !dir.exists() {
         return Ok(0);
     }
-    Ok(fs::read_dir(dir)?.filter_map(|e| e.ok()).count())
+    Ok(fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gz"))
+        .count())
 }
 
 #[cfg(test)]
@@ -207,5 +215,29 @@ mod tests {
         // Saving the same hash again must not increase the count (deduplication).
         save_durable(42, "hash_a", b"content a").unwrap();
         assert_eq!(count(42).unwrap(), 2);
+    }
+
+    /// A leaked temp file from an interrupted durable write (`<hash>.gz.tmp.<pid>.<seq>`)
+    /// must NOT be counted as a snapshot — its extension is the sequence number,
+    /// not `gz`. Before the `.gz`-only filter, `count()` tallied every dir entry,
+    /// so a power-loss-leaked temp inflated the `Snapshots:` figure in `undo status`.
+    #[test]
+    fn count_ignores_leaked_temp_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        save_durable(7, "realhash", b"real snapshot").unwrap();
+        assert_eq!(count(7).unwrap(), 1);
+
+        // Simulate a temp file left behind by an interrupted/killed write.
+        let dir = crate::backtrack_dir().unwrap().join("snapshots").join("7");
+        let leaked = dir.join(format!("realhash.gz.tmp.{}.0", std::process::id()));
+        fs::write(&leaked, b"half-written gzip").unwrap();
+
+        assert_eq!(
+            count(7).unwrap(),
+            1,
+            "a leaked .gz.tmp temp file must not be counted as a snapshot"
+        );
     }
 }
