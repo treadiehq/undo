@@ -11,8 +11,8 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 #[derive(Parser)]
 #[command(
     name = "undo",
-    about = "undo — filesystem history for your working directory",
-    long_about = "See what changed. Diff it. Restore it. No git commit required."
+    about = "undo: give your files an undo button",
+    long_about = "See what changed, compare versions, and restore files when something goes wrong."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,7 +25,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start watching the current directory
+    /// Start saving history for the current folder
     Start {
         /// Skip safety checks (ownership, file-count limit)
         #[arg(long)]
@@ -39,19 +39,19 @@ pub enum Command {
         limit: usize,
     },
 
-    /// Show what changed in a time window (e.g. 5m, 2h, 1d)
+    /// Show what changed recently (e.g. 5m, 2h, 1d)
     WhatChanged {
         /// Duration like 5m, 30m, 2h, 1d
         duration: String,
     },
 
-    /// Show diff of a file against its latest snapshot
+    /// Compare a file with its latest saved version
     Diff {
-        /// File path to diff
+        /// File path to compare
         path: String,
     },
 
-    /// Restore a file from a snapshot
+    /// Bring back an older version of a file
     Restore {
         /// File path to restore
         path: String,
@@ -59,22 +59,22 @@ pub enum Command {
         duration: String,
     },
 
-    /// Show daemon and project status
+    /// Show whether Undo is running and how much space it uses
     Status,
 
-    /// Stop the daemon
+    /// Stop saving history
     Stop {
-        /// Stop all running undo daemons
+        /// Stop Undo in every watched folder
         #[arg(long)]
         all: bool,
     },
 
-    /// Remove old history beyond the retention window
+    /// Delete old saved history
     Prune {
-        /// Override retention period (e.g. 30d, 12h)
+        /// Keep this much history for this cleanup run (e.g. 30d, 12h)
         #[arg(long)]
         keep: Option<String>,
-        /// Dry run — show what would be deleted without deleting
+        /// Show what would be deleted without deleting it
         #[arg(long)]
         dry_run: bool,
     },

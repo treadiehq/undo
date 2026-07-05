@@ -134,8 +134,8 @@ fn check_no_overlap(bt_dir: &Path, new_root: &Path, exclude_pid: u32) -> Result<
         if overlap {
             anyhow::bail!(
                 "directory overlaps with an already-watched path.\n\
-                 Running daemon (PID {}) is watching: {}\n\
-                 Overlapping watchers cause duplicate events.\n\
+                 Undo (PID {}) is already watching: {}\n\
+                 Overlapping folders record some changes twice.\n\
                  Use --force to override.",
                 pid,
                 existing.display(),
@@ -180,7 +180,7 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         pid_file.read_to_string(&mut contents)?;
         let pid = contents.lines().next().unwrap_or("?");
         let project = contents.lines().nth(1).unwrap_or("unknown");
-        println!("undo is already running (PID {}).", pid);
+        println!("Undo is already saving history (PID {}).", pid);
         println!("Watching: {}", project);
         return Ok(());
     }
@@ -216,7 +216,7 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         cwd.display()
     );
 
-    println!("{}undo{} — filesystem history", BOLD, RESET);
+    println!("{}undo{}: give your files an undo button", BOLD, RESET);
     println!("Watching: {}", cwd.display());
     println!("Recording changes...");
     println!();
@@ -263,7 +263,7 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     let _ = std::fs::remove_file(&pid_path);
     drop(pid_file);
     crate::log_info!("daemon stopped (PID {})", std::process::id());
-    eprintln!("\nundo stopped.");
+    eprintln!("\nUndo stopped.");
 
     Ok(())
 }
@@ -281,7 +281,7 @@ pub fn cmd_stop(all: bool) -> Result<()> {
     let pid_path = pid_file_for_root(&bt_dir, &cwd);
 
     if !pid_path.exists() {
-        println!("No undo daemon is running for this directory.");
+        println!("Undo is not running for this folder.");
         return Ok(());
     }
 
@@ -298,7 +298,7 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("invalid PID file"))?;
 
     if !is_daemon_alive(pid_path) {
-        println!("Daemon is not running (stale PID file). Cleaning up.");
+        println!("Undo is not running (stale PID file). Cleaning up.");
         std::fs::remove_file(pid_path)?;
         return Ok(());
     }
@@ -318,7 +318,7 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
 
     if is_daemon_alive(pid_path) {
         anyhow::bail!(
-            "daemon (PID {}) did not stop within 6 seconds.\n\
+            "Undo (PID {}) did not stop within 6 seconds.\n\
              The PID file has been left in place so it can be found later.\n\
              Try `kill -9 {}` if the process is stuck.",
             pid,
@@ -329,14 +329,14 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
     let _ = std::fs::remove_file(pid_path);
 
     let project = contents.lines().nth(1).unwrap_or("unknown");
-    println!("undo daemon stopped (PID {}, {}).", pid, project);
+    println!("Undo stopped (PID {}, {}).", pid, project);
     Ok(())
 }
 
 fn stop_all_daemons(bt_dir: &Path) -> Result<()> {
     let pids_dir = bt_dir.join("pids");
     if !pids_dir.exists() {
-        println!("No undo daemons are running.");
+        println!("Undo is not running in any folder.");
         return Ok(());
     }
 
@@ -352,7 +352,7 @@ fn stop_all_daemons(bt_dir: &Path) -> Result<()> {
     }
 
     if stopped == 0 {
-        println!("No undo daemons were running.");
+        println!("Undo was not running in any folder.");
     }
     Ok(())
 }
@@ -382,7 +382,7 @@ pub fn cmd_status() -> Result<()> {
             } else {
                 format!("{}not running{}", RED, RESET)
             };
-            println!("Daemon:    {}", daemon_status);
+            println!("Status:    {}", daemon_status);
 
             let db_path = bt_dir.join("database.db");
             let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -395,7 +395,7 @@ pub fn cmd_status() -> Result<()> {
             let event_count = db.count_events(project.id)?;
             let snapshot_count = crate::snapshots::count(project.id)?;
             println!("Events:    {}", event_count);
-            println!("Snapshots: {}", snapshot_count);
+            println!("Saved:     {} versions", snapshot_count);
 
             // Deep check (decompress/CRC) since the user is here and asking — this is
             // the expensive read-per-snapshot pass the daemon startup deliberately
@@ -421,7 +421,7 @@ pub fn cmd_status() -> Result<()> {
             let project_root = std::path::Path::new(&project.root_path);
             let cfg = crate::retention::load_config(Some(project_root));
             println!(
-                "Retention: {} days, {} max",
+                "Keep:      {} days, {} max",
                 cfg.retention_days,
                 crate::retention::format_size(cfg.max_size_bytes()),
             );
@@ -429,7 +429,7 @@ pub fn cmd_status() -> Result<()> {
             // Single tree walk instead of three (was: dir_size x2 + total).
             let usage = crate::retention::disk_usage_breakdown().unwrap_or_default();
             println!(
-                "Disk:      {} (snapshots: {}, backups: {}, db: {})",
+                "Storage:   {} (saved: {}, backups: {}, db: {})",
                 crate::retention::format_size(usage.total),
                 crate::retention::format_size(usage.snapshots),
                 crate::retention::format_size(usage.backups),
@@ -439,8 +439,8 @@ pub fn cmd_status() -> Result<()> {
             println!("Log:       {}", crate::logging::log_path(&bt_dir).display());
         }
         None => {
-            println!("No project being watched for this directory.");
-            println!("Run {}undo start{} to begin watching.", BOLD, RESET);
+            println!("Undo is not saving history for this folder.");
+            println!("Run {}undo start{} to begin.", BOLD, RESET);
         }
     }
 

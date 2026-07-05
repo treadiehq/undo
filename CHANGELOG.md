@@ -10,11 +10,37 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.1.14] — 2026-07-05
+
+- Integrity check is now tiered for speed on large histories: daemon startup runs
+  a shallow existence-only check (a stat per distinct snapshot, which still catches
+  the power-loss symptom of a committed row pointing at missing bytes), while
+  `undo status` runs the full decompress/CRC check on demand and reports it as the
+  `Integrity:` line.
+- Documentation: fixed accuracy drift (toolchain version, ignore-list patterns,
+  data-storage layout, the `Log:` and `Integrity:` status lines) and added
+  `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md`, and Cargo package metadata.
 - Prune now reclaims leaked snapshot temp files (`<hash>.gz.tmp.*`) left behind
   when a durable write is interrupted by a hard kill or power loss. Previously
   nothing reclaimed them and they inflated disk usage indefinitely; reaping is
   age-guarded so an in-flight write is never touched. `undo status` also no
   longer counts such temp files toward the snapshot total.
+
+## [0.1.13] — 2026-06-17
+
+- Crash/power-loss durability for the live write path: snapshots written by the
+  live watcher are fsync'd (file + parent directory) before the referencing
+  database row is committed, and each event's row plus file-state update now commit
+  in a single transaction, so an interrupted write can't leave a dangling hash
+  chain or a row pointing at bytes that never reached disk. (`undo status` gains an
+  `Integrity:` line backed by a startup snapshot-verification pass.)
+- Retention/duration time math is saturated against overflow: a very large
+  retention window no longer wraps the prune cutoff into the future (which would
+  have deleted all history), and duration→timestamp subtraction no longer
+  underflows for extreme durations in `restore` / `what-changed`.
+- CI: replaced deprecated Node-20 GitHub Actions with current majors.
 
 ## [0.1.12] — 2026-06-17
 
@@ -87,7 +113,9 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.1.14...HEAD
+[0.1.14]: https://github.com/treadiehq/undo/compare/v0.1.13...v0.1.14
+[0.1.13]: https://github.com/treadiehq/undo/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/treadiehq/undo/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/treadiehq/undo/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/treadiehq/undo/compare/v0.1.9...v0.1.10

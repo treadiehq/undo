@@ -37,7 +37,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     let event = match db.get_latest_event(project.id, &abs_path_str)? {
         Some(e) => e,
         None => {
-            println!("No snapshots available for this file.");
+            println!("No saved version available for this file.");
             return Ok(());
         }
     };
@@ -53,7 +53,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     let hash = match &event.current_hash {
         Some(h) => h,
         None => {
-            println!("No snapshot available for this file.");
+            println!("No saved version available for this file.");
             return Ok(());
         }
     };
@@ -61,7 +61,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     let snapshot_content = snapshots::load(project.id, hash)?;
 
     if is_binary(&snapshot_content) {
-        println!("Binary file — text diff not available.");
+        println!("Binary file — text comparison not available.");
         return Ok(());
     }
 
@@ -80,7 +80,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
         Some(c) => c,
         None => {
             println!(
-                "Current file is larger than {} bytes — refusing to diff to avoid OOM.",
+                "Current file is larger than {} bytes, so Undo will not compare it.",
                 snapshots::MAX_SNAPSHOT_SIZE
             );
             return Ok(());
@@ -88,14 +88,14 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     };
 
     if is_binary(&current_content) {
-        println!("Binary file — text diff not available.");
+        println!("Binary file — text comparison not available.");
         return Ok(());
     }
 
     let current_text = String::from_utf8_lossy(&current_content);
 
     if snapshot_text == current_text {
-        println!("No changes since last snapshot.");
+        println!("No changes since the last saved version.");
         return Ok(());
     }
 
@@ -108,7 +108,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
 fn print_unified_diff(old: &str, new: &str, path: &str) {
     let diff = TextDiff::from_lines(old, new);
 
-    println!("{}--- snapshot  {}{}", DIM, path, RESET);
+    println!("{}--- saved     {}{}", DIM, path, RESET);
     println!("{}+++ current   {}{}", DIM, path, RESET);
     println!();
 

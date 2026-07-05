@@ -1,9 +1,9 @@
 [package]
 name = "undo"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 rust-version = "1.85"
-description = "Ctrl+Z for your filesystem"
+description = "Give your files an undo button"
 repository = "https://github.com/treadiehq/undo"
 homepage = "https://github.com/treadiehq/undo"
 readme = "README.md"

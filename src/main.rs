@@ -296,17 +296,17 @@ fn cmd_prune(keep: Option<String>, dry_run: bool) -> Result<()> {
         config.retention_secs_override = Some(secs as u64);
     }
 
-    let label = if dry_run { "Would prune" } else { "Pruned" };
+    let label = if dry_run { "Would delete" } else { "Deleted" };
     let stats = retention::prune(&db, project.id, &config, dry_run)?;
 
     println!(
-        "{} {} events, {} snapshots, {} backups.",
+        "{} {} events, {} saved copies, {} backups.",
         label, stats.events_deleted, stats.snapshots_deleted, stats.backups_deleted,
     );
 
     let usage = retention::total_disk_usage()?;
     println!(
-        "Freed {}. Current usage: {}.",
+        "Freed {}. Current storage: {}.",
         retention::format_size(stats.bytes_freed),
         retention::format_size(usage),
     );
