@@ -145,7 +145,7 @@ pub fn load(project_id: i64, hash: &str) -> Result<Vec<u8>> {
 /// Counts only `*.gz` files — a published snapshot is always named `<hash>.gz`.
 /// In-flight or leaked temp writes are named `<hash>.gz.tmp.<pid>.<seq>` (so
 /// their extension is the sequence number, not `gz`); counting those would
-/// inflate the `Snapshots:` figure in `undo status` after an interrupted write.
+/// inflate the `Saved:` figure in `undo status` after an interrupted write.
 pub fn count(project_id: i64) -> Result<usize> {
     let dir = crate::backtrack_dir()?
         .join("snapshots")
@@ -220,7 +220,7 @@ mod tests {
     /// A leaked temp file from an interrupted durable write (`<hash>.gz.tmp.<pid>.<seq>`)
     /// must NOT be counted as a snapshot — its extension is the sequence number,
     /// not `gz`. Before the `.gz`-only filter, `count()` tallied every dir entry,
-    /// so a power-loss-leaked temp inflated the `Snapshots:` figure in `undo status`.
+    /// so a power-loss-leaked temp inflated the `Saved:` figure in `undo status`.
     #[test]
     fn count_ignores_leaked_temp_files() {
         let data_dir = tempfile::tempdir().unwrap();

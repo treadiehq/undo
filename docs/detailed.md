@@ -256,11 +256,12 @@ Undo deletes old history automatically so `~/.undo/` does not grow forever.
 
 ### What gets cleaned up
 
-Undo cleans up three things, in this order:
+Undo cleans up four things, in this order:
 
 1. **Events** — old database records
-2. **Unused saved copies** — `.gz` files no remaining event points to
-3. **Backups** — old files in `~/.undo/backups/`
+2. **Leaked snapshot temp files** — `.gz.tmp.*` files from writes interrupted by a hard kill or power loss, older than one hour
+3. **Unused saved copies** — `.gz` files no remaining event points to
+4. **Backups** — old files in `~/.undo/backups/`
 
 If `~/.undo/` is still over `max_size_mb`, Undo deletes the oldest saved copies until it is under the limit.
 
@@ -372,7 +373,7 @@ Everything under `~/.undo/` is owner-only: the directory is `0700` and the datab
 
 If two files have the same content, Undo stores that content once.
 
-Saved copies are written to a `.tmp` file first, then renamed into place, so partial writes are not treated as valid history.
+Saved copies are written to a `.tmp` file first, then renamed into place, so partial writes are not treated as valid history. If the process is killed before the rename completes, the leftover temp file is reclaimed by `undo prune` once it is older than one hour.
 
 ---
 
@@ -464,7 +465,7 @@ Undo has no saved version for that path. This can happen if the file was ignored
 
 ### Checking saved versions after a crash
 
-Undo writes saved copies before it records them in the database, and SQLite WAL helps interrupted writes recover cleanly. At worst, a crash may leave an unused saved copy that the next cleanup removes. If you suspect a problem after a hard crash, restart Undo so it can scan and match the database to what is on disk.
+Undo writes saved copies before it records them in the database, and SQLite WAL helps interrupted writes recover cleanly. At worst, a hard kill or power loss may leave a leaked temp file (`.gz.tmp.*`) alongside an unused saved copy; `undo prune` reaps the temp file once it is older than one hour and removes the orphaned copy immediately. If you suspect a problem after a hard crash, restart Undo so it can scan and match the database to what is on disk.
 
 ---
 

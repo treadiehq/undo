@@ -71,7 +71,7 @@ All source lives in `src/`. Each module is focused:
 | `db.rs` | SQLite schema and all queries (events, file state, retention) |
 | `restore.rs` | `restore` — symlink refusal, safety backup, atomic write |
 | `diff.rs` | `diff` — binary detection, capped reads, unified diff |
-| `retention.rs` | Config loading (`config.toml` / `.undorc`), pruning, disk-usage accounting |
+| `retention.rs` | Config loading (`config.toml` / `.undorc`), pruning (including leaked temp-file reaping), disk-usage accounting |
 | `ignore.rs` | Builtin ignore list + `.gitignore`/`.undoignore` matching |
 | `duration.rs` | Human-friendly duration parsing/formatting (`5m`, `2h`, `1d`) |
 | `logging.rs` | Persistent daemon log at `~/.undo/undo.log` (with rotation) |
