@@ -23,7 +23,7 @@ Commands, settings, storage, and troubleshooting for Undo.
 ### Quick install (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/treadiehq/undo/main/install.sh | sh
+curl -fsSL https://useundo.co/install.sh | bash
 ```
 
 ### Download binaries
