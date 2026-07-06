@@ -43,7 +43,7 @@ impl IntegrityReport {
 /// Verify the snapshots referenced by `project_id` are present (and, when `deep`,
 /// readable). The reference set is exactly the live set retention preserves
 /// ([`Database::get_live_hashes`]): current-event hashes, the `latest_hash` of
-/// files that still exist, and the `previous_hash` of surviving DELETED events.
+/// files that still exist, and the `previous_hash` of surviving events.
 ///
 /// `deep = false` checks only existence — a cheap `stat` per distinct hash, which
 /// catches the power-loss symptom of a committed row pointing at a snapshot whose

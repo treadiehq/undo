@@ -4,6 +4,7 @@ use crate::snapshots;
 use crate::{GREEN, RESET, find_project};
 use anyhow::Result;
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -65,22 +66,7 @@ pub fn cmd_restore(path_str: &str, duration_str: &str) -> Result<()> {
     // Stored in ~/.undo/backups/ rather than /tmp so it survives a reboot —
     // /tmp is cleared on restart, which would defeat the purpose of the backup.
     if abs_path.exists() {
-        use std::os::unix::fs::PermissionsExt;
-        let filename = abs_path
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-        let ts = Utc::now().timestamp();
-        let backups_dir = crate::backtrack_dir()?.join("backups");
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .create(&backups_dir)?;
-        // Restrict backups dir to owner-only
-        let _ = std::fs::set_permissions(&backups_dir, std::fs::Permissions::from_mode(0o700));
-        let backup_path = backups_dir.join(format!("{}_{}.bak", filename, ts));
-        std::fs::copy(&abs_path, &backup_path)?;
-        // Restrict backup file to owner-only
-        let _ = std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o600));
+        let backup_path = create_restore_backup(&abs_path)?;
         println!("Backup of current file saved to {}", backup_path.display());
     }
 
@@ -173,6 +159,83 @@ fn resolve_restore_source(
     }
 
     Ok(None)
+}
+
+fn backup_timestamp_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn backup_path_hash(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let digest = Sha256::digest(path.as_os_str().as_bytes());
+    crate::to_hex(&digest[..8])
+}
+
+fn backup_path_for(
+    abs_path: &Path,
+    backups_dir: &Path,
+    timestamp_nanos: u128,
+    attempt: usize,
+) -> PathBuf {
+    let filename = abs_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let path_hash = backup_path_hash(abs_path);
+    let retry_suffix = if attempt == 0 {
+        String::new()
+    } else {
+        format!(".{}", attempt)
+    };
+    backups_dir.join(format!(
+        "{}_{}_{}{}.bak",
+        filename, path_hash, timestamp_nanos, retry_suffix
+    ))
+}
+
+fn create_restore_backup(abs_path: &Path) -> Result<PathBuf> {
+    create_restore_backup_at(abs_path, backup_timestamp_nanos())
+}
+
+fn create_restore_backup_at(abs_path: &Path, timestamp_nanos: u128) -> Result<PathBuf> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let backups_dir = crate::backtrack_dir()?.join("backups");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(&backups_dir)?;
+    // Restrict backups dir to owner-only.
+    let _ = std::fs::set_permissions(&backups_dir, std::fs::Permissions::from_mode(0o700));
+
+    for attempt in 0..1000 {
+        let backup_path = backup_path_for(abs_path, &backups_dir, timestamp_nanos, attempt);
+        let open_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&backup_path);
+
+        let mut backup = match open_result {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut current = std::fs::File::open(abs_path)?;
+        std::io::copy(&mut current, &mut backup)?;
+        backup.sync_all()?;
+        let _ = std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o600));
+        return Ok(backup_path);
+    }
+
+    anyhow::bail!(
+        "could not create a unique restore backup for {}",
+        abs_path.display()
+    );
 }
 
 /// Unique sibling path for the restore temp file — always distinct from `target`,
@@ -271,7 +334,7 @@ mod tests {
         assert!(!is_symlink);
     }
 
-    use super::{RestoreKind, resolve_restore_source};
+    use super::{RestoreKind, backup_path_for, create_restore_backup_at, resolve_restore_source};
     use crate::db::Database;
 
     fn mem_db() -> (Database, i64) {
@@ -280,6 +343,59 @@ mod tests {
             .get_or_create_project(std::path::Path::new("/proj"))
             .unwrap();
         (db, p.id)
+    }
+
+    /// Same-basename files in different directories must not collapse to the
+    /// same backup name when restored in the same timestamp window.
+    #[test]
+    fn backup_path_includes_full_path_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        let first = dir.path().join("pkg-a/config.json");
+        let second = dir.path().join("pkg-b/config.json");
+
+        let first_backup = backup_path_for(&first, &backups, 123, 0);
+        let second_backup = backup_path_for(&second, &backups, 123, 0);
+
+        assert_ne!(
+            first_backup, second_backup,
+            "same basename and timestamp must still produce distinct backups"
+        );
+        assert!(
+            first_backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("config.json_"),
+            "backup name should remain recognizable"
+        );
+    }
+
+    /// Even if the exact computed name already exists, creating a backup must
+    /// allocate a fresh path instead of overwriting the earlier safety copy.
+    #[test]
+    fn create_restore_backup_never_overwrites_existing_backup() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let tree = tempfile::tempdir().unwrap();
+        let file = tree.path().join("pkg/config.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "first state").unwrap();
+
+        let first_backup = create_restore_backup_at(&file, 123).unwrap();
+        std::fs::write(&file, "second state").unwrap();
+        let second_backup = create_restore_backup_at(&file, 123).unwrap();
+
+        assert_ne!(first_backup, second_backup);
+        assert_eq!(
+            std::fs::read_to_string(first_backup).unwrap(),
+            "first state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_backup).unwrap(),
+            "second state"
+        );
     }
 
     /// A file deleted after its creating event aged out of retention must still

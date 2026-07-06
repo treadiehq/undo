@@ -1055,13 +1055,20 @@ fn handle_rename(
         return Ok(());
     };
 
+    let dest_prev_hash = if old_str == new_str {
+        None
+    } else {
+        db.get_file_state(project.id, &new_str)?
+            .and_then(|s| if s.exists_now { s.latest_hash } else { None })
+    };
+
     let content = match read_within_limit(new_path, len) {
         Some(c) => c,
         None => return Ok(()),
     };
     let hash = compute_hash(&content);
 
-    let prev_hash = db
+    let source_prev_hash = db
         .get_file_state(project.id, &old_str)?
         .and_then(|s| if s.exists_now { s.latest_hash } else { None });
 
@@ -1071,12 +1078,28 @@ fn handle_rename(
     // The RENAMED event, the old path's deletion, and the new path's state all
     // commit together so a crash can't split the rename across two autocommits (#41).
     db.transaction(|db| {
+        if let Some(dest_hash) = dest_prev_hash
+            .as_deref()
+            .filter(|dest_hash| *dest_hash != hash.as_str())
+        {
+            db.insert_event(
+                project.id,
+                &new_str,
+                "DELETED",
+                None,
+                Some(dest_hash),
+                None,
+                None,
+                None,
+            )?;
+        }
+
         db.insert_event(
             project.id,
             &new_str,
             "RENAMED",
             Some(&hash),
-            prev_hash.as_deref(),
+            source_prev_hash.as_deref(),
             snap.as_deref(),
             Some(&old_str),
             Some(content.len() as i64),
@@ -1141,6 +1164,66 @@ mod tests {
         assert!(
             matches!(outcome, EventOutcome::Panicked),
             "a panic in event processing must be caught, not propagated"
+        );
+    }
+
+    /// Renaming one tracked file over another must preserve the overwritten
+    /// destination's previous content as a DELETED event. Otherwise retention can
+    /// orphan that snapshot once file_state is updated to the incoming content.
+    #[test]
+    fn handle_rename_records_deleted_event_for_overwritten_destination() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let tree = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(tree.path()).unwrap();
+
+        let old_path = tree.path().join("incoming.txt");
+        let new_path = tree.path().join("config.txt");
+        let new_content = b"incoming content";
+        std::fs::write(&new_path, new_content).unwrap();
+
+        let old_str = db_key(&old_path).unwrap();
+        let new_str = db_key(&new_path).unwrap();
+        db.upsert_file_state(project.id, &old_str, "source_hash", true, 1, None)
+            .unwrap();
+        db.upsert_file_state(project.id, &new_str, "overwritten_hash", true, 1, None)
+            .unwrap();
+
+        handle_rename(
+            &db,
+            &project,
+            &old_path,
+            &new_path,
+            new_content.len() as u64,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let new_hash = compute_hash(new_content);
+        let deleted = db
+            .get_latest_deleted_event(project.id, &new_str)
+            .unwrap()
+            .expect("overwritten destination should get a DELETED event");
+        assert_eq!(deleted.previous_hash.as_deref(), Some("overwritten_hash"));
+
+        let latest = db.get_latest_event(project.id, &new_str).unwrap().unwrap();
+        assert_eq!(latest.event_type, "RENAMED");
+        assert_eq!(latest.previous_hash.as_deref(), Some("source_hash"));
+        assert_eq!(latest.current_hash.as_deref(), Some(new_hash.as_str()));
+
+        let old_state = db.get_file_state(project.id, &old_str).unwrap().unwrap();
+        assert!(!old_state.exists_now);
+        let new_state = db.get_file_state(project.id, &new_str).unwrap().unwrap();
+        assert_eq!(new_state.latest_hash.as_deref(), Some(new_hash.as_str()));
+
+        let hashes = db.get_live_hashes(project.id).unwrap();
+        assert!(
+            hashes.contains("overwritten_hash"),
+            "overwritten destination hash must stay live while its DELETED event survives: {:?}",
+            hashes
         );
     }
 

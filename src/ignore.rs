@@ -118,6 +118,20 @@ fn apply_matcher(gi: &Gitignore, path: &Path, project_root: &Path, is_dir: bool)
     }
 }
 
+fn apply_parent_dir_matcher(gi: &Gitignore, path: &Path, project_root: &Path) -> Option<bool> {
+    let mut parent = path.parent();
+    while let Some(dir) = parent {
+        if dir == project_root {
+            break;
+        }
+        if let Some(result) = apply_matcher(gi, dir, project_root, true) {
+            return Some(result);
+        }
+        parent = dir.parent();
+    }
+    None
+}
+
 /// Core decision function shared by both production and test paths.
 /// Only the *storage* of the matcher differs; the branching logic here
 /// is always the same code that ships in the binary.
@@ -129,6 +143,11 @@ fn should_ignore_with(
 ) -> bool {
     if let Some(gi) = gi
         && let Some(result) = apply_matcher(gi, path, project_root, is_dir)
+    {
+        return result;
+    }
+    if let Some(gi) = gi
+        && let Some(result) = apply_parent_dir_matcher(gi, path, project_root)
     {
         return result;
     }
@@ -325,6 +344,65 @@ mod tests {
         assert!(
             m.is_whitelist(),
             "!build/ in .undoignore should whitelist the build directory"
+        );
+    }
+
+    /// A directory negation must also carry through to children that would
+    /// otherwise fall through to the builtin component-name ignore list.
+    #[test]
+    fn negation_dir_pattern_whitelists_children_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".undoignore"), "!build/\n").unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/output.o"), "x").unwrap();
+        init(root);
+
+        assert!(
+            !should_ignore_with_type(&root.join("build/output.o"), root, false),
+            "!build/ in .undoignore should whitelist build/output.o"
+        );
+    }
+
+    /// The equivalent recursive glob already whitelists children directly.
+    /// Keeping this test documents that both supported spellings work.
+    #[test]
+    fn negation_glob_pattern_works_for_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".undoignore"), "!build/**\n").unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/output.o"), "x").unwrap();
+        init(root);
+
+        assert!(
+            !should_ignore_with_type(&root.join("build/output.o"), root, false),
+            "!build/** in .undoignore should whitelist build/output.o"
+        );
+    }
+
+    /// WalkDir uses the same predicate during initial scan: it first decides
+    /// whether to descend into `build/`, then evaluates each child file.
+    #[test]
+    fn walkdir_filter_entry_simulation_with_negation_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".undoignore"), "!build/\n").unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::write(root.join("build/output.o"), "x").unwrap();
+        init(root);
+
+        let paths = walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| !should_ignore_with_type(e.path(), root, e.file_type().is_dir()))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().strip_prefix(root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+
+        assert!(
+            paths.iter().any(|path| path == Path::new("build/output.o")),
+            "build/output.o should be scanned because build/ is whitelisted"
         );
     }
 

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use semver::Version;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::process::Command;
 
 const REPO: &str = "treadiehq/undo";
@@ -16,9 +18,16 @@ pub fn cmd_update() -> Result<()> {
     println!("  Latest release:  {}", latest_tag);
     println!();
 
-    if latest_ver == CURRENT_VERSION {
-        println!("Already up to date.");
-        return Ok(());
+    match compare_release_versions(latest_ver, CURRENT_VERSION)? {
+        Ordering::Greater => {}
+        Ordering::Equal => {
+            println!("Already up to date.");
+            return Ok(());
+        }
+        Ordering::Less => {
+            println!("Current version is newer than the latest GitHub release; not downgrading.");
+            return Ok(());
+        }
     }
 
     let target = detect_target()?;
@@ -125,6 +134,16 @@ fn fetch_latest_tag() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("could not parse latest release tag from GitHub API"))?;
 
     Ok(tag)
+}
+
+fn parse_release_version(version: &str) -> Result<Version> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    Version::parse(version)
+        .with_context(|| format!("release version '{version}' is not valid semantic version"))
+}
+
+fn compare_release_versions(latest: &str, current: &str) -> Result<Ordering> {
+    Ok(parse_release_version(latest)?.cmp(&parse_release_version(current)?))
 }
 
 /// Verify the downloaded tarball against the release's published `SHA256SUMS`
@@ -326,6 +345,49 @@ mod tests {
 
         install_binary(&src, &dest).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"NEW");
+    }
+
+    /// GitHub's `/releases/latest` is based on creation time, not semantic
+    /// ordering. If it reports an older patch release, self-update must not
+    /// install it over a newer local binary.
+    #[test]
+    fn version_comparison_prevents_patch_downgrade() {
+        assert_eq!(
+            compare_release_versions("v0.1.2", "0.1.14").unwrap(),
+            Ordering::Less
+        );
+    }
+
+    /// Multi-digit version components must compare numerically, not as strings.
+    #[test]
+    fn version_comparison_handles_multi_digit_components() {
+        assert_eq!(
+            compare_release_versions("v1.10.0", "1.9.0").unwrap(),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_release_versions("v10.0.0", "2.0.0").unwrap(),
+            Ordering::Greater
+        );
+    }
+
+    /// Equal versions, with or without a leading `v`, are not updates.
+    #[test]
+    fn version_comparison_treats_matching_tags_as_equal() {
+        assert_eq!(
+            compare_release_versions("v0.1.14", "0.1.14").unwrap(),
+            Ordering::Equal
+        );
+    }
+
+    /// A malformed release tag leaves version ordering unknowable, so update
+    /// must fail closed before any download/install work begins.
+    #[test]
+    fn version_comparison_rejects_invalid_release_tags() {
+        let err = compare_release_versions("latest", "0.1.14")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("valid semantic version"), "got: {err}");
     }
 
     /// A matching checksum line verifies the artifact (#33). Hash comparison is

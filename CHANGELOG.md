@@ -12,6 +12,21 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 _No unreleased changes yet._
 
+## [0.1.15] — 2026-07-06
+
+- Ignore rules: directory negations such as `!build/` now whitelist child files
+  before builtin ignores are applied, matching the documented `.undoignore`
+  behavior for initial scans and live watcher events.
+- Self-update now compares release tags semantically and refuses downgrades when
+  GitHub reports an older release as latest.
+- Restore backups are collision-safe for same-named files restored within the
+  same timestamp window, and backup creation never overwrites an existing backup.
+- `undo diff` now compares recreated files against the last known content from a
+  `DELETED` event instead of incorrectly claiming the file is still deleted.
+- Rename-overwrite handling now preserves overwritten destination content through
+  retention by recording the overwrite and pinning surviving event
+  `previous_hash` values until those events age out.
+
 ## [0.1.14] — 2026-07-05
 
 - Integrity check is now tiered for speed on large histories: daemon startup runs
@@ -113,7 +128,8 @@ _No unreleased changes yet._
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/treadiehq/undo/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/treadiehq/undo/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/treadiehq/undo/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/treadiehq/undo/compare/v0.1.11...v0.1.12

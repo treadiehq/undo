@@ -313,7 +313,7 @@ impl Database {
                         current_hash, previous_hash, snapshot_path, old_path, file_size
                  FROM file_events
                  WHERE project_id = ?1 AND path = ?2
-                 ORDER BY timestamp DESC
+                 ORDER BY timestamp DESC, id DESC
                  LIMIT 1",
                 params![project_id, path],
                 row_to_event,
@@ -518,16 +518,13 @@ impl Database {
         // every file ever deleted permanently anchors its snapshot and
         // retention can never reclaim that disk space.
         //
-        // The third arm pins the `previous_hash` of surviving DELETED events.
-        // When a file is removed, its DELETED event carries `current_hash =
-        // NULL` and only `previous_hash` points at the last captured content.
-        // If that file's creating event has already aged out of retention,
-        // nothing else references the snapshot, so without this arm the only
-        // copy of a just-deleted file is orphaned and pruned immediately —
-        // making the file unrecoverable even though the user deleted it
-        // seconds ago. The pin lasts exactly as long as the DELETED event
-        // itself (until `delete_events_before` removes it), so the snapshot is
-        // still reclaimed once the deletion ages past the retention window.
+        // The third arm pins `previous_hash` from surviving events. A DELETED
+        // event carries the last captured content only in `previous_hash`; a
+        // rename-overwrite can also leave overwritten destination content only
+        // in a MODIFIED event's `previous_hash` on Linux. In both cases, the
+        // pin lasts exactly as long as the event itself (until
+        // `delete_events_before` removes it), so the snapshot is still
+        // reclaimed once the event ages past the retention window.
         let mut stmt = self.conn.prepare(
             "SELECT current_hash FROM file_events
              WHERE project_id = ?1 AND current_hash IS NOT NULL
@@ -537,8 +534,7 @@ impl Database {
                AND exists_now = 1
              UNION
              SELECT previous_hash FROM file_events
-             WHERE project_id = ?1 AND event_type = 'DELETED'
-               AND previous_hash IS NOT NULL",
+             WHERE project_id = ?1 AND previous_hash IS NOT NULL",
         )?;
         let hashes = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         hashes
@@ -1035,6 +1031,69 @@ mod tests {
         );
     }
 
+    /// A surviving MODIFIED event's `previous_hash` can be the only reference to
+    /// content overwritten by a rename-overwrite event sequence on Linux. Keep it
+    /// live while the event itself remains inside the retention window.
+    #[test]
+    fn get_live_hashes_pins_modified_event_previous_hash() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/modified.rs";
+
+        db.insert_event(
+            p.id,
+            path,
+            "MODIFIED",
+            Some("new_content_hash"),
+            Some("old_content_hash"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let hashes = db.get_live_hashes(p.id).unwrap();
+        assert!(
+            hashes.contains("new_content_hash"),
+            "current_hash from MODIFIED event must stay live: {:?}",
+            hashes
+        );
+        assert!(
+            hashes.contains("old_content_hash"),
+            "previous_hash from surviving MODIFIED event must stay live: {:?}",
+            hashes
+        );
+    }
+
+    /// Once the event carrying a `previous_hash` ages out, that hash is no
+    /// longer pinned just because it used to be previous content.
+    #[test]
+    fn get_live_hashes_drops_previous_hash_after_event_prune() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/modified.rs";
+
+        db.insert_event(
+            p.id,
+            path,
+            "MODIFIED",
+            Some("new_content_hash"),
+            Some("old_content_hash"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.delete_events_before(p.id, i64::MAX).unwrap();
+
+        let hashes = db.get_live_hashes(p.id).unwrap();
+        assert!(
+            !hashes.contains("old_content_hash"),
+            "previous_hash must not remain live after its event is pruned: {:?}",
+            hashes
+        );
+    }
+
     /// Returns the most recent DELETED event so restore can fall back to its
     /// previous_hash; returns None when the file was never deleted.
     #[test]
@@ -1090,6 +1149,42 @@ mod tests {
             .unwrap();
         let event = db.get_latest_event(p.id, path).unwrap().unwrap();
         assert_eq!(event.event_type, "MODIFIED");
+    }
+
+    /// Events inserted in one transaction can share the same second-precision
+    /// timestamp. Tie-break by row id so the later insert is the latest event.
+    #[test]
+    fn get_latest_event_tie_breaks_same_timestamp_by_insert_order() {
+        let db = db();
+        let p = project(&db);
+        let path = "/home/user/project/renamed_over.rs";
+
+        db.insert_event(
+            p.id,
+            path,
+            "DELETED",
+            None,
+            Some("overwritten_hash"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_event(
+            p.id,
+            path,
+            "RENAMED",
+            Some("new_hash"),
+            Some("source_hash"),
+            None,
+            Some("/home/user/project/source.rs"),
+            None,
+        )
+        .unwrap();
+
+        let event = db.get_latest_event(p.id, path).unwrap().unwrap();
+        assert_eq!(event.event_type, "RENAMED");
+        assert_eq!(event.current_hash.as_deref(), Some("new_hash"));
     }
 
     /// DELETED events are never returned as restorable; only non-delete events at or before the

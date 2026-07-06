@@ -1,6 +1,6 @@
 [package]
 name = "undo"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 rust-version = "1.85"
 description = "Give your files an undo button"
@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "filesystem", "development-tools"]
 clap = { version = "4", features = ["derive"] }
 notify = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
+semver = "1"
 sha2 = "0.10"
 flate2 = "1"
 chrono = { version = "0.4", features = ["clock"] }

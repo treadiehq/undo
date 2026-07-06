@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::db::Database;
+use crate::models::FileEvent;
 use crate::snapshots;
 use crate::{BOLD, DIM, GREEN, RED, RESET, find_project};
 
@@ -42,15 +43,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
         }
     };
 
-    if event.event_type == "DELETED" {
-        println!(
-            "File was deleted. Use {}undo restore{} to recover it.",
-            BOLD, RESET
-        );
-        return Ok(());
-    }
-
-    let hash = match &event.current_hash {
+    let hash = match saved_hash_for_diff(&event) {
         Some(h) => h,
         None => {
             println!("No saved version available for this file.");
@@ -68,6 +61,14 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     let snapshot_text = String::from_utf8_lossy(&snapshot_content);
 
     if !abs_path.exists() {
+        if event.event_type == "DELETED" {
+            println!(
+                "File was deleted. Use {}undo restore{} to recover it.",
+                BOLD, RESET
+            );
+            return Ok(());
+        }
+
         println!("File does not exist on disk. Showing last known content.");
         println!();
         for line in snapshot_text.lines() {
@@ -105,6 +106,14 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     Ok(())
 }
 
+fn saved_hash_for_diff(event: &FileEvent) -> Option<&str> {
+    if event.event_type == "DELETED" {
+        event.previous_hash.as_deref()
+    } else {
+        event.current_hash.as_deref()
+    }
+}
+
 fn print_unified_diff(old: &str, new: &str, path: &str) {
     let diff = TextDiff::from_lines(old, new);
 
@@ -140,6 +149,25 @@ fn print_unified_diff(old: &str, new: &str, path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(
+        event_type: &str,
+        current_hash: Option<&str>,
+        previous_hash: Option<&str>,
+    ) -> FileEvent {
+        FileEvent {
+            id: 1,
+            project_id: 1,
+            timestamp: 0,
+            path: "/project/file.txt".to_string(),
+            event_type: event_type.to_string(),
+            current_hash: current_hash.map(str::to_string),
+            previous_hash: previous_hash.map(str::to_string),
+            snapshot_path: None,
+            old_path: None,
+            file_size: None,
+        }
+    }
 
     /// A NUL byte within the first 8 KiB marks content as binary.
     #[test]
@@ -192,5 +220,29 @@ mod tests {
         std::fs::write(&path, vec![b'y'; 100]).unwrap();
         let got = read_capped(&path, 100).unwrap();
         assert_eq!(got, Some(vec![b'y'; 100]));
+    }
+
+    /// A deleted file's last known contents live in `previous_hash`. This is
+    /// what lets `undo diff` compare that content against a file recreated on
+    /// disk after the daemon recorded the deletion.
+    #[test]
+    fn deleted_event_uses_previous_hash_for_diff() {
+        let e = event("DELETED", None, Some("last_live_hash"));
+        assert_eq!(saved_hash_for_diff(&e), Some("last_live_hash"));
+    }
+
+    /// Normal events still diff from their current snapshot.
+    #[test]
+    fn non_deleted_event_uses_current_hash_for_diff() {
+        let e = event("MODIFIED", Some("current_hash"), Some("older_hash"));
+        assert_eq!(saved_hash_for_diff(&e), Some("current_hash"));
+    }
+
+    /// If a malformed deleted event has no previous hash, diff should report
+    /// that no saved version is available instead of guessing.
+    #[test]
+    fn deleted_event_without_previous_hash_has_no_saved_diff_source() {
+        let e = event("DELETED", None, None);
+        assert_eq!(saved_hash_for_diff(&e), None);
     }
 }
