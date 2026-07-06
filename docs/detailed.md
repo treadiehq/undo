@@ -136,7 +136,7 @@ undo restore src/server.rs 10m
 ```
 
 ```
-Backup of current file saved to /Users/me/.undo/backups/server.rs_1713200000.bak
+Backup of current file saved to /Users/me/.undo/backups/server.rs_a1b2c3d4_1713200000000000000.bak
 Restored src/server.rs from the version saved 9 minute(s) ago.
 ```
 
@@ -205,7 +205,7 @@ Update Undo to the latest release.
 undo update
 ```
 
-Undo downloads the release for your platform, checks it against the published `SHA256SUMS`, then installs it with a copy-and-rename step. If the checksum is missing or does not match, the update stops without touching your current install.
+Undo downloads the release for your platform, checks it against the published `SHA256SUMS`, then installs it with a copy-and-rename step. If the checksum is missing or does not match, the update stops without touching your current install. Downgrades are also refused — if the latest GitHub release is older than your current version, Undo leaves your install as-is.
 
 ---
 
