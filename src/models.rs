@@ -1,9 +1,11 @@
+#[derive(Clone, Debug)]
 pub struct WatchedProject {
     pub id: i64,
     pub root_path: String,
     pub created_at: i64,
 }
 
+#[derive(Clone, Debug)]
 pub struct FileEvent {
     pub id: i64,
     pub project_id: i64,
@@ -17,6 +19,7 @@ pub struct FileEvent {
     pub file_size: Option<i64>,
 }
 
+#[derive(Clone, Debug)]
 pub struct FileState {
     pub id: i64,
     pub project_id: i64,
@@ -30,4 +33,26 @@ pub struct FileState {
     /// Modification time in nanoseconds since the Unix epoch when the hash was
     /// recorded. Paired with `size` to short-circuit no-op modify events.
     pub mtime_nanos: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Checkpoint {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub timestamp: i64,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub kind: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub start_event_id: i64,
+    pub end_event_id: Option<i64>,
+    pub created_at: i64,
 }

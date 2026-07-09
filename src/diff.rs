@@ -10,13 +10,13 @@ use crate::{BOLD, DIM, GREEN, RED, RESET, find_project};
 
 /// Heuristic: treat content as binary if it contains a NUL byte within the
 /// first 8 KiB (same approach used by git and most editors).
-fn is_binary(data: &[u8]) -> bool {
+pub(crate) fn is_binary(data: &[u8]) -> bool {
     data.iter().take(8192).any(|&b| b == 0)
 }
 
 /// Read at most `limit` bytes from `path`. Returns `None` if the file is
 /// larger than the limit so callers can degrade gracefully instead of OOM-ing.
-fn read_capped(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_capped(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
     let file = std::fs::File::open(path)?;
     let cap = limit as u64 + 1;
     let mut buf = Vec::new();
@@ -27,7 +27,13 @@ fn read_capped(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
-pub fn cmd_diff(path_str: &str) -> Result<()> {
+pub fn cmd_diff(
+    path_str: &str,
+    duration: Option<&str>,
+    checkpoint: Option<&str>,
+    summary: bool,
+    stat: bool,
+) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
@@ -35,7 +41,7 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;
     let abs_path_str = abs_path.to_string_lossy().to_string();
 
-    let event = match db.get_latest_event(project.id, &abs_path_str)? {
+    let event = match diff_event(&db, project.id, &abs_path_str, duration, checkpoint)? {
         Some(e) => e,
         None => {
             println!("No saved version available for this file.");
@@ -101,12 +107,41 @@ pub fn cmd_diff(path_str: &str) -> Result<()> {
     }
 
     let rel = crate::relative_path(&abs_path_str, &project.root_path);
-    print_unified_diff(&snapshot_text, &current_text, rel);
+    if summary || stat {
+        print_diff_stats(&snapshot_text, &current_text, rel);
+    }
+    if !summary {
+        print_unified_diff(&snapshot_text, &current_text, rel);
+    }
 
     Ok(())
 }
 
-fn saved_hash_for_diff(event: &FileEvent) -> Option<&str> {
+fn diff_event(
+    db: &Database,
+    project_id: i64,
+    path: &str,
+    duration: Option<&str>,
+    checkpoint: Option<&str>,
+) -> Result<Option<FileEvent>> {
+    match (duration, checkpoint) {
+        (Some(_), Some(_)) => anyhow::bail!("use either a duration or --checkpoint, not both"),
+        (Some(duration), None) => {
+            let secs = crate::duration::parse_duration(duration)?;
+            let target_time = chrono::Utc::now().timestamp().saturating_sub(secs);
+            db.get_event_at_time(project_id, path, target_time)
+        }
+        (None, Some(name)) => {
+            let checkpoint = db
+                .get_checkpoint(project_id, name)?
+                .ok_or_else(|| anyhow::anyhow!("checkpoint '{}' not found", name))?;
+            db.get_event_at_time(project_id, path, checkpoint.timestamp)
+        }
+        (None, None) => db.get_latest_event(project_id, path),
+    }
+}
+
+pub(crate) fn saved_hash_for_diff(event: &FileEvent) -> Option<&str> {
     if event.event_type == "DELETED" {
         event.previous_hash.as_deref()
     } else {
@@ -114,11 +149,21 @@ fn saved_hash_for_diff(event: &FileEvent) -> Option<&str> {
     }
 }
 
-fn print_unified_diff(old: &str, new: &str, path: &str) {
+pub(crate) fn print_unified_diff(old: &str, new: &str, path: &str) {
+    print_unified_diff_with_labels(old, new, path, "saved", "current");
+}
+
+pub(crate) fn print_unified_diff_with_labels(
+    old: &str,
+    new: &str,
+    path: &str,
+    old_label: &str,
+    new_label: &str,
+) {
     let diff = TextDiff::from_lines(old, new);
 
-    println!("{}--- saved     {}{}", DIM, path, RESET);
-    println!("{}+++ current   {}{}", DIM, path, RESET);
+    println!("{}--- {:<9}{}{}", DIM, old_label, path, RESET);
+    println!("{}+++ {:<9}{}{}", DIM, new_label, path, RESET);
     println!();
 
     for (idx, group) in diff.grouped_ops(3).iter().enumerate() {
@@ -144,6 +189,41 @@ fn print_unified_diff(old: &str, new: &str, path: &str) {
             }
         }
     }
+}
+
+pub(crate) fn print_diff_stats(old: &str, new: &str, path: &str) {
+    let diff = TextDiff::from_lines(old, new);
+    let mut inserted = 0usize;
+    let mut deleted = 0usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Delete => deleted += 1,
+            ChangeTag::Insert => inserted += 1,
+            ChangeTag::Equal => {}
+        }
+    }
+    println!("{} | +{} -{}", path, inserted, deleted);
+}
+
+pub(crate) fn print_bytes_diff(
+    old: &[u8],
+    new: &[u8],
+    path: &str,
+    old_label: &str,
+    new_label: &str,
+) -> Result<()> {
+    if is_binary(old) || is_binary(new) {
+        println!("{}: binary file — text comparison not available.", path);
+        return Ok(());
+    }
+    let old_text = String::from_utf8_lossy(old);
+    let new_text = String::from_utf8_lossy(new);
+    if old_text == new_text {
+        println!("{}: no content changes.", path);
+        return Ok(());
+    }
+    print_unified_diff_with_labels(&old_text, &new_text, path, old_label, new_label);
+    Ok(())
 }
 
 #[cfg(test)]

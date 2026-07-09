@@ -10,7 +10,20 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+## [0.1.16] — 2026-07-09
+
+- Recovery UX: added checkpoint, preview, deleted-file listing, timeline burst,
+  and panic-dashboard flows for safer rollback after messy edits or AI-agent
+  runs.
+- Docs now position Undo as a preview-first AI coding safety net while keeping
+  the current workflow honest: burst/checkpoint recovery, not magical semantic
+  hunk selection.
+- Semantic rollback groundwork: added manual sessions, deterministic change
+  groups, and `undo recover --session ... [--group ...]` for selective,
+  preview-first recovery of agent work.
+- Added `undo ask "<intent>"` as a conservative semantic rollback MVP that maps
+  intent to session groups, previews revert/keep proposals, and requires
+  `--apply --yes` before writing.
 
 ## [0.1.15] — 2026-07-06
 

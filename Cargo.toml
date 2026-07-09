@@ -1,6 +1,6 @@
 [package]
 name = "undo"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 rust-version = "1.85"
 description = "Give your files an undo button"

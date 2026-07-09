@@ -3,17 +3,22 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::path::Path;
 
+mod activity;
+mod ask;
 mod cli;
 mod daemon;
 mod db;
 mod diff;
 mod duration;
+mod groups;
 mod ignore;
 mod integrity;
 mod logging;
 mod models;
+mod recover;
 mod restore;
 mod retention;
+mod sessions;
 mod snapshots;
 mod update;
 mod watcher;
@@ -193,15 +198,6 @@ pub fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn format_local_time(timestamp: i64) -> String {
-    use chrono::{Local, TimeZone};
-    Local
-        .timestamp_opt(timestamp, 0)
-        .single()
-        .map(|dt| dt.format("%H:%M").to_string())
-        .unwrap_or_else(|| "??:??".to_string())
-}
-
 fn event_color(event_type: &str) -> &'static str {
     match event_type {
         "MODIFIED" => YELLOW,
@@ -219,10 +215,62 @@ fn main() {
 
     let result = match cli.command {
         cli::Command::Start { force } => daemon::cmd_start(cli.verbose, force),
-        cli::Command::Timeline { limit } => cmd_timeline(limit),
+        cli::Command::Timeline {
+            limit,
+            since,
+            bursts,
+            deleted,
+        } => activity::cmd_timeline(limit, since.as_deref(), bursts, deleted),
         cli::Command::WhatChanged { duration } => cmd_what_changed(&duration),
-        cli::Command::Diff { path } => diff::cmd_diff(&path),
-        cli::Command::Restore { path, duration } => restore::cmd_restore(&path, &duration),
+        cli::Command::Diff {
+            path,
+            duration,
+            checkpoint,
+            summary,
+            stat,
+        } => diff::cmd_diff(
+            &path,
+            duration.as_deref(),
+            checkpoint.as_deref(),
+            summary,
+            stat,
+        ),
+        cli::Command::Preview { path, duration } => restore::cmd_preview(&path, &duration),
+        cli::Command::Restore {
+            path,
+            duration,
+            preview,
+            checkpoint,
+            deleted,
+            yes,
+        } => restore::cmd_restore(
+            path.as_deref(),
+            duration.as_deref(),
+            checkpoint.as_deref(),
+            preview,
+            deleted,
+            yes,
+        ),
+        cli::Command::Checkpoint { name } => activity::cmd_checkpoint(&name),
+        cli::Command::Checkpoints => activity::cmd_checkpoints(),
+        cli::Command::Deleted { limit } => activity::cmd_deleted(limit),
+        cli::Command::RestoreDeleted { path } => restore::cmd_restore_deleted(&path),
+        cli::Command::Panic {
+            restore_before_latest_burst,
+            yes,
+        } => activity::cmd_panic(restore_before_latest_burst, yes),
+        cli::Command::Session { command } => match command {
+            cli::SessionCommand::Start { name } => sessions::cmd_session_start(&name),
+            cli::SessionCommand::Stop => sessions::cmd_session_stop(),
+            cli::SessionCommand::Show { name } => sessions::cmd_session_show(&name),
+        },
+        cli::Command::Sessions => sessions::cmd_sessions(),
+        cli::Command::Recover(args) => {
+            recover::cmd_recover(&args.session, args.group.as_deref(), args.preview, args.yes)
+        }
+        cli::Command::Ask(args) => {
+            ask::cmd_ask(&args.query, args.session.as_deref(), args.apply, args.yes)
+        }
         cli::Command::Status => daemon::cmd_status(),
         cli::Command::Stop { all } => daemon::cmd_stop(all),
         cli::Command::Prune { keep, dry_run } => cmd_prune(keep, dry_run),
@@ -235,46 +283,6 @@ fn main() {
         logging::error(&e.to_string());
         std::process::exit(1);
     }
-}
-
-// ── timeline ────────────────────────────────────────────────────────
-
-fn cmd_timeline(limit: usize) -> Result<()> {
-    let cwd = std::env::current_dir()?.canonicalize()?;
-    let db = db::Database::open()?;
-    let project = find_project(&db, &cwd)?;
-
-    let events = db.get_timeline(project.id, limit)?;
-
-    if events.is_empty() {
-        println!("No events recorded yet.");
-        return Ok(());
-    }
-
-    println!("{}undo{} — recent activity", BOLD, RESET);
-    println!();
-
-    for event in &events {
-        let time = format_local_time(event.timestamp);
-        let color = event_color(&event.event_type);
-        let rel = relative_path(&event.path, &project.root_path);
-
-        if event.event_type == "RENAMED" {
-            let old = event.old_path.as_deref().unwrap_or("?");
-            let old_rel = relative_path(old, &project.root_path);
-            println!(
-                "{}{}{} {}{}{} {} -> {}",
-                DIM, time, RESET, color, event.event_type, RESET, old_rel, rel
-            );
-        } else {
-            println!(
-                "{}{}{} {}{}{} {}",
-                DIM, time, RESET, color, event.event_type, RESET, rel
-            );
-        }
-    }
-
-    Ok(())
 }
 
 // ── prune ────────────────────────────────────────────────────────────

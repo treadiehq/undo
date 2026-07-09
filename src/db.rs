@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::models::{FileEvent, FileState, WatchedProject};
+use crate::models::{Checkpoint, FileEvent, FileState, Session, WatchedProject};
 
 pub struct Database {
     conn: Connection,
@@ -58,12 +58,52 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             UNIQUE(project_id, path)
         );
 
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name       TEXT    NOT NULL,
+            timestamp  INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES watched_projects(id),
+            UNIQUE(project_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name       TEXT    NOT NULL,
+            kind       TEXT    NOT NULL,
+            started_at INTEGER NOT NULL,
+            ended_at   INTEGER,
+            start_event_id INTEGER NOT NULL DEFAULT 0,
+            end_event_id   INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES watched_projects(id),
+            UNIQUE(project_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS session_events (
+            session_id INTEGER NOT NULL,
+            event_id   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, event_id),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (event_id) REFERENCES file_events(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_events_project_time
             ON file_events(project_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_events_path
             ON file_events(project_id, path, timestamp);
         CREATE INDEX IF NOT EXISTS idx_state_project_path
-            ON file_state(project_id, path);",
+            ON file_state(project_id, path);
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_project_time
+            ON checkpoints(project_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sessions_project_time
+            ON sessions(project_id, started_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active
+            ON sessions(project_id) WHERE ended_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_session_events_event
+            ON session_events(event_id);",
     )?;
 
     // Additive migration (#26): databases created before size/mtime tracking
@@ -76,6 +116,52 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     ] {
         let _ = conn.execute(stmt, []);
     }
+    for stmt in [
+        "ALTER TABLE sessions ADD COLUMN start_event_id INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN end_event_id INTEGER",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS checkpoints (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name       TEXT    NOT NULL,
+            timestamp  INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES watched_projects(id),
+            UNIQUE(project_id, name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_project_time
+            ON checkpoints(project_id, timestamp);
+        CREATE TABLE IF NOT EXISTS sessions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name       TEXT    NOT NULL,
+            kind       TEXT    NOT NULL DEFAULT 'manual',
+            started_at INTEGER NOT NULL,
+            ended_at   INTEGER,
+            start_event_id INTEGER NOT NULL DEFAULT 0,
+            end_event_id   INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES watched_projects(id),
+            UNIQUE(project_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS session_events (
+            session_id INTEGER NOT NULL,
+            event_id   INTEGER NOT NULL,
+            PRIMARY KEY (session_id, event_id),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (event_id) REFERENCES file_events(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_project_time
+            ON sessions(project_id, started_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active
+            ON sessions(project_id) WHERE ended_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_session_events_event
+            ON session_events(event_id);",
+    )?;
 
     Ok(())
 }
@@ -279,7 +365,7 @@ impl Database {
                     current_hash, previous_hash, snapshot_path, old_path, file_size
              FROM file_events
              WHERE project_id = ?1
-             ORDER BY timestamp DESC
+             ORDER BY timestamp DESC, id DESC
              LIMIT ?2",
         )?;
         let events = stmt.query_map(params![project_id, limit as i64], row_to_event)?;
@@ -298,7 +384,7 @@ impl Database {
                     current_hash, previous_hash, snapshot_path, old_path, file_size
              FROM file_events
              WHERE project_id = ?1 AND timestamp >= ?2
-             ORDER BY timestamp DESC",
+             ORDER BY timestamp DESC, id DESC",
         )?;
         let events = stmt.query_map(params![project_id, since_timestamp], row_to_event)?;
         events
@@ -338,13 +424,48 @@ impl Database {
                    AND path = ?2
                    AND timestamp <= ?3
                    AND event_type != 'DELETED'
-                 ORDER BY timestamp DESC
+                 ORDER BY timestamp DESC, id DESC
                  LIMIT 1",
                 params![project_id, path, before_ts],
                 row_to_event,
             )
             .optional()
             .context("failed to query event at time")
+    }
+
+    /// Find the newest restorable event at the exact start boundary of a
+    /// session. The event id fence matters because watcher events and session
+    /// commands are timestamped to whole seconds; events recorded after
+    /// `session start` can share the same timestamp as the start command.
+    pub fn get_event_at_session_start(
+        &self,
+        session: &Session,
+        path: &str,
+    ) -> Result<Option<FileEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND path = ?2
+                   AND event_type != 'DELETED'
+                   AND (
+                        timestamp < ?3
+                        OR (timestamp = ?3 AND id <= ?4)
+                   )
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                params![
+                    session.project_id,
+                    path,
+                    session.started_at,
+                    session.start_event_id
+                ],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query event at session start")
     }
 
     /// Find the most recent DELETED event for a path, if any. A deleted file's
@@ -382,7 +503,7 @@ impl Database {
                  WHERE project_id = ?1
                    AND path = ?2
                    AND event_type != 'DELETED'
-                 ORDER BY timestamp ASC
+                 ORDER BY timestamp ASC, id ASC
                  LIMIT 1",
                 params![project_id, path],
                 row_to_event,
@@ -399,6 +520,23 @@ impl Database {
                 |row| row.get(0),
             )
             .context("failed to count events")
+    }
+
+    pub fn get_deleted_events(&self, project_id: i64, limit: usize) -> Result<Vec<FileEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, timestamp, path, event_type,
+                    current_hash, previous_hash, snapshot_path, old_path, file_size
+             FROM file_events
+             WHERE project_id = ?1
+               AND event_type = 'DELETED'
+               AND previous_hash IS NOT NULL
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let events = stmt.query_map(params![project_id, limit as i64], row_to_event)?;
+        events
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query deleted events")
     }
 
     // ── file state operations ───────────────────────────────────────
@@ -548,6 +686,246 @@ impl Database {
         ids.collect::<Result<Vec<_>, _>>()
             .context("failed to query project ids")
     }
+
+    // ── session operations ──────────────────────────────────────────
+
+    pub fn start_session(&self, project_id: i64, name: &str, kind: &str) -> Result<Session> {
+        let now = Utc::now().timestamp();
+        if let Some(active) = self.get_active_session(project_id)? {
+            anyhow::bail!(
+                "session '{}' is already active. Stop it before starting another.",
+                active.name
+            );
+        }
+        let start_event_id = self.max_event_id(project_id)?;
+        self.conn.execute(
+            "INSERT INTO sessions
+                (project_id, name, kind, started_at, start_event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project_id, name, kind, now, start_event_id, now],
+        )?;
+        self.get_session_by_name(project_id, name)?
+            .ok_or_else(|| anyhow::anyhow!("failed to read session after creating it"))
+    }
+
+    pub fn stop_active_session(&self, project_id: i64) -> Result<Option<Session>> {
+        let Some(session) = self.get_active_session(project_id)? else {
+            return Ok(None);
+        };
+        let ended_at = Utc::now().timestamp();
+        let end_event_id = self.max_event_id(project_id)?;
+        self.transaction(|db| {
+            db.conn.execute(
+                "UPDATE sessions SET ended_at = ?1, end_event_id = ?2 WHERE id = ?3",
+                params![ended_at, end_event_id, session.id],
+            )?;
+            db.link_session_events(
+                session.id,
+                project_id,
+                session.started_at,
+                ended_at,
+                session.start_event_id,
+                end_event_id,
+            )?;
+            Ok(())
+        })?;
+        self.get_session_by_id(session.id)
+    }
+
+    pub fn list_sessions(&self, project_id: i64) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, kind, started_at, ended_at,
+                    start_event_id, end_event_id, created_at
+             FROM sessions
+             WHERE project_id = ?1
+             ORDER BY started_at DESC, id DESC",
+        )?;
+        let sessions = stmt.query_map(params![project_id], row_to_session)?;
+        sessions
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query sessions")
+    }
+
+    pub fn get_session_by_name(&self, project_id: i64, name: &str) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, kind, started_at, ended_at,
+                        start_event_id, end_event_id, created_at
+                 FROM sessions
+                 WHERE project_id = ?1 AND name = ?2
+                 LIMIT 1",
+                params![project_id, name],
+                row_to_session,
+            )
+            .optional()
+            .context("failed to query session by name")
+    }
+
+    pub fn get_active_session(&self, project_id: i64) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, kind, started_at, ended_at,
+                        start_event_id, end_event_id, created_at
+                 FROM sessions
+                 WHERE project_id = ?1 AND ended_at IS NULL
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+                params![project_id],
+                row_to_session,
+            )
+            .optional()
+            .context("failed to query active session")
+    }
+
+    pub fn get_session_events(&self, session: &Session) -> Result<Vec<FileEvent>> {
+        let mapped_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+            params![session.id],
+            |row| row.get(0),
+        )?;
+
+        if mapped_count > 0 {
+            let mut stmt = self.conn.prepare(
+                "SELECT e.id, e.project_id, e.timestamp, e.path, e.event_type,
+                        e.current_hash, e.previous_hash, e.snapshot_path, e.old_path, e.file_size
+                 FROM file_events e
+                 JOIN session_events se ON se.event_id = e.id
+                 WHERE se.session_id = ?1
+                 ORDER BY e.timestamp DESC, e.id DESC",
+            )?;
+            let events = stmt.query_map(params![session.id], row_to_event)?;
+            return events
+                .collect::<Result<Vec<_>, _>>()
+                .context("failed to query mapped session events");
+        }
+
+        let ended_at = session.ended_at.unwrap_or_else(|| Utc::now().timestamp());
+        let end_event_id = match session.end_event_id {
+            Some(id) => id,
+            None => self.max_event_id(session.project_id)?,
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, timestamp, path, event_type,
+                    current_hash, previous_hash, snapshot_path, old_path, file_size
+             FROM file_events
+             WHERE project_id = ?1
+               AND id > ?2
+               AND id <= ?3
+               AND timestamp >= ?4
+               AND timestamp <= ?5
+             ORDER BY timestamp DESC, id DESC",
+        )?;
+        let events = stmt.query_map(
+            params![
+                session.project_id,
+                session.start_event_id,
+                end_event_id,
+                session.started_at,
+                ended_at
+            ],
+            row_to_event,
+        )?;
+        events
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query session events")
+    }
+
+    fn get_session_by_id(&self, session_id: i64) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, kind, started_at, ended_at,
+                        start_event_id, end_event_id, created_at
+                 FROM sessions
+                 WHERE id = ?1
+                 LIMIT 1",
+                params![session_id],
+                row_to_session,
+            )
+            .optional()
+            .context("failed to query session by id")
+    }
+
+    fn link_session_events(
+        &self,
+        session_id: i64,
+        project_id: i64,
+        started_at: i64,
+        ended_at: i64,
+        start_event_id: i64,
+        end_event_id: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO session_events (session_id, event_id)
+             SELECT ?1, id
+             FROM file_events
+             WHERE project_id = ?2
+               AND id > ?3
+               AND id <= ?4
+               AND timestamp >= ?5
+               AND timestamp <= ?6",
+            params![
+                session_id,
+                project_id,
+                start_event_id,
+                end_event_id,
+                started_at,
+                ended_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn max_event_id(&self, project_id: i64) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM file_events WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .context("failed to query max event id")
+    }
+
+    // ── checkpoint operations ───────────────────────────────────────
+
+    pub fn create_checkpoint(&self, project_id: i64, name: &str, timestamp: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO checkpoints (project_id, name, timestamp, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id, name) DO UPDATE SET
+                timestamp  = excluded.timestamp,
+                created_at = excluded.created_at",
+            params![project_id, name, timestamp, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_checkpoints(&self, project_id: i64) -> Result<Vec<Checkpoint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, timestamp, created_at
+             FROM checkpoints
+             WHERE project_id = ?1
+             ORDER BY timestamp DESC, id DESC",
+        )?;
+        let checkpoints = stmt.query_map(params![project_id], row_to_checkpoint)?;
+        checkpoints
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query checkpoints")
+    }
+
+    pub fn get_checkpoint(&self, project_id: i64, name: &str) -> Result<Option<Checkpoint>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, timestamp, created_at
+                 FROM checkpoints
+                 WHERE project_id = ?1 AND name = ?2
+                 LIMIT 1",
+                params![project_id, name],
+                row_to_checkpoint,
+            )
+            .optional()
+            .context("failed to query checkpoint")
+    }
 }
 
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<FileEvent> {
@@ -562,6 +940,30 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<FileEvent> {
         snapshot_path: row.get(7)?,
         old_path: row.get(8)?,
         file_size: row.get(9)?,
+    })
+}
+
+fn row_to_checkpoint(row: &rusqlite::Row) -> rusqlite::Result<Checkpoint> {
+    Ok(Checkpoint {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        timestamp: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        started_at: row.get(4)?,
+        ended_at: row.get(5)?,
+        start_event_id: row.get(6)?,
+        end_event_id: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -797,6 +1199,200 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.count_events(p.id).unwrap(), 2);
+    }
+
+    /// Same-second events must resolve deterministically to the newest inserted
+    /// row, otherwise preview and restore can disagree during rapid edits.
+    #[test]
+    fn get_event_at_time_breaks_timestamp_ties_by_id() {
+        let db = db();
+        let p = project(&db);
+        let ts = chrono::Utc::now().timestamp();
+        for hash in ["first", "second"] {
+            db.conn
+                .execute(
+                    "INSERT INTO file_events
+                     (project_id, timestamp, path, event_type, current_hash)
+                     VALUES (?1, ?2, ?3, 'MODIFIED', ?4)",
+                    params![p.id, ts, "/home/user/project/a.rs", hash],
+                )
+                .unwrap();
+        }
+
+        let event = db
+            .get_event_at_time(p.id, "/home/user/project/a.rs", ts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.current_hash.as_deref(), Some("second"));
+    }
+
+    /// Deleted files with a previous hash are listed as recoverable in newest-first order.
+    #[test]
+    fn get_deleted_events_returns_recoverable_deletions() {
+        let db = db();
+        let p = project(&db);
+        db.insert_event(
+            p.id,
+            "/home/user/project/gone.rs",
+            "DELETED",
+            None,
+            Some("gone_hash"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_event(
+            p.id,
+            "/home/user/project/bad.rs",
+            "DELETED",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let deleted = db.get_deleted_events(p.id, 10).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].path, "/home/user/project/gone.rs");
+    }
+
+    // ── checkpoints ──────────────────────────────────────────────────
+
+    /// Checkpoints are labels over timestamps and can be replaced by name.
+    #[test]
+    fn checkpoint_create_list_and_replace() {
+        let db = db();
+        let p = project(&db);
+        db.create_checkpoint(p.id, "before refactor", 100).unwrap();
+        db.create_checkpoint(p.id, "before refactor", 200).unwrap();
+
+        let checkpoint = db
+            .get_checkpoint(p.id, "before refactor")
+            .unwrap()
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.timestamp, 200);
+
+        let checkpoints = db.list_checkpoints(p.id).unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].name, "before refactor");
+    }
+
+    // ── sessions ─────────────────────────────────────────────────────
+
+    /// Sessions are named windows over events: starting creates one active
+    /// window, stopping closes it, and list/show expose the same row.
+    #[test]
+    fn session_start_stop_list_and_show() {
+        let db = db();
+        let p = project(&db);
+
+        let started = db.start_session(p.id, "agent-auth-work", "manual").unwrap();
+        assert_eq!(started.name, "agent-auth-work");
+        assert_eq!(started.kind, "manual");
+        assert!(started.ended_at.is_none());
+
+        let active = db.get_active_session(p.id).unwrap().unwrap();
+        assert_eq!(active.id, started.id);
+
+        let stopped = db.stop_active_session(p.id).unwrap().unwrap();
+        assert_eq!(stopped.id, started.id);
+        assert!(stopped.ended_at.is_some());
+        assert!(db.get_active_session(p.id).unwrap().is_none());
+
+        let by_name = db
+            .get_session_by_name(p.id, "agent-auth-work")
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_name.id, started.id);
+
+        let sessions = db.list_sessions(p.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "agent-auth-work");
+    }
+
+    /// A project can only have one active session; otherwise new events would be
+    /// ambiguously attributed.
+    #[test]
+    fn session_start_rejects_existing_active_session() {
+        let db = db();
+        let p = project(&db);
+
+        db.start_session(p.id, "first", "manual").unwrap();
+        let err = db.start_session(p.id, "second", "manual").unwrap_err();
+        assert!(err.to_string().contains("already active"), "{}", err);
+    }
+
+    /// Stopping a session snapshots the events that landed inside its time
+    /// window into session_events, so later recovery can use stable membership.
+    #[test]
+    fn session_stop_links_events_in_window() {
+        let db = db();
+        let p = project(&db);
+        let session = db.start_session(p.id, "agent-run", "manual").unwrap();
+        db.insert_event(
+            p.id,
+            "/home/user/project/src/auth.rs",
+            "MODIFIED",
+            Some("auth_hash"),
+            Some("old_auth_hash"),
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+
+        let stopped = db.stop_active_session(p.id).unwrap().unwrap();
+        assert_eq!(stopped.id, session.id);
+
+        let events = db.get_session_events(&stopped).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "/home/user/project/src/auth.rs");
+    }
+
+    /// Event-id anchors keep same-second baseline events out of the session. A
+    /// timestamp-only window would include both rows because all calls can land
+    /// inside one second.
+    #[test]
+    fn session_events_exclude_same_second_events_before_start() {
+        let db = db();
+        let p = project(&db);
+        db.insert_event(
+            p.id,
+            "/home/user/project/src/baseline.rs",
+            "MODIFIED",
+            Some("baseline_hash"),
+            None,
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+        let session = db.start_session(p.id, "agent-run", "manual").unwrap();
+        assert!(session.start_event_id > 0);
+        db.insert_event(
+            p.id,
+            "/home/user/project/src/agent.rs",
+            "MODIFIED",
+            Some("agent_hash"),
+            Some("baseline_hash"),
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+
+        let stopped = db.stop_active_session(p.id).unwrap().unwrap();
+        let paths = db
+            .get_session_events(&stopped)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["/home/user/project/src/agent.rs"]);
     }
 
     // ── file_state ───────────────────────────────────────────────────

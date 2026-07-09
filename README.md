@@ -8,6 +8,10 @@ You deleted a file. You changed something 10 minutes ago and can't remember what
 
 Not anymore. Undo keeps local history, then lets you bring files back instantly.
 
+It is also a safety net for AI-assisted coding: let an agent move fast, then use
+checkpoints, burst detection, preview, and restore to undo bad AI changes without
+losing the good ones.
+
 ## Install
 
 ```bash
@@ -25,8 +29,12 @@ undo start &                     # start saving history
 # ... work on your project ...
 
 undo what-changed 5m             # see changes from the last 5 minutes
-undo diff src/server.rs          # compare with the saved version
+undo preview src/server.rs 10m   # preview a restore before writing
 undo restore src/server.rs 10m   # bring back the version from 10 minutes ago
+undo mark pre                    # mark a known-good moment
+undo session start agent-work    # group an agent run for selective recovery
+undo ask "undo auth, keep security" --session agent-work
+undo panic                       # get recovery options after a messy edit
 undo timeline                    # show recent file activity
 ```
 
@@ -35,12 +43,19 @@ That's it. No commits, no setup, no server.
 ## Commands
 
 | Command | What it does |
-|---------|-------------|
+| ------- | ------------ |
 | `undo start` | Start saving history for this folder |
 | `undo what-changed 5m` | See what changed recently |
-| `undo timeline` | Show recent file activity |
-| `undo diff <file>` | Compare a file with its saved version |
-| `undo restore <file> <time>` | Bring back an older version |
+| `undo timeline` | Show recent activity, checkpoints, and bursts |
+| `undo diff <file>` | Compare a file with a saved version |
+| `undo preview <path> <time>` | Preview a restore before writing |
+| `undo restore <path> <time>` | Bring back an older version |
+| `undo mark <name>` | Mark a known-good moment |
+| `undo session start <name>` | Start grouping a unit of work |
+| `undo recover --session <name>` | Preview or apply session/group recovery |
+| `undo ask "<intent>"` | Turn rollback intent into a preview-first proposal |
+| `undo deleted` | List recoverable deleted files |
+| `undo panic` | Show a guided recovery dashboard |
 | `undo status` | See if Undo is running and how much space it uses |
 | `undo prune` | Delete old saved history |
 | `undo stop` | Stop saving history (`--all` stops every folder) |

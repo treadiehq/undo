@@ -103,15 +103,22 @@ DELETED
 
 ### `undo timeline`
 
-Show recent file activity in order.
+Show recent file activity in order. Use filters when you are trying to recover
+from a specific window.
 
 ```bash
 undo timeline
 undo timeline --limit 50
+undo timeline --since 2h
+undo timeline --bursts
+undo timeline --deleted
 ```
 
-```
+```text
 undo — recent activity
+
+Change bursts
+  12:34 18 files, 22 events, 3 deleted
 
 12:31 MODIFIED src/server.rs
 12:30 CREATED logs/debug.log
@@ -121,26 +128,141 @@ undo — recent activity
 
 ### `undo diff <path>`
 
-Compare the current file with the latest saved version.
+Compare the current file with a saved version.
 
 ```bash
 undo diff src/server.rs
+undo diff src/server.rs 30m
+undo diff src/server.rs -c pre
+undo diff src/server.rs --summary
+undo diff src/server.rs --stat
 ```
+
+### `undo preview <path> <duration>`
+
+Preview a restore without writing files.
+
+```bash
+undo preview src/server.rs 10m
+undo preview . 1h
+undo restore src/server.rs 10m --preview
+```
+
+Preview uses the same restore planner as `undo restore`, so the preview and the
+actual restore choose the same saved versions. For text files it prints a unified
+diff. For binary or oversized files it explains why text comparison is skipped.
 
 ### `undo restore <path> <duration>`
 
-Bring back an older version of a file.
+Bring back an older version of a file or directory.
 
 ```bash
 undo restore src/server.rs 10m
+undo restore . 30m --preview
+undo restore . 30m --yes
+undo restore -c pre src/server.rs
 ```
 
-```
+```text
 Backup of current file saved to /Users/me/.undo/backups/server.rs_a1b2c3d4_1713200000000000000.bak
 Restored src/server.rs from the version saved 9 minute(s) ago.
 ```
 
-Before Undo overwrites a file, it saves a backup in `~/.undo/backups/`.
+Before Undo overwrites or deletes a file, it saves a backup in
+`~/.undo/backups/`. Multi-file restores require `--yes`; run `--preview` first
+to see the write/delete plan.
+
+### `undo mark <name>` and `undo marks`
+
+Mark and list named restore points.
+
+```bash
+undo mark pre
+undo marks
+undo restore -c pre src/server.rs
+undo restore -c pre . --yes
+```
+
+`undo checkpoint` and `undo checkpoints` still work as explicit aliases.
+Checkpoints are timestamp labels. They do not duplicate snapshots; retention
+still controls how long the underlying history is recoverable.
+
+### `undo deleted` and `undo restore-deleted <path>`
+
+List and recover deleted files whose last contents are still retained.
+
+```bash
+undo deleted
+undo deleted --limit 50
+undo restore-deleted src/old-api.rs
+undo restore src/old-api.rs --deleted
+```
+
+Deleted-file recovery is bounded by retention. If the deletion event ages out,
+the last captured contents may be pruned too.
+
+### `undo panic`
+
+Show a recovery dashboard after a messy edit or large agent run.
+
+```bash
+undo panic
+undo panic --undo-burst --yes
+```
+
+By default panic mode is read-only. It shows recent large change bursts, deleted
+files, checkpoints, and suggested preview/restore commands. The restore flag
+uses the same guarded project restore path and requires `--yes`.
+
+### AI-agent recovery workflow
+
+Undo's first AI recovery workflow is intentionally conservative. It does not
+claim perfect semantic understanding of every edit; it combines checkpoints,
+time-based change bursts, restore previews, and explicit confirmation so you can
+recover from a bad agent run without blindly throwing away everything.
+
+```bash
+undo checkpoint before-agent
+# run Cursor, Codex, Claude, or another agent
+undo timeline --since 30m --bursts
+undo panic
+undo preview . 30m
+undo panic --restore-before-latest-burst --yes
+```
+
+For the best results, create a checkpoint before large agent work. Panic mode can
+still detect recent bursts without one, but a named checkpoint gives you a clear
+known-good moment to preview and restore from.
+
+### `undo session` and `undo recover`
+
+Sessions group a unit of work, such as one AI-agent run, so Undo can recover the
+whole session or one deterministic change group from inside it.
+
+```bash
+undo session start agent-auth-work
+# run Cursor, Codex, Claude, or another agent
+undo session stop
+
+undo sessions
+undo session show agent-auth-work
+undo recover --session agent-auth-work --preview
+undo recover --session agent-auth-work --group auth --preview
+undo recover --session agent-auth-work --group auth --yes
+undo ask "undo the auth refactor but keep security" --session agent-auth-work
+undo ask "revert everything except bug fixes" --session agent-auth-work --apply --yes
+```
+
+Change groups are deterministic labels based on the paths touched in the session
+and their diff stats. Use `undo session show` to see group ids, then recover one
+group with `--group`.
+
+`undo ask` is the first natural-language layer over those groups. It is
+preview-first and deterministic: it matches words in your request against group
+ids, labels, and paths, then prints the groups it would revert and the groups it
+would keep. It does not call an LLM or apply hunk-level edits yet, so same-file
+mixed changes can still be too coarse. Use `--apply --yes` only after reviewing
+the proposal.
 
 ### `undo prune`
 
