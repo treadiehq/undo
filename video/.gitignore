@@ -1,0 +1,4 @@
+node_modules/
+out/
+.remotion/
+public/undo-score.wav
