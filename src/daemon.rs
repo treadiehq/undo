@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
@@ -16,6 +16,50 @@ fn pid_file_for_root(bt_dir: &Path, root: &Path) -> PathBuf {
     let hash = Sha256::digest(root.to_string_lossy().as_bytes());
     let short = crate::to_hex(&hash[..8]);
     bt_dir.join("pids").join(format!("{}.pid", short))
+}
+
+pub fn is_recording(root: &Path) -> Result<bool> {
+    let bt_dir = backtrack_dir()?;
+    let pid_path = pid_file_for_root(&bt_dir, root);
+    Ok(pid_path.exists() && is_daemon_alive(&pid_path))
+}
+
+/// Ensure continuous history is active before opening a Run. Returns true when
+/// this call started the recorder and false when one was already running.
+pub fn ensure_recording(root: &Path) -> Result<bool> {
+    if is_recording(root)? {
+        return Ok(false);
+    }
+
+    let executable = std::env::current_exe()?;
+    std::process::Command::new(executable)
+        .arg("start")
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to start Undo recorder")?;
+
+    let bt_dir = backtrack_dir()?;
+    let pid_path = pid_file_for_root(&bt_dir, root);
+    for _ in 0..200 {
+        if pid_path.exists() && is_daemon_alive(&pid_path) {
+            let ready = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|contents| contents.lines().nth(2).map(str::to_string))
+                .is_some_and(|state| state == "ready");
+            if ready {
+                return Ok(true);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    anyhow::bail!(
+        "Undo did not start recording within 10 seconds.\nCheck the diagnostic log at: {}",
+        bt_dir.join("undo.log").display()
+    )
 }
 
 /// Migrate the old singleton `~/.undo/pid` to the new per-project layout.
@@ -45,9 +89,8 @@ fn check_not_root() -> Result<()> {
     let euid = unsafe { libc::geteuid() };
     if euid == 0 {
         anyhow::bail!(
-            "refusing to run as root — undo stores data in the current user's home directory.\n\
-             Running as root would write to root's home, making data invisible to your normal user.\n\
-             Use --force to override."
+            "Undo did not start: refusing to run as root because saved history belongs to the current user.\n\
+             To bypass this check, rerun with --force; it also bypasses ownership, file-count, and overlap safety checks."
         );
     }
     Ok(())
@@ -62,9 +105,8 @@ fn check_directory_ownership(path: &Path) -> Result<()> {
 
     if uid == 0 {
         anyhow::bail!(
-            "refusing to watch '{}': directory is owned by root.\n\
-             Watching root-owned directories can be dangerous.\n\
-             Use --force to override this check.",
+            "Undo did not start: folder '{}' is owned by root.\n\
+             To bypass this ownership check, rerun with --force; it also bypasses file-count and overlap safety checks.",
             path.display()
         );
     }
@@ -72,8 +114,8 @@ fn check_directory_ownership(path: &Path) -> Result<()> {
     let system_uid_threshold = if cfg!(target_os = "macos") { 500 } else { 1000 };
     if uid < system_uid_threshold {
         anyhow::bail!(
-            "refusing to watch '{}': directory is owned by a system account (uid {}).\n\
-             Use --force to override this check.",
+            "Undo did not start: folder '{}' is owned by a system account (uid {}).\n\
+             To bypass this ownership check, rerun with --force; it also bypasses file-count and overlap safety checks.",
             path.display(),
             uid
         );
@@ -133,12 +175,11 @@ fn check_no_overlap(bt_dir: &Path, new_root: &Path, exclude_pid: u32) -> Result<
 
         if overlap {
             anyhow::bail!(
-                "directory overlaps with an already-watched path.\n\
-                 Undo (PID {}) is already watching: {}\n\
-                 Overlapping folders record some changes twice.\n\
-                 Use --force to override.",
-                pid,
+                "Undo did not start: this folder overlaps with one already being recorded.\n\
+                 Recorded folder: {}\n\
+                 To bypass this overlap check, rerun with --force; it also bypasses ownership and file-count safety checks. (Recorder PID: {})",
                 existing.display(),
+                pid,
             );
         }
     }
@@ -180,17 +221,13 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         pid_file.read_to_string(&mut contents)?;
         let pid = contents.lines().next().unwrap_or("?");
         let project = contents.lines().nth(1).unwrap_or("unknown");
-        println!("Undo is already saving history (PID {}).", pid);
-        println!("Watching: {}", project);
+        println!("Undo is already recording file changes for this folder.");
+        println!("Folder: {} (recorder PID: {})", project, pid);
         return Ok(());
     }
 
     // Lock acquired — write our PID.
-    {
-        use std::io::Write;
-        pid_file.set_len(0)?;
-        write!(pid_file, "{}\n{}", std::process::id(), cwd.display())?;
-    }
+    write_pid_state(&mut pid_file, &cwd, "starting")?;
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
@@ -216,12 +253,12 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         cwd.display()
     );
 
-    println!("{}undo{}: give your files an undo button", BOLD, RESET);
-    println!("Watching: {}", cwd.display());
-    println!("Recording changes...");
+    println!("{}Undo is recording file changes.{}", BOLD, RESET);
+    println!("Folder: {}", cwd.display());
     println!();
 
     watcher::initial_scan(&db, &project, &cwd, verbose, force)?;
+    write_pid_state(&mut pid_file, &cwd, "ready")?;
 
     let retention_cfg = crate::retention::load_config(Some(&cwd));
     match crate::retention::prune(&db, project.id, &retention_cfg, false) {
@@ -268,6 +305,21 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+fn write_pid_state(file: &mut std::fs::File, root: &Path, state: &str) -> Result<()> {
+    use std::io::{Seek, Write};
+    file.set_len(0)?;
+    file.rewind()?;
+    write!(
+        file,
+        "{}\n{}\n{}",
+        std::process::id(),
+        root.display(),
+        state
+    )?;
+    file.sync_data()?;
+    Ok(())
+}
+
 pub fn cmd_stop(all: bool) -> Result<()> {
     let bt_dir = backtrack_dir()?;
 
@@ -281,7 +333,7 @@ pub fn cmd_stop(all: bool) -> Result<()> {
     let pid_path = pid_file_for_root(&bt_dir, &cwd);
 
     if !pid_path.exists() {
-        println!("Undo is not running for this folder.");
+        println!("Undo is not recording file changes for this folder.");
         return Ok(());
     }
 
@@ -298,7 +350,8 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("invalid PID file"))?;
 
     if !is_daemon_alive(pid_path) {
-        println!("Undo is not running (stale PID file). Cleaning up.");
+        println!("Undo was not recording file changes.");
+        println!("Removed a stale recorder marker.");
         std::fs::remove_file(pid_path)?;
         return Ok(());
     }
@@ -318,9 +371,8 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
 
     if is_daemon_alive(pid_path) {
         anyhow::bail!(
-            "Undo (PID {}) did not stop within 6 seconds.\n\
-             The PID file has been left in place so it can be found later.\n\
-             Try `kill -9 {}` if the process is stuck.",
+            "Undo did not stop recording within 6 seconds (recorder PID: {}).\n\
+             If the recorder is stuck, stop it with: kill -9 {}",
             pid,
             pid
         );
@@ -329,14 +381,15 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
     let _ = std::fs::remove_file(pid_path);
 
     let project = contents.lines().nth(1).unwrap_or("unknown");
-    println!("Undo stopped (PID {}, {}).", pid, project);
+    println!("Undo stopped recording file changes.");
+    println!("Folder: {} (recorder PID: {})", project, pid);
     Ok(())
 }
 
 fn stop_all_daemons(bt_dir: &Path) -> Result<()> {
     let pids_dir = bt_dir.join("pids");
     if !pids_dir.exists() {
-        println!("Undo is not running in any folder.");
+        println!("Undo is not recording file changes in any folder.");
         return Ok(());
     }
 
@@ -352,7 +405,7 @@ fn stop_all_daemons(bt_dir: &Path) -> Result<()> {
     }
 
     if stopped == 0 {
-        println!("Undo was not running in any folder.");
+        println!("Undo was not recording file changes in any folder.");
     }
     Ok(())
 }
@@ -362,12 +415,12 @@ pub fn cmd_status() -> Result<()> {
     let db = Database::open()?;
     let cwd = std::env::current_dir()?.canonicalize()?;
 
-    println!("{}undo{} — status", BOLD, RESET);
+    println!("{}Undo recording status{}", BOLD, RESET);
     println!();
 
     match db.find_project_for_path(&cwd)? {
         Some(project) => {
-            println!("Project:   {}", project.root_path);
+            println!("Folder:        {}", project.root_path);
 
             let project_root = Path::new(&project.root_path);
             let pid_path = pid_file_for_root(&bt_dir, project_root);
@@ -382,20 +435,20 @@ pub fn cmd_status() -> Result<()> {
             } else {
                 format!("{}not running{}", RED, RESET)
             };
-            println!("Status:    {}", daemon_status);
+            println!("Recording:     {}", daemon_status);
 
             let db_path = bt_dir.join("database.db");
             let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
             println!(
-                "Database:  {} ({:.1} KB)",
+                "Data index:    {} ({:.1} KB)",
                 db_path.display(),
                 db_size as f64 / 1024.0
             );
 
             let event_count = db.count_events(project.id)?;
             let snapshot_count = crate::snapshots::count(project.id)?;
-            println!("Events:    {}", event_count);
-            println!("Saved:     {} versions", snapshot_count);
+            println!("File changes:  {}", event_count);
+            println!("Saved versions: {}", snapshot_count);
 
             // Deep check (decompress/CRC) since the user is here and asking — this is
             // the expensive read-per-snapshot pass the daemon startup deliberately
@@ -416,12 +469,12 @@ pub fn cmd_status() -> Result<()> {
                     integrity.checked,
                 )
             };
-            println!("Integrity: {}", integrity_line);
+            println!("History health: {}", integrity_line);
 
             let project_root = std::path::Path::new(&project.root_path);
             let cfg = crate::retention::load_config(Some(project_root));
             println!(
-                "Keep:      {} days, {} max",
+                "Keep history:  {} days, {} max",
                 cfg.retention_days,
                 crate::retention::format_size(cfg.max_size_bytes()),
             );
@@ -429,17 +482,20 @@ pub fn cmd_status() -> Result<()> {
             // Single tree walk instead of three (was: dir_size x2 + total).
             let usage = crate::retention::disk_usage_breakdown().unwrap_or_default();
             println!(
-                "Storage:   {} (saved: {}, backups: {}, db: {})",
+                "Storage:       {} (versions: {}, backups: {}, index: {})",
                 crate::retention::format_size(usage.total),
                 crate::retention::format_size(usage.snapshots),
                 crate::retention::format_size(usage.backups),
                 crate::retention::format_size(db_size),
             );
 
-            println!("Log:       {}", crate::logging::log_path(&bt_dir).display());
+            println!(
+                "Diagnostic log: {}",
+                crate::logging::log_path(&bt_dir).display()
+            );
         }
         None => {
-            println!("Undo is not saving history for this folder.");
+            println!("Undo is not recording file changes for this folder.");
             println!("Run {}undo start{} to begin.", BOLD, RESET);
         }
     }

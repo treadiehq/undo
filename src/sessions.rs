@@ -1,14 +1,13 @@
 use anyhow::Result;
-use chrono::{Local, TimeZone, Utc};
+use chrono::{Local, TimeZone};
 
 use crate::db::Database;
-use crate::models::Session;
 use crate::{BOLD, DIM, GREEN, RESET, find_project, groups};
 
 pub fn cmd_session_start(name: &str) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
-        anyhow::bail!("session name cannot be empty");
+        anyhow::bail!("Run name cannot be empty");
     }
 
     let cwd = std::env::current_dir()?.canonicalize()?;
@@ -17,8 +16,9 @@ pub fn cmd_session_start(name: &str) -> Result<()> {
     let session = db.start_session(project.id, name, "manual")?;
 
     println!(
-        "{}Session started{} {} at {}",
+        "{}Recording started for Run {}{} ({}) at {}.",
         GREEN,
+        session.public_id(),
         RESET,
         session.name,
         format_local_time(session.started_at)
@@ -32,33 +32,24 @@ pub fn cmd_session_stop() -> Result<()> {
     let project = find_project(&db, &cwd)?;
 
     let Some(session) = db.stop_active_session(project.id)? else {
-        println!("No active session.");
+        println!("No active Run.");
         return Ok(());
     };
     let event_count = db.get_session_events(&session)?.len();
+    let change_word = if event_count == 1 {
+        "file change"
+    } else {
+        "file changes"
+    };
     println!(
-        "{}Session stopped{} {} ({} event(s))",
-        GREEN, RESET, session.name, event_count
+        "{}Run completed{} {} ({}, {} {}).",
+        GREEN,
+        RESET,
+        session.public_id(),
+        session.name,
+        event_count,
+        change_word
     );
-    Ok(())
-}
-
-pub fn cmd_sessions() -> Result<()> {
-    let cwd = std::env::current_dir()?.canonicalize()?;
-    let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
-    let sessions = db.list_sessions(project.id)?;
-
-    if sessions.is_empty() {
-        println!("No sessions yet.");
-        return Ok(());
-    }
-
-    println!("{}undo{} — sessions", BOLD, RESET);
-    println!();
-    for session in sessions {
-        print_session_line(&session);
-    }
     Ok(())
 }
 
@@ -68,58 +59,45 @@ pub fn cmd_session_show(name: &str) -> Result<()> {
     let project = find_project(&db, &cwd)?;
     let session = db
         .get_session_by_name(project.id, name)?
-        .ok_or_else(|| anyhow::anyhow!("session '{}' not found", name))?;
+        .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", name))?;
     let events = db.get_session_events(&session)?;
     let groups = groups::build_groups(&project, &events);
 
-    println!("{}undo{} — session {}", BOLD, RESET, session.name);
+    println!(
+        "{}Run {}{} — {}",
+        BOLD,
+        session.public_id(),
+        RESET,
+        session.name
+    );
     println!("Started: {}", format_local_time(session.started_at));
-    match session.ended_at {
-        Some(ended_at) => println!("Ended:   {}", format_local_time(ended_at)),
-        None => println!("Ended:   active"),
+    if let Some(ended_at) = session.ended_at {
+        println!("Finished: {}", format_local_time(ended_at));
     }
-    println!("Events:  {}", events.len());
+    println!("File changes: {}", events.len());
 
     if groups.is_empty() {
         println!();
-        println!("No change groups yet.");
+        println!("No groups of file changes yet.");
         return Ok(());
     }
 
     println!();
-    println!("{}Change groups{}", BOLD, RESET);
+    println!("{}File groups{}", BOLD, RESET);
     for group in groups {
         println!(
-            "  {}{}{} {} - {} file(s), {} event(s), +{} -{}",
-            DIM,
-            group.id,
-            RESET,
+            "  {} — {} files, {} recorded changes, +{} -{} {}({}){}",
             group.label,
             group.paths.len(),
             group.event_count,
             group.inserted,
-            group.deleted
+            group.deleted,
+            DIM,
+            group.id,
+            RESET
         );
     }
     Ok(())
-}
-
-fn print_session_line(session: &Session) {
-    let status = if session.ended_at.is_some() {
-        "stopped"
-    } else {
-        "active"
-    };
-    let elapsed = Utc::now().timestamp().saturating_sub(session.started_at);
-    println!(
-        "{}{}{} {} ({}, {})",
-        DIM,
-        format_local_time(session.started_at),
-        RESET,
-        session.name,
-        status,
-        crate::duration::format_elapsed(elapsed)
-    );
 }
 
 fn format_local_time(timestamp: i64) -> String {

@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::db::Database;
 use crate::groups::{self, ChangeGroup};
-use crate::{BOLD, DIM, RESET, find_project, restore};
+use crate::{BOLD, DIM, RESET, find_project, recoveries};
 
 pub fn cmd_recover(
     session_name: &str,
@@ -11,24 +11,29 @@ pub fn cmd_recover(
     yes: bool,
 ) -> Result<()> {
     if !preview && !yes {
-        anyhow::bail!("recover writes files. Run with --preview first, then pass --yes to apply.");
+        anyhow::bail!(
+            "No files changed: recovery requires --yes.\nPreview first, then rerun with --yes to give Undo permission to change files."
+        );
     }
 
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
     let session = db
-        .get_session_by_name(project.id, session_name)?
-        .ok_or_else(|| anyhow::anyhow!("session '{}' not found", session_name))?;
+        .get_run_by_ref(project.id, session_name)?
+        .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", session_name))?;
     let events = db.get_session_events(&session)?;
     if events.is_empty() {
-        println!("No events recorded for session '{}'.", session.name);
+        println!("Run {} has no recorded file changes.", session.public_id());
         return Ok(());
     }
 
     let groups = groups::build_groups(&project, &events);
     if groups.is_empty() {
-        println!("No change groups found for session '{}'.", session.name);
+        println!(
+            "Run {} has no recoverable groups of file changes.",
+            session.public_id()
+        );
         return Ok(());
     }
 
@@ -47,7 +52,21 @@ pub fn cmd_recover(
         ),
     };
 
-    restore::restore_paths_at_session_start(&paths, &session, &label, preview, yes)
+    let recovery = recoveries::create_run_recovery(
+        &session,
+        &paths,
+        &label,
+        if group_id.is_some() { "group" } else { "run" },
+        "exact-paths",
+        None,
+    )?;
+    if preview {
+        return Ok(());
+    }
+    if yes {
+        recoveries::cmd_apply(&recovery.public_id())?;
+    }
+    Ok(())
 }
 
 fn find_group<'a>(groups: &'a [ChangeGroup], requested: &str) -> Result<&'a ChangeGroup> {
@@ -73,18 +92,18 @@ fn find_group<'a>(groups: &'a [ChangeGroup], requested: &str) -> Result<&'a Chan
 }
 
 fn print_group_summary(groups: &[ChangeGroup]) {
-    println!("{}Change groups{}", BOLD, RESET);
+    println!("{}File groups in this Run{}", BOLD, RESET);
     for group in groups {
         println!(
-            "  {}{}{} {} - {} file(s), {} event(s), +{} -{}",
-            DIM,
-            group.id,
-            RESET,
+            "  {} — {} files, {} recorded changes, +{} -{} {}({}){}",
             group.label,
             group.paths.len(),
             group.event_count,
             group.inserted,
-            group.deleted
+            group.deleted,
+            DIM,
+            group.id,
+            RESET
         );
     }
     println!();

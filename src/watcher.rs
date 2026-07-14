@@ -297,7 +297,11 @@ fn scan_one(
 /// it — the pool is fixed-size, so a stuck filesystem can never leak unbounded
 /// threads (the failure mode of the old thread-per-read helper).
 fn report_scan_failure(path: &str, e: &anyhow::Error) {
-    crate::log_warn!("scan: failed to snapshot {}: {}", path, e);
+    crate::log_warn!(
+        "File skipped: could not save a version of {} during the initial scan: {}",
+        path,
+        e
+    );
 }
 
 fn scan_pipeline(
@@ -379,8 +383,8 @@ fn initial_scan_with_limit(
         total_files += 1;
         if total_files > max_files {
             anyhow::bail!(
-                "directory contains more than {} files — this looks too large to watch safely.\n\
-                 Use --force to override this limit.",
+                "Recording did not start: this directory is too large to watch safely (more than {} files).\n\
+                 Rerun with --force to override this limit.",
                 max_files
             );
         }
@@ -479,8 +483,8 @@ fn initial_scan_with_limit(
         let mut deletions = 0usize;
         if mount_anomaly {
             crate::log_warn!(
-                "skipping {} apparent deletion(s) on reconcile: the watched root {} — \
-                 preserving history rather than recording deletions (#31)",
+                "Deletions skipped: Undo found {} missing paths, but the watched directory {}. \
+                 Existing saved versions were kept; no deletions were recorded (#31)",
                 would_delete,
                 if seen_paths.is_empty() {
                     "came back empty (likely an empty remount)"
@@ -517,7 +521,11 @@ fn initial_scan_with_limit(
 
     let count = change_count + deletions;
     if count > 0 {
-        eprintln!("Initial scan: {} change(s) detected.", count);
+        eprintln!(
+            "Initial scan: detected {} file change{}.",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
     }
 
     Ok(())
@@ -577,12 +585,18 @@ pub fn watch_directory(
             let accessible = root_is_accessible(root);
 
             if !accessible && !paused {
-                crate::log_warn!("watched directory is no longer accessible — pausing recording");
+                crate::log_warn!(
+                    "Recording paused: the watched directory is no longer accessible: {}",
+                    root.display()
+                );
                 paused = true;
             } else if accessible && paused {
-                crate::log_notice!("watched directory is accessible again — resuming");
+                crate::log_notice!(
+                    "Recording resumed: the watched directory is accessible again: {}",
+                    root.display()
+                );
                 if let Err(e) = reconcile_after_resume(db, project, root, start_dev, verbose) {
-                    crate::log_warn!("reconciliation scan failed: {}", e);
+                    crate::log_warn!("Recording resumed, but the catch-up scan failed: {}", e);
                 }
                 paused = false;
             }
@@ -598,14 +612,14 @@ pub fn watch_directory(
                         > 0 =>
                 {
                     crate::log_notice!(
-                        "auto-prune: removed {} events, {} snapshots, {} backups (freed {})",
+                        "Automatic cleanup removed {} file changes, {} saved versions, and {} backups; freed {}.",
                         stats.events_deleted,
                         stats.snapshots_deleted,
                         stats.backups_deleted,
                         crate::retention::format_size(stats.bytes_freed),
                     );
                 }
-                Err(e) => crate::log_warn!("auto-prune failed: {}", e),
+                Err(e) => crate::log_warn!("Automatic cleanup failed: {}", e),
                 _ => {}
             }
         }
@@ -626,18 +640,18 @@ pub fn watch_directory(
                     EventOutcome::Failed(e) => {
                         // Always surface errors — a silent failure means the user
                         // believes changes are being recorded when they aren't.
-                        crate::log_warn!("failed to record event: {}", e);
+                        crate::log_warn!("File skipped: Undo could not record this change: {}", e);
                     }
                     EventOutcome::Panicked => {
                         crate::log_warn!(
-                            "panicked while processing an event — skipping it; daemon continues"
+                            "File skipped: the change handler panicked; recording continues"
                         );
                     }
                 }
             }
             Ok(Err(e)) => {
                 // Always surface watcher errors too.
-                crate::log_warn!("file watcher error: {}", e);
+                crate::log_warn!("Recording issue: the file watcher reported an error: {}", e);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -814,7 +828,7 @@ fn db_key(path: &Path) -> Option<String> {
         Some(s) => Some(s.to_string()),
         None => {
             crate::log_warn!(
-                "skipping file with a non-UTF8 path — it cannot be tracked safely: {}",
+                "File skipped: its path is not valid UTF-8, so Undo cannot track it safely: {}",
                 path.display()
             );
             None
@@ -919,7 +933,7 @@ fn handle_modify(
     let state = db.get_file_state(project.id, &path_str)?;
 
     // Fast path (#26): a recorded file whose size *and* mtime are unchanged has
-    // unchanged bytes, so skip the (up to 100 MB) read + hash entirely. Any
+    // unchanged bytes, so skip the (up to 100 MiB) read + hash entirely. Any
     // mismatch — or a missing/legacy mtime — falls through to the full read.
     if let Some(s) = &state
         && s.exists_now

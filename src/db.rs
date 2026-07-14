@@ -4,7 +4,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::models::{Checkpoint, FileEvent, FileState, Session, WatchedProject};
+use crate::models::{
+    Checkpoint, FileEvent, FileState, Recovery, RecoveryEntry, RunIntent, Session, WatchedProject,
+};
 
 pub struct Database {
     conn: Connection,
@@ -22,8 +24,19 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
-         PRAGMA foreign_keys=ON;",
+         PRAGMA foreign_keys=ON;
+         PRAGMA busy_timeout=5000;",
     )?;
+
+    let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version > 3 {
+        anyhow::bail!(
+            "Undo data uses schema version {}, but this binary supports through version 3. \
+             Upgrade Undo before opening this history.",
+            schema_version
+        );
+    }
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS watched_projects (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,11 +74,14 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS checkpoints (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER NOT NULL,
+            run_id      INTEGER,
             name       TEXT    NOT NULL,
             timestamp  INTEGER NOT NULL,
+            event_id    INTEGER,
+            intent      TEXT,
             created_at INTEGER NOT NULL,
             FOREIGN KEY (project_id) REFERENCES watched_projects(id),
-            UNIQUE(project_id, name)
+            FOREIGN KEY (run_id) REFERENCES sessions(id)
         );
 
         CREATE TABLE IF NOT EXISTS sessions (
@@ -73,6 +89,12 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             project_id INTEGER NOT NULL,
             name       TEXT    NOT NULL,
             kind       TEXT    NOT NULL,
+            actor      TEXT    NOT NULL DEFAULT 'human',
+            agent      TEXT,
+            command    TEXT,
+            intent     TEXT,
+            external_id TEXT,
+            status     TEXT    NOT NULL DEFAULT 'active',
             started_at INTEGER NOT NULL,
             ended_at   INTEGER,
             start_event_id INTEGER NOT NULL DEFAULT 0,
@@ -88,6 +110,55 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (session_id, event_id),
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
             FOREIGN KEY (event_id) REFERENCES file_events(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS run_intents (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id         INTEGER NOT NULL,
+            label          TEXT    NOT NULL,
+            status         TEXT    NOT NULL DEFAULT 'active',
+            start_event_id INTEGER NOT NULL,
+            end_event_id   INTEGER,
+            started_at     INTEGER NOT NULL,
+            ended_at       INTEGER,
+            FOREIGN KEY (run_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS recoveries (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id  INTEGER NOT NULL,
+            run_id      INTEGER,
+            request     TEXT    NOT NULL,
+            kind        TEXT    NOT NULL,
+            status      TEXT    NOT NULL DEFAULT 'planned',
+            confidence  TEXT    NOT NULL DEFAULT 'exact',
+            ambiguity   TEXT,
+            created_at  INTEGER NOT NULL,
+            expires_at  INTEGER NOT NULL,
+            applied_at  INTEGER,
+            FOREIGN KEY (project_id) REFERENCES watched_projects(id),
+            FOREIGN KEY (run_id) REFERENCES sessions(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS recovery_entries (
+            recovery_id    INTEGER NOT NULL,
+            path           TEXT    NOT NULL,
+            action         TEXT    NOT NULL,
+            target_hash    TEXT,
+            source_timestamp INTEGER,
+            expected_hash  TEXT,
+            expected_exists INTEGER NOT NULL,
+            PRIMARY KEY (recovery_id, path),
+            FOREIGN KEY (recovery_id) REFERENCES recoveries(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS integration_events (
+            idempotency_key TEXT PRIMARY KEY,
+            run_id          INTEGER,
+            event_type      TEXT NOT NULL,
+            response_json   TEXT NOT NULL,
+            created_at      INTEGER NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES sessions(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_events_project_time
@@ -103,66 +174,117 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active
             ON sessions(project_id) WHERE ended_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_session_events_event
-            ON session_events(event_id);",
+            ON session_events(event_id);
+        CREATE INDEX IF NOT EXISTS idx_run_intents_run
+            ON run_intents(run_id, start_event_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_run_intents_one_active
+            ON run_intents(run_id) WHERE ended_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_recoveries_project
+            ON recoveries(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_recovery_entries_target
+            ON recovery_entries(target_hash);",
     )?;
 
-    // Additive migration (#26): databases created before size/mtime tracking
-    // lack these columns. New databases already have them from the CREATE TABLE
-    // above, so these ALTERs fail with "duplicate column name" — which is the
-    // expected, harmless outcome we deliberately ignore.
-    for stmt in [
-        "ALTER TABLE file_state ADD COLUMN size INTEGER",
-        "ALTER TABLE file_state ADD COLUMN mtime_nanos INTEGER",
-    ] {
-        let _ = conn.execute(stmt, []);
-    }
-    for stmt in [
-        "ALTER TABLE sessions ADD COLUMN start_event_id INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE sessions ADD COLUMN end_event_id INTEGER",
-    ] {
-        let _ = conn.execute(stmt, []);
+    add_column_if_missing(conn, "file_state", "size", "INTEGER")?;
+    add_column_if_missing(conn, "file_state", "mtime_nanos", "INTEGER")?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "start_event_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "sessions", "end_event_id", "INTEGER")?;
+    add_column_if_missing(conn, "sessions", "actor", "TEXT NOT NULL DEFAULT 'human'")?;
+    add_column_if_missing(conn, "sessions", "agent", "TEXT")?;
+    add_column_if_missing(conn, "sessions", "command", "TEXT")?;
+    add_column_if_missing(conn, "sessions", "intent", "TEXT")?;
+    add_column_if_missing(conn, "sessions", "external_id", "TEXT")?;
+    add_column_if_missing(conn, "sessions", "status", "TEXT NOT NULL DEFAULT 'active'")?;
+    add_column_if_missing(conn, "checkpoints", "run_id", "INTEGER")?;
+    add_column_if_missing(conn, "checkpoints", "event_id", "INTEGER")?;
+    add_column_if_missing(conn, "checkpoints", "intent", "TEXT")?;
+    migrate_checkpoints_v3(conn)?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_external_id
+            ON sessions(project_id, external_id) WHERE external_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_legacy_name
+            ON checkpoints(project_id, name) WHERE run_id IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_run_name
+            ON checkpoints(run_id, name) WHERE run_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_checkpoints_project_time
+            ON checkpoints(project_id, timestamp);",
+    )?;
+
+    conn.execute(
+        "UPDATE sessions
+         SET status = CASE WHEN ended_at IS NULL THEN 'active' ELSE 'completed' END
+         WHERE status IS NULL OR status = '' OR (status = 'active' AND ended_at IS NOT NULL)",
+        [],
+    )?;
+    conn.pragma_update(None, "user_version", 3)?;
+
+    Ok(())
+}
+
+fn migrate_checkpoints_v3(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'checkpoints'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let requires_rebuild = sql
+        .as_deref()
+        .is_some_and(|sql| sql.contains("UNIQUE(project_id, name)"));
+    if !requires_rebuild {
+        return Ok(());
     }
 
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS checkpoints (
+        "PRAGMA foreign_keys=OFF;
+         BEGIN IMMEDIATE;
+         CREATE TABLE checkpoints_v3 (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER NOT NULL,
+            run_id      INTEGER,
             name       TEXT    NOT NULL,
             timestamp  INTEGER NOT NULL,
+            event_id    INTEGER,
+            intent      TEXT,
             created_at INTEGER NOT NULL,
             FOREIGN KEY (project_id) REFERENCES watched_projects(id),
-            UNIQUE(project_id, name)
-        );
-        CREATE INDEX IF NOT EXISTS idx_checkpoints_project_time
-            ON checkpoints(project_id, timestamp);
-        CREATE TABLE IF NOT EXISTS sessions (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER NOT NULL,
-            name       TEXT    NOT NULL,
-            kind       TEXT    NOT NULL DEFAULT 'manual',
-            started_at INTEGER NOT NULL,
-            ended_at   INTEGER,
-            start_event_id INTEGER NOT NULL DEFAULT 0,
-            end_event_id   INTEGER,
-            created_at INTEGER NOT NULL,
-            FOREIGN KEY (project_id) REFERENCES watched_projects(id),
-            UNIQUE(project_id, name)
-        );
-        CREATE TABLE IF NOT EXISTS session_events (
-            session_id INTEGER NOT NULL,
-            event_id   INTEGER NOT NULL,
-            PRIMARY KEY (session_id, event_id),
-            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-            FOREIGN KEY (event_id) REFERENCES file_events(id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_sessions_project_time
-            ON sessions(project_id, started_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active
-            ON sessions(project_id) WHERE ended_at IS NULL;
-        CREATE INDEX IF NOT EXISTS idx_session_events_event
-            ON session_events(event_id);",
+            FOREIGN KEY (run_id) REFERENCES sessions(id)
+         );
+         INSERT INTO checkpoints_v3
+            (id, project_id, run_id, name, timestamp, event_id, intent, created_at)
+         SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
+         FROM checkpoints;
+         DROP TABLE checkpoints;
+         ALTER TABLE checkpoints_v3 RENAME TO checkpoints;
+         COMMIT;
+         PRAGMA foreign_keys=ON;",
     )?;
+    Ok(())
+}
 
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
     Ok(())
 }
 
@@ -433,6 +555,55 @@ impl Database {
             .context("failed to query event at time")
     }
 
+    /// Return the latest event that determines whether `path` existed at a
+    /// point in time. Unlike `get_event_at_time`, deletion and rename-away
+    /// events are included because absence is a real recoverable state.
+    pub fn get_path_state_event_at_time(
+        &self,
+        project_id: i64,
+        path: &str,
+        before_ts: i64,
+    ) -> Result<Option<FileEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND (path = ?2 OR old_path = ?2)
+                   AND timestamp <= ?3
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                params![project_id, path, before_ts],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query path state at time")
+    }
+
+    pub fn get_path_state_event_at_id(
+        &self,
+        project_id: i64,
+        path: &str,
+        event_id: i64,
+    ) -> Result<Option<FileEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND (path = ?2 OR old_path = ?2)
+                   AND id <= ?3
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![project_id, path, event_id],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query path state at event boundary")
+    }
+
     /// Find the first event after a restore target that changed whether `path`
     /// existed or what it contained. Matching `old_path` makes renames usable
     /// for reconstructing the source name after older history is pruned.
@@ -457,6 +628,29 @@ impl Database {
             )
             .optional()
             .context("failed to query first path event after target")
+    }
+
+    pub fn get_first_path_event_after_id(
+        &self,
+        project_id: i64,
+        path: &str,
+        event_id: i64,
+    ) -> Result<Option<FileEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND id > ?3
+                   AND (path = ?2 OR old_path = ?2)
+                 ORDER BY id ASC
+                 LIMIT 1",
+                params![project_id, path, event_id],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query first path event after boundary")
     }
 
     /// Find the newest restorable event at the exact start boundary of a
@@ -733,7 +927,15 @@ impl Database {
                AND exists_now = 1
              UNION
              SELECT previous_hash FROM file_events
-             WHERE project_id = ?1 AND previous_hash IS NOT NULL",
+             WHERE project_id = ?1 AND previous_hash IS NOT NULL
+             UNION
+             SELECT re.target_hash
+             FROM recovery_entries re
+             JOIN recoveries r ON r.id = re.recovery_id
+             WHERE r.project_id = ?1
+               AND r.status = 'planned'
+               AND r.expires_at >= unixepoch()
+               AND re.target_hash IS NOT NULL",
         )?;
         let hashes = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
         hashes
@@ -751,38 +953,87 @@ impl Database {
     // ── session operations ──────────────────────────────────────────
 
     pub fn start_session(&self, project_id: i64, name: &str, kind: &str) -> Result<Session> {
+        self.start_run(project_id, name, kind, "human", None, None, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_run(
+        &self,
+        project_id: i64,
+        name: &str,
+        kind: &str,
+        actor: &str,
+        agent: Option<&str>,
+        command: Option<&str>,
+        intent: Option<&str>,
+        external_id: Option<&str>,
+    ) -> Result<Session> {
         let now = Utc::now().timestamp();
+        if let Some(external_id) = external_id
+            && let Some(existing) = self.get_run_by_external_id(project_id, external_id)?
+        {
+            return Ok(existing);
+        }
         if let Some(active) = self.get_active_session(project_id)? {
             anyhow::bail!(
-                "session '{}' is already active. Stop it before starting another.",
-                active.name
+                "Run {} ('{}') is already active. Complete it before starting another.",
+                active.public_id(),
+                active.name,
             );
         }
         let start_event_id = self.max_event_id(project_id)?;
         self.conn.execute(
             "INSERT INTO sessions
-                (project_id, name, kind, started_at, start_event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![project_id, name, kind, now, start_event_id, now],
+                (project_id, name, kind, actor, agent, command, intent, external_id,
+                 status, started_at, start_event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11)",
+            params![
+                project_id,
+                name,
+                kind,
+                actor,
+                agent,
+                command,
+                intent,
+                external_id,
+                now,
+                start_event_id,
+                now
+            ],
         )?;
-        self.get_session_by_name(project_id, name)?
-            .ok_or_else(|| anyhow::anyhow!("failed to read session after creating it"))
+        self.get_session_by_id(self.conn.last_insert_rowid())?
+            .ok_or_else(|| anyhow::anyhow!("failed to read Run after creating it"))
     }
 
     pub fn stop_active_session(&self, project_id: i64) -> Result<Option<Session>> {
         let Some(session) = self.get_active_session(project_id)? else {
             return Ok(None);
         };
+        self.complete_run(session.id, "completed").map(Some)
+    }
+
+    pub fn complete_run(&self, run_id: i64, status: &str) -> Result<Session> {
+        let session = self.get_session_by_id(run_id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Run r_{} not found. Use `undo run list` to see available Runs.",
+                run_id
+            )
+        })?;
+        if session.ended_at.is_some() {
+            return Ok(session);
+        }
         let ended_at = Utc::now().timestamp();
-        let end_event_id = self.max_event_id(project_id)?;
+        let end_event_id = self.max_event_id(session.project_id)?;
         self.transaction(|db| {
             db.conn.execute(
-                "UPDATE sessions SET ended_at = ?1, end_event_id = ?2 WHERE id = ?3",
-                params![ended_at, end_event_id, session.id],
+                "UPDATE sessions
+                 SET ended_at = ?1, end_event_id = ?2, status = ?3
+                 WHERE id = ?4",
+                params![ended_at, end_event_id, status, session.id],
             )?;
             db.link_session_events(
                 session.id,
-                project_id,
+                session.project_id,
                 session.started_at,
                 ended_at,
                 session.start_event_id,
@@ -791,11 +1042,13 @@ impl Database {
             Ok(())
         })?;
         self.get_session_by_id(session.id)
+            .and_then(|run| run.ok_or_else(|| anyhow::anyhow!("failed to read completed Run")))
     }
 
     pub fn list_sessions(&self, project_id: i64) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, kind, started_at, ended_at,
+            "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                    external_id, status, started_at, ended_at,
                     start_event_id, end_event_id, created_at
              FROM sessions
              WHERE project_id = ?1
@@ -810,7 +1063,8 @@ impl Database {
     pub fn get_session_by_name(&self, project_id: i64, name: &str) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, kind, started_at, ended_at,
+                "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                        external_id, status, started_at, ended_at,
                         start_event_id, end_event_id, created_at
                  FROM sessions
                  WHERE project_id = ?1 AND name = ?2
@@ -825,7 +1079,8 @@ impl Database {
     pub fn get_active_session(&self, project_id: i64) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, kind, started_at, ended_at,
+                "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                        external_id, status, started_at, ended_at,
                         start_event_id, end_event_id, created_at
                  FROM sessions
                  WHERE project_id = ?1 AND ended_at IS NULL
@@ -891,10 +1146,11 @@ impl Database {
             .context("failed to query session events")
     }
 
-    fn get_session_by_id(&self, session_id: i64) -> Result<Option<Session>> {
+    pub fn get_session_by_id(&self, session_id: i64) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, kind, started_at, ended_at,
+                "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                        external_id, status, started_at, ended_at,
                         start_event_id, end_event_id, created_at
                  FROM sessions
                  WHERE id = ?1
@@ -904,6 +1160,35 @@ impl Database {
             )
             .optional()
             .context("failed to query session by id")
+    }
+
+    pub fn get_run_by_ref(&self, project_id: i64, reference: &str) -> Result<Option<Session>> {
+        if let Some(id) = parse_public_id(reference, "r_") {
+            return self
+                .get_session_by_id(id)
+                .map(|run| run.filter(|run| run.project_id == project_id));
+        }
+        self.get_session_by_name(project_id, reference)
+    }
+
+    fn get_run_by_external_id(
+        &self,
+        project_id: i64,
+        external_id: &str,
+    ) -> Result<Option<Session>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                        external_id, status, started_at, ended_at,
+                        start_event_id, end_event_id, created_at
+                 FROM sessions
+                 WHERE project_id = ?1 AND external_id = ?2
+                 LIMIT 1",
+                params![project_id, external_id],
+                row_to_session,
+            )
+            .optional()
+            .context("failed to query Run by external id")
     }
 
     fn link_session_events(
@@ -936,7 +1221,7 @@ impl Database {
         Ok(())
     }
 
-    fn max_event_id(&self, project_id: i64) -> Result<i64> {
+    pub fn max_event_id(&self, project_id: i64) -> Result<i64> {
         self.conn
             .query_row(
                 "SELECT COALESCE(MAX(id), 0) FROM file_events WHERE project_id = ?1",
@@ -949,21 +1234,44 @@ impl Database {
     // ── checkpoint operations ───────────────────────────────────────
 
     pub fn create_checkpoint(&self, project_id: i64, name: &str, timestamp: i64) -> Result<()> {
+        let run_id = self.get_active_session(project_id)?.map(|run| run.id);
+        let event_id = self.max_event_id(project_id)?;
+        self.create_checkpoint_at(project_id, run_id, name, timestamp, event_id, None)?;
+        Ok(())
+    }
+
+    pub fn create_checkpoint_at(
+        &self,
+        project_id: i64,
+        run_id: Option<i64>,
+        name: &str,
+        timestamp: i64,
+        event_id: i64,
+        intent: Option<&str>,
+    ) -> Result<(Checkpoint, bool)> {
+        let existing = match run_id {
+            Some(run_id) => self.get_checkpoint_for_run(run_id, name)?,
+            None => self.get_legacy_checkpoint(project_id, name)?,
+        };
+        if let Some(existing) = existing {
+            return Ok((existing, false));
+        }
         let now = Utc::now().timestamp();
         self.conn.execute(
-            "INSERT INTO checkpoints (project_id, name, timestamp, created_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(project_id, name) DO UPDATE SET
-                timestamp  = excluded.timestamp,
-                created_at = excluded.created_at",
-            params![project_id, name, timestamp, now],
+            "INSERT INTO checkpoints
+                (project_id, run_id, name, timestamp, event_id, intent, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project_id, run_id, name, timestamp, event_id, intent, now],
         )?;
-        Ok(())
+        let checkpoint = self
+            .get_checkpoint_by_id(self.conn.last_insert_rowid())?
+            .ok_or_else(|| anyhow::anyhow!("failed to read checkpoint after creating it"))?;
+        Ok((checkpoint, true))
     }
 
     pub fn list_checkpoints(&self, project_id: i64) -> Result<Vec<Checkpoint>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, timestamp, created_at
+            "SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
              FROM checkpoints
              WHERE project_id = ?1
              ORDER BY timestamp DESC, id DESC",
@@ -977,9 +1285,10 @@ impl Database {
     pub fn get_checkpoint(&self, project_id: i64, name: &str) -> Result<Option<Checkpoint>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, timestamp, created_at
+                "SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
                  FROM checkpoints
                  WHERE project_id = ?1 AND name = ?2
+                 ORDER BY timestamp DESC, id DESC
                  LIMIT 1",
                 params![project_id, name],
                 row_to_checkpoint,
@@ -987,6 +1296,371 @@ impl Database {
             .optional()
             .context("failed to query checkpoint")
     }
+
+    fn get_checkpoint_for_run(&self, run_id: i64, name: &str) -> Result<Option<Checkpoint>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
+                 FROM checkpoints
+                 WHERE run_id = ?1 AND name = ?2
+                 LIMIT 1",
+                params![run_id, name],
+                row_to_checkpoint,
+            )
+            .optional()
+            .context("failed to query Run checkpoint")
+    }
+
+    fn get_legacy_checkpoint(&self, project_id: i64, name: &str) -> Result<Option<Checkpoint>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
+                 FROM checkpoints
+                 WHERE project_id = ?1 AND run_id IS NULL AND name = ?2
+                 LIMIT 1",
+                params![project_id, name],
+                row_to_checkpoint,
+            )
+            .optional()
+            .context("failed to query legacy checkpoint")
+    }
+
+    pub fn get_checkpoint_by_ref(
+        &self,
+        project_id: i64,
+        reference: &str,
+    ) -> Result<Option<Checkpoint>> {
+        if let Some(id) = parse_public_id(reference, "cp_") {
+            return self
+                .get_checkpoint_by_id(id)
+                .map(|checkpoint| checkpoint.filter(|cp| cp.project_id == project_id));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
+             FROM checkpoints
+             WHERE project_id = ?1 AND name = ?2
+             ORDER BY timestamp DESC, id DESC
+             LIMIT 2",
+        )?;
+        let checkpoints = stmt
+            .query_map(params![project_id, reference], row_to_checkpoint)?
+            .collect::<Result<Vec<_>, _>>()?;
+        match checkpoints.as_slice() {
+            [] => Ok(None),
+            [checkpoint] => Ok(Some(checkpoint.clone())),
+            [first, second] => anyhow::bail!(
+                "checkpoint name '{}' is ambiguous ({} and {}). Use a specific checkpoint id, \
+                 such as {}.",
+                reference,
+                first.public_id(),
+                second.public_id(),
+                first.public_id()
+            ),
+            _ => unreachable!("query is limited to two checkpoints"),
+        }
+    }
+
+    fn get_checkpoint_by_id(&self, checkpoint_id: i64) -> Result<Option<Checkpoint>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
+                 FROM checkpoints
+                 WHERE id = ?1
+                 LIMIT 1",
+                params![checkpoint_id],
+                row_to_checkpoint,
+            )
+            .optional()
+            .context("failed to query checkpoint by id")
+    }
+
+    // ── Run intent operations ───────────────────────────────────────
+
+    pub fn start_run_intent(
+        &self,
+        run_id: i64,
+        label: &str,
+        event_id: i64,
+        timestamp: i64,
+    ) -> Result<RunIntent> {
+        if let Some(active) = self.get_active_run_intent(run_id)? {
+            if active.label == label {
+                return Ok(active);
+            }
+            anyhow::bail!(
+                "Run r_{} already has an active intent. Complete it before starting another.",
+                run_id
+            );
+        }
+        self.conn.execute(
+            "INSERT INTO run_intents
+                (run_id, label, status, start_event_id, started_at)
+             VALUES (?1, ?2, 'active', ?3, ?4)",
+            params![run_id, label, event_id, timestamp],
+        )?;
+        self.get_run_intent_by_id(self.conn.last_insert_rowid())?
+            .ok_or_else(|| anyhow::anyhow!("failed to read intent after creating it"))
+    }
+
+    pub fn complete_run_intent(
+        &self,
+        run_id: i64,
+        label: Option<&str>,
+        event_id: i64,
+        timestamp: i64,
+    ) -> Result<RunIntent> {
+        let Some(intent) = self.get_active_run_intent(run_id)? else {
+            if let Some(label) = label
+                && let Some(completed) = self
+                    .list_run_intents(run_id)?
+                    .into_iter()
+                    .rev()
+                    .find(|intent| intent.label == label && intent.ended_at.is_some())
+            {
+                return Ok(completed);
+            }
+            anyhow::bail!(
+                "Run r_{} has no active intent. Send intent_started before intent_completed.",
+                run_id
+            );
+        };
+        if let Some(label) = label
+            && intent.label != label
+        {
+            anyhow::bail!(
+                "Run r_{} has active intent '{}', not '{}'. Send the active intent name or omit \
+                 'intent'.",
+                run_id,
+                intent.label,
+                label
+            );
+        }
+        self.conn.execute(
+            "UPDATE run_intents
+             SET status = 'completed', end_event_id = ?1, ended_at = ?2
+             WHERE id = ?3",
+            params![event_id, timestamp, intent.id],
+        )?;
+        self.get_run_intent_by_id(intent.id)?
+            .ok_or_else(|| anyhow::anyhow!("failed to read completed intent"))
+    }
+
+    pub fn list_run_intents(&self, run_id: i64) -> Result<Vec<RunIntent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, label, status, start_event_id, end_event_id,
+                    started_at, ended_at
+             FROM run_intents
+             WHERE run_id = ?1
+             ORDER BY start_event_id, id",
+        )?;
+        let intents = stmt.query_map(params![run_id], row_to_run_intent)?;
+        intents
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query Run intents")
+    }
+
+    pub fn get_active_run_intent(&self, run_id: i64) -> Result<Option<RunIntent>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, label, status, start_event_id, end_event_id,
+                        started_at, ended_at
+                 FROM run_intents
+                 WHERE run_id = ?1 AND ended_at IS NULL
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![run_id],
+                row_to_run_intent,
+            )
+            .optional()
+            .context("failed to query active Run intent")
+    }
+
+    fn get_run_intent_by_id(&self, intent_id: i64) -> Result<Option<RunIntent>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, label, status, start_event_id, end_event_id,
+                        started_at, ended_at
+                 FROM run_intents
+                 WHERE id = ?1",
+                params![intent_id],
+                row_to_run_intent,
+            )
+            .optional()
+            .context("failed to query Run intent")
+    }
+
+    pub fn get_events_between_ids(
+        &self,
+        project_id: i64,
+        start_event_id: i64,
+        end_event_id: i64,
+    ) -> Result<Vec<FileEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, timestamp, path, event_type,
+                    current_hash, previous_hash, snapshot_path, old_path, file_size
+             FROM file_events
+             WHERE project_id = ?1 AND id > ?2 AND id <= ?3
+             ORDER BY id",
+        )?;
+        let events = stmt.query_map(
+            params![project_id, start_event_id, end_event_id],
+            row_to_event,
+        )?;
+        events
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query events between boundaries")
+    }
+
+    // ── Recovery operations ─────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_recovery(
+        &self,
+        project_id: i64,
+        run_id: Option<i64>,
+        request: &str,
+        kind: &str,
+        confidence: &str,
+        ambiguity: Option<&str>,
+        entries: &[RecoveryEntry],
+    ) -> Result<Recovery> {
+        let now = Utc::now().timestamp();
+        let expires_at = now.saturating_add(24 * 60 * 60);
+        self.transaction(|db| {
+            db.conn.execute(
+                "INSERT INTO recoveries
+                    (project_id, run_id, request, kind, status, confidence,
+                     ambiguity, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, 'planned', ?5, ?6, ?7, ?8)",
+                params![
+                    project_id, run_id, request, kind, confidence, ambiguity, now, expires_at
+                ],
+            )?;
+            let recovery_id = db.conn.last_insert_rowid();
+            for entry in entries {
+                db.conn.execute(
+                    "INSERT INTO recovery_entries
+                        (recovery_id, path, action, target_hash, source_timestamp,
+                         expected_hash, expected_exists)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        recovery_id,
+                        entry.path,
+                        entry.action,
+                        entry.target_hash,
+                        entry.source_timestamp,
+                        entry.expected_hash,
+                        entry.expected_exists as i32
+                    ],
+                )?;
+            }
+            Ok(recovery_id)
+        })
+        .and_then(|id| {
+            self.get_recovery_by_id(id)?
+                .ok_or_else(|| anyhow::anyhow!("failed to read Recovery after creating it"))
+        })
+    }
+
+    pub fn get_recovery_by_ref(
+        &self,
+        project_id: i64,
+        reference: &str,
+    ) -> Result<Option<Recovery>> {
+        let Some(id) = parse_public_id(reference, "rec_") else {
+            return Ok(None);
+        };
+        self.get_recovery_by_id(id)
+            .map(|recovery| recovery.filter(|recovery| recovery.project_id == project_id))
+    }
+
+    pub fn get_recovery_entries(&self, recovery_id: i64) -> Result<Vec<RecoveryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT recovery_id, path, action, target_hash, source_timestamp,
+                    expected_hash, expected_exists
+             FROM recovery_entries
+             WHERE recovery_id = ?1
+             ORDER BY path",
+        )?;
+        let entries = stmt.query_map(params![recovery_id], row_to_recovery_entry)?;
+        entries
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query Recovery entries")
+    }
+
+    pub fn mark_recovery_applied(&self, recovery_id: i64) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "UPDATE recoveries
+             SET status = 'applied', applied_at = ?1
+             WHERE id = ?2 AND status = 'planned'",
+            params![now, recovery_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_recovery_conflicted(&self, recovery_id: i64, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE recoveries
+             SET status = 'conflicted', ambiguity = ?1
+             WHERE id = ?2 AND status = 'planned'",
+            params![reason, recovery_id],
+        )?;
+        Ok(())
+    }
+
+    fn get_recovery_by_id(&self, recovery_id: i64) -> Result<Option<Recovery>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, run_id, request, kind, status, confidence,
+                        ambiguity, created_at, expires_at, applied_at
+                 FROM recoveries
+                 WHERE id = ?1",
+                params![recovery_id],
+                row_to_recovery,
+            )
+            .optional()
+            .context("failed to query Recovery")
+    }
+
+    // ── Integration idempotency ─────────────────────────────────────
+
+    pub fn get_integration_response(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT response_json FROM integration_events WHERE idempotency_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to query integration event")
+    }
+
+    pub fn record_integration_response(
+        &self,
+        key: &str,
+        run_id: Option<i64>,
+        event_type: &str,
+        response_json: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO integration_events
+                (idempotency_key, run_id, event_type, response_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                key,
+                run_id,
+                event_type,
+                response_json,
+                Utc::now().timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+fn parse_public_id(value: &str, prefix: &str) -> Option<i64> {
+    value.strip_prefix(prefix)?.parse().ok()
 }
 
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<FileEvent> {
@@ -1008,9 +1682,12 @@ fn row_to_checkpoint(row: &rusqlite::Row) -> rusqlite::Result<Checkpoint> {
     Ok(Checkpoint {
         id: row.get(0)?,
         project_id: row.get(1)?,
-        name: row.get(2)?,
-        timestamp: row.get(3)?,
-        created_at: row.get(4)?,
+        run_id: row.get(2)?,
+        name: row.get(3)?,
+        timestamp: row.get(4)?,
+        event_id: row.get(5)?,
+        intent: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -1020,11 +1697,58 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         project_id: row.get(1)?,
         name: row.get(2)?,
         kind: row.get(3)?,
-        started_at: row.get(4)?,
-        ended_at: row.get(5)?,
-        start_event_id: row.get(6)?,
-        end_event_id: row.get(7)?,
+        actor: row.get(4)?,
+        agent: row.get(5)?,
+        command: row.get(6)?,
+        intent: row.get(7)?,
+        external_id: row.get(8)?,
+        status: row.get(9)?,
+        started_at: row.get(10)?,
+        ended_at: row.get(11)?,
+        start_event_id: row.get(12)?,
+        end_event_id: row.get(13)?,
+        created_at: row.get(14)?,
+    })
+}
+
+fn row_to_run_intent(row: &rusqlite::Row) -> rusqlite::Result<RunIntent> {
+    Ok(RunIntent {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        label: row.get(2)?,
+        status: row.get(3)?,
+        start_event_id: row.get(4)?,
+        end_event_id: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+    })
+}
+
+fn row_to_recovery(row: &rusqlite::Row) -> rusqlite::Result<Recovery> {
+    Ok(Recovery {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        run_id: row.get(2)?,
+        request: row.get(3)?,
+        kind: row.get(4)?,
+        status: row.get(5)?,
+        confidence: row.get(6)?,
+        ambiguity: row.get(7)?,
         created_at: row.get(8)?,
+        expires_at: row.get(9)?,
+        applied_at: row.get(10)?,
+    })
+}
+
+fn row_to_recovery_entry(row: &rusqlite::Row) -> rusqlite::Result<RecoveryEntry> {
+    Ok(RecoveryEntry {
+        recovery_id: row.get(0)?,
+        path: row.get(1)?,
+        action: row.get(2)?,
+        target_hash: row.get(3)?,
+        source_timestamp: row.get(4)?,
+        expected_hash: row.get(5)?,
+        expected_exists: row.get::<_, i32>(6)? != 0,
     })
 }
 
@@ -1322,9 +2046,10 @@ mod tests {
 
     // ── checkpoints ──────────────────────────────────────────────────
 
-    /// Checkpoints are labels over timestamps and can be replaced by name.
+    /// Repeating a checkpoint is idempotent: agent retries must never move a
+    /// recovery boundary forward.
     #[test]
-    fn checkpoint_create_list_and_replace() {
+    fn checkpoint_create_is_idempotent() {
         let db = db();
         let p = project(&db);
         db.create_checkpoint(p.id, "before refactor", 100).unwrap();
@@ -1334,11 +2059,66 @@ mod tests {
             .get_checkpoint(p.id, "before refactor")
             .unwrap()
             .expect("checkpoint exists");
-        assert_eq!(checkpoint.timestamp, 200);
+        assert_eq!(checkpoint.timestamp, 100);
 
         let checkpoints = db.list_checkpoints(p.id).unwrap();
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints[0].name, "before refactor");
+    }
+
+    #[test]
+    fn checkpoint_names_can_repeat_across_runs() {
+        let db = db();
+        let p = project(&db);
+        let first = db
+            .start_run(
+                p.id,
+                "first",
+                "run",
+                "agent",
+                Some("Claude Code"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (first_checkpoint, _) = db
+            .create_checkpoint_at(p.id, Some(first.id), "validated", 100, 0, None)
+            .unwrap();
+        db.complete_run(first.id, "completed").unwrap();
+
+        let second = db
+            .start_run(
+                p.id,
+                "second",
+                "run",
+                "agent",
+                Some("Codex"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let (second_checkpoint, _) = db
+            .create_checkpoint_at(p.id, Some(second.id), "validated", 200, 0, None)
+            .unwrap();
+
+        assert_ne!(first_checkpoint.id, second_checkpoint.id);
+        assert_eq!(first_checkpoint.name, second_checkpoint.name);
+        let error = db
+            .get_checkpoint_by_ref(p.id, "validated")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains(&first_checkpoint.public_id()), "{error}");
+        assert!(error.contains(&second_checkpoint.public_id()), "{error}");
+        assert_eq!(
+            db.get_checkpoint_by_ref(p.id, &second_checkpoint.public_id())
+                .unwrap()
+                .unwrap()
+                .id,
+            second_checkpoint.id
+        );
     }
 
     // ── sessions ─────────────────────────────────────────────────────
@@ -1372,6 +2152,119 @@ mod tests {
         let sessions = db.list_sessions(p.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "agent-auth-work");
+    }
+
+    #[test]
+    fn run_lifecycle_preserves_agent_identity_and_status() {
+        let db = db();
+        let p = project(&db);
+        let started = db
+            .start_run(
+                p.id,
+                "dashboard",
+                "run",
+                "agent",
+                Some("Claude Code"),
+                Some("claude"),
+                Some("Redesign dashboard"),
+                Some("external-42"),
+            )
+            .unwrap();
+        assert_eq!(started.public_id(), format!("r_{}", started.id));
+        assert_eq!(started.actor, "agent");
+        assert_eq!(started.agent.as_deref(), Some("Claude Code"));
+        assert_eq!(started.status, "active");
+
+        let completed = db.complete_run(started.id, "completed").unwrap();
+        assert_eq!(completed.status, "completed");
+        assert!(completed.ended_at.is_some());
+
+        let retry = db
+            .start_run(
+                p.id,
+                "ignored-retry-name",
+                "run",
+                "agent",
+                Some("Claude Code"),
+                None,
+                None,
+                Some("external-42"),
+            )
+            .unwrap();
+        assert_eq!(retry.id, completed.id);
+    }
+
+    #[test]
+    fn missing_run_error_points_to_run_list() {
+        let error = db().complete_run(999, "completed").unwrap_err().to_string();
+
+        assert!(error.contains("Run r_999 not found"), "{error}");
+        assert!(error.contains("undo run list"), "{error}");
+    }
+
+    #[test]
+    fn intent_errors_explain_the_next_event() {
+        let db = db();
+        let p = project(&db);
+        let run = db.start_session(p.id, "work", "manual").unwrap();
+        db.start_run_intent(run.id, "first task", 0, 10).unwrap();
+
+        let already_active = db
+            .start_run_intent(run.id, "second task", 0, 11)
+            .unwrap_err()
+            .to_string();
+        assert!(already_active.contains("already has an active intent"));
+        assert!(already_active.contains("Complete it before starting another"));
+
+        let wrong_intent = db
+            .complete_run_intent(run.id, Some("second task"), 0, 12)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_intent.contains("active intent 'first task'"));
+        assert!(wrong_intent.contains("omit 'intent'"));
+
+        db.complete_run_intent(run.id, None, 0, 13).unwrap();
+        let no_active = db
+            .complete_run_intent(run.id, None, 0, 14)
+            .unwrap_err()
+            .to_string();
+        assert!(no_active.contains("Send intent_started before intent_completed"));
+    }
+
+    #[test]
+    fn recovery_plan_and_entries_round_trip() {
+        let db = db();
+        let p = project(&db);
+        let recovery = db
+            .create_recovery(
+                p.id,
+                None,
+                "remove auth",
+                "intent",
+                "explicit-intent",
+                None,
+                &[RecoveryEntry {
+                    recovery_id: 0,
+                    path: "/home/user/project/auth.rs".to_string(),
+                    action: "WRITE".to_string(),
+                    target_hash: Some("before".to_string()),
+                    source_timestamp: Some(10),
+                    expected_hash: Some("after".to_string()),
+                    expected_exists: true,
+                }],
+            )
+            .unwrap();
+        assert_eq!(recovery.status, "planned");
+        let entries = db.get_recovery_entries(recovery.id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expected_hash.as_deref(), Some("after"));
+
+        db.mark_recovery_applied(recovery.id).unwrap();
+        let applied = db
+            .get_recovery_by_ref(p.id, &recovery.public_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.status, "applied");
     }
 
     /// A project can only have one active session; otherwise new events would be
@@ -1519,6 +2412,72 @@ mod tests {
         let updated = db.get_file_state(1, "/legacy.rs").unwrap().unwrap();
         assert_eq!(updated.size, Some(42));
         assert_eq!(updated.mtime_nanos, Some(7));
+    }
+
+    #[test]
+    fn migration_preserves_legacy_sessions_and_rebuilds_checkpoint_uniqueness() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE watched_projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_path TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL
+             );
+             INSERT INTO watched_projects (id, root_path, created_at)
+             VALUES (1, '/legacy', 1);
+             CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'manual',
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                start_event_id INTEGER NOT NULL DEFAULT 0,
+                end_event_id INTEGER,
+                created_at INTEGER NOT NULL,
+                UNIQUE(project_id, name)
+             );
+             INSERT INTO sessions
+                (id, project_id, name, kind, started_at, ended_at,
+                 start_event_id, end_event_id, created_at)
+             VALUES (7, 1, 'legacy-agent-work', 'manual', 10, 20, 0, 0, 10);
+             CREATE TABLE checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(project_id, name)
+             );
+             INSERT INTO checkpoints
+                (id, project_id, name, timestamp, created_at)
+             VALUES (9, 1, 'before', 11, 11);",
+        )
+        .unwrap();
+
+        apply_schema(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+
+        let db = Database { conn };
+        let legacy = db.get_session_by_id(7).unwrap().unwrap();
+        assert_eq!(legacy.name, "legacy-agent-work");
+        assert_eq!(legacy.actor, "human");
+        assert_eq!(legacy.status, "completed");
+        let checkpoint = db.get_checkpoint_by_ref(1, "cp_9").unwrap().unwrap();
+        assert_eq!(checkpoint.name, "before");
+        assert_eq!(checkpoint.event_id, None);
+
+        let new_run = db
+            .start_run(1, "new", "run", "agent", Some("Codex"), None, None, None)
+            .unwrap();
+        let (new_checkpoint, created) = db
+            .create_checkpoint_at(1, Some(new_run.id), "before", 30, 0, None)
+            .unwrap();
+        assert!(created);
+        assert_ne!(new_checkpoint.id, checkpoint.id);
     }
 
     // ── retention methods ───────────────────────────────────────────

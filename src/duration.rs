@@ -43,15 +43,21 @@ pub fn parse_duration(s: &str) -> Result<i64> {
 
 /// Format an elapsed duration in seconds into a human-readable string.
 pub fn format_elapsed(seconds: i64) -> String {
-    if seconds < 60 {
-        format!("{} second(s) ago", seconds)
-    } else if seconds < 3600 {
-        format!("{} minute(s) ago", seconds / 60)
-    } else if seconds < 86400 {
-        format!("{} hour(s) ago", seconds / 3600)
-    } else {
-        format!("{} day(s) ago", seconds / 86400)
+    if seconds < 0 {
+        return "in the future".to_string();
     }
+
+    let (value, unit) = if seconds < 60 {
+        (seconds, "second")
+    } else if seconds < 3600 {
+        (seconds / 60, "minute")
+    } else if seconds < 86400 {
+        (seconds / 3600, "hour")
+    } else {
+        (seconds / 86400, "day")
+    };
+    let suffix = if value == 1 { "" } else { "s" };
+    format!("{} {}{} ago", value, unit, suffix)
 }
 
 #[cfg(test)]
@@ -151,24 +157,34 @@ mod tests {
     /// Durations under 60 seconds are shown as seconds.
     #[test]
     fn format_elapsed_under_a_minute() {
-        assert_eq!(format_elapsed(45), "45 second(s) ago");
+        assert_eq!(format_elapsed(45), "45 seconds ago");
+        assert_eq!(format_elapsed(1), "1 second ago");
     }
 
     /// Durations between 60 s and 3600 s are shown as minutes.
     #[test]
     fn format_elapsed_minutes() {
-        assert_eq!(format_elapsed(120), "2 minute(s) ago");
+        assert_eq!(format_elapsed(120), "2 minutes ago");
+        assert_eq!(format_elapsed(60), "1 minute ago");
     }
 
     /// Durations between 3600 s and 86400 s are shown as hours.
     #[test]
     fn format_elapsed_hours() {
-        assert_eq!(format_elapsed(7200), "2 hour(s) ago");
+        assert_eq!(format_elapsed(7200), "2 hours ago");
+        assert_eq!(format_elapsed(3600), "1 hour ago");
     }
 
     /// Durations of 86400 s or more are shown as days.
     #[test]
     fn format_elapsed_days() {
-        assert_eq!(format_elapsed(172_800), "2 day(s) ago");
+        assert_eq!(format_elapsed(172_800), "2 days ago");
+        assert_eq!(format_elapsed(86_400), "1 day ago");
+    }
+
+    /// Clock skew or future-dated records are described without a negative age.
+    #[test]
+    fn format_elapsed_future_timestamp() {
+        assert_eq!(format_elapsed(-1), "in the future");
     }
 }

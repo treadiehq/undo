@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod activity;
+mod agent_events;
 mod ask;
 mod cli;
 mod daemon;
@@ -16,8 +17,10 @@ mod integrity;
 mod logging;
 mod models;
 mod recover;
+mod recoveries;
 mod restore;
 mod retention;
+mod runs;
 mod sessions;
 mod snapshots;
 mod update;
@@ -161,7 +164,7 @@ pub fn safe_resolve_path(
         || (resolved_str.len() > root_str.len() && resolved_str.as_bytes()[root_str.len()] != b'/')
     {
         anyhow::bail!(
-            "path '{}' resolves outside the project root ({})",
+            "Cannot use '{}': it resolves outside the project root ({}).",
             path_str,
             project_root,
         );
@@ -172,7 +175,9 @@ pub fn safe_resolve_path(
 
 pub fn find_project(db: &db::Database, cwd: &Path) -> Result<models::WatchedProject> {
     db.find_project_for_path(cwd)?.ok_or_else(|| {
-        anyhow::anyhow!("no project is being watched for this directory.\nRun `undo start` first.")
+        anyhow::anyhow!(
+            "Undo is not recording file changes for this folder.\nStart recording with: undo start"
+        )
     })
 }
 
@@ -205,6 +210,16 @@ fn event_color(event_type: &str) -> &'static str {
         "DELETED" => RED,
         "RENAMED" => BLUE,
         _ => "",
+    }
+}
+
+fn event_label(event_type: &str) -> &str {
+    match event_type {
+        "MODIFIED" => "Modified",
+        "CREATED" => "Created",
+        "DELETED" => "Deleted",
+        "RENAMED" => "Renamed",
+        other => other,
     }
 }
 
@@ -253,7 +268,12 @@ fn main() {
             deleted,
             yes,
         ),
-        cli::Command::Checkpoint { name } => activity::cmd_checkpoint(&name),
+        cli::Command::Checkpoint {
+            name,
+            intent,
+            run,
+            json,
+        } => activity::cmd_checkpoint_for(&name, intent.as_deref(), run.as_deref(), json),
         cli::Command::Checkpoints => activity::cmd_checkpoints(),
         cli::Command::Deleted { limit } => activity::cmd_deleted(limit),
         cli::Command::RestoreDeleted { path } => restore::cmd_restore_deleted(&path),
@@ -261,18 +281,105 @@ fn main() {
             restore_before_latest_burst,
             yes,
         } => activity::cmd_panic(restore_before_latest_burst, yes),
+        cli::Command::Run { command } => match command {
+            cli::RunCommand::Start {
+                name,
+                actor,
+                agent,
+                intent,
+                external_id,
+                json,
+            } => runs::cmd_run_start(
+                runs::StartRunOptions {
+                    name: name.as_deref(),
+                    actor: actor.as_deref(),
+                    agent: agent.as_deref(),
+                    command: None,
+                    intent: intent.as_deref(),
+                    external_id: external_id.as_deref(),
+                },
+                if json {
+                    runs::Output::Json
+                } else {
+                    runs::Output::Text
+                },
+            )
+            .map(|_| ()),
+            cli::RunCommand::Stop {
+                reference,
+                status,
+                json,
+            } => runs::cmd_run_stop(
+                reference.as_deref(),
+                &status,
+                if json {
+                    runs::Output::Json
+                } else {
+                    runs::Output::Text
+                },
+            )
+            .map(|_| ()),
+            cli::RunCommand::Show { reference, json } => runs::cmd_run_show(
+                &reference,
+                if json {
+                    runs::Output::Json
+                } else {
+                    runs::Output::Text
+                },
+            ),
+            cli::RunCommand::List { json } => runs::cmd_runs(if json {
+                runs::Output::Json
+            } else {
+                runs::Output::Text
+            }),
+            cli::RunCommand::Exec {
+                agent,
+                name,
+                intent,
+                command,
+            } => runs::cmd_run_command(
+                &command,
+                agent.as_deref(),
+                name.as_deref(),
+                intent.as_deref(),
+            )
+            .and_then(|code| {
+                if code == 0 {
+                    Ok(())
+                } else {
+                    anyhow::bail!("Command exited with code {}", code)
+                }
+            }),
+            cli::RunCommand::External(command) => {
+                runs::cmd_run_shorthand(command).and_then(|code| {
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("Command exited with code {}", code)
+                    }
+                })
+            }
+        },
+        cli::Command::Runs { json } => runs::cmd_runs(if json {
+            runs::Output::Json
+        } else {
+            runs::Output::Text
+        }),
+        cli::Command::Apply { recovery } => recoveries::cmd_apply(&recovery),
+        cli::Command::Event { json } => agent_events::cmd_event(json.as_deref()),
         cli::Command::Session { command } => match command {
             cli::SessionCommand::Start { name } => sessions::cmd_session_start(&name),
             cli::SessionCommand::Stop => sessions::cmd_session_stop(),
             cli::SessionCommand::Show { name } => sessions::cmd_session_show(&name),
         },
-        cli::Command::Sessions => sessions::cmd_sessions(),
+        cli::Command::Sessions => runs::cmd_runs(runs::Output::Text),
         cli::Command::Recover(args) => {
-            recover::cmd_recover(&args.session, args.group.as_deref(), args.preview, args.yes)
+            recover::cmd_recover(&args.run, args.group.as_deref(), args.preview, args.yes)
         }
-        cli::Command::Ask(args) => {
-            ask::cmd_ask(&args.query, args.session.as_deref(), args.apply, args.yes)
-        }
+        cli::Command::Ask(args) => match args.resolve() {
+            Ok((run, query)) => ask::cmd_ask(query, run, args.apply, args.yes),
+            Err(error) => Err(anyhow::anyhow!(error)),
+        },
         cli::Command::Status => daemon::cmd_status(),
         cli::Command::Stop { all } => daemon::cmd_stop(all),
         cli::Command::Prune { keep, dry_run } => cmd_prune(keep, dry_run),
@@ -310,18 +417,23 @@ fn cmd_prune(keep: Option<String>, dry_run: bool) -> Result<()> {
     let stats = retention::prune(&db, project.id, &config, dry_run)?;
 
     println!(
-        "{} {} events, {} saved copies, {} backups.",
+        "{} {} file changes, {} saved versions, {} backups.",
         label, stats.events_deleted, stats.snapshots_deleted, stats.backups_deleted,
     );
 
     let usage = retention::total_disk_usage()?;
     println!(
-        "Freed {}. Current storage: {}.",
+        "{} {}. Current storage: {}.",
+        freed_label(dry_run),
         retention::format_size(stats.bytes_freed),
         retention::format_size(usage),
     );
 
     Ok(())
+}
+
+fn freed_label(dry_run: bool) -> &'static str {
+    if dry_run { "Would free" } else { "Freed" }
 }
 
 // ── what-changed ────────────────────────────────────────────────────
@@ -356,13 +468,13 @@ fn cmd_what_changed(duration_str: &str) -> Result<()> {
         grouped.entry(etype.clone()).or_default().push(path.clone());
     }
 
-    println!("{}Changes in last {}{}", BOLD, duration_str, RESET);
+    println!("{}File changes in the last {}{}", BOLD, duration_str, RESET);
     println!();
 
     for etype in &["MODIFIED", "CREATED", "DELETED", "RENAMED"] {
         if let Some(paths) = grouped.get(*etype) {
             let color = event_color(etype);
-            println!("{}{}{}", color, etype, RESET);
+            println!("{}{}{}", color, event_label(etype), RESET);
             let mut sorted = paths.clone();
             sorted.sort();
             for path in &sorted {
@@ -513,6 +625,21 @@ mod tests {
         assert_eq!(event_color("RENAMED"), BLUE);
         // Unknown types should return an empty string (no color).
         assert_eq!(event_color("UNKNOWN"), "");
+    }
+
+    #[test]
+    fn event_labels_are_plain_language_without_changing_stored_values() {
+        assert_eq!(event_label("MODIFIED"), "Modified");
+        assert_eq!(event_label("CREATED"), "Created");
+        assert_eq!(event_label("DELETED"), "Deleted");
+        assert_eq!(event_label("RENAMED"), "Renamed");
+        assert_eq!(event_label("CUSTOM"), "CUSTOM");
+    }
+
+    #[test]
+    fn dry_run_reports_space_it_would_free() {
+        assert_eq!(freed_label(true), "Would free");
+        assert_eq!(freed_label(false), "Freed");
     }
 
     /// to_hex produces lowercase, zero-padded, two-chars-per-byte output —

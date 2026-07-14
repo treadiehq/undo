@@ -1,14 +1,14 @@
 [package]
 name = "undo"
-version = "0.1.17"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Give your files an undo button"
+description = "Preview and undo file changes from coding agents"
 repository = "https://github.com/treadiehq/undo"
 homepage = "https://github.com/treadiehq/undo"
 readme = "README.md"
 license-file = "LICENSE"
-keywords = ["filesystem", "history", "snapshot", "restore", "undo"]
+keywords = ["ai", "agent", "recovery", "filesystem", "undo"]
 categories = ["command-line-utilities", "filesystem", "development-tools"]
 
 [dependencies]
@@ -29,3 +29,5 @@ ignore = "0.4.25"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
+serde_json = "1.0.150"
+diffy = "0.5.0"

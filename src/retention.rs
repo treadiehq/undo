@@ -300,9 +300,9 @@ pub fn prune(
             }
             if current > max_bytes {
                 eprintln!(
-                    "{}warning:{} disk usage ({}) still exceeds cap ({}) — \
-                     remaining snapshots are referenced by live events. \
-                     Consider increasing max_size_mb in .undorc or ~/.undo/config.toml.",
+                    "{}warning:{} Saved versions still needed: storage is {} (limit {}). \
+                     Undo kept the remaining versions because recorded file changes still reference them. \
+                     Increase max_size_mb in .undorc or ~/.undo/config.toml to keep them without exceeding the limit.",
                     crate::YELLOW,
                     crate::RESET,
                     format_size(current),

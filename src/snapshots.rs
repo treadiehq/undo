@@ -2,12 +2,17 @@ use anyhow::Result;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const MAX_SNAPSHOT_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+pub const MAX_SNAPSHOT_SIZE: usize = 100 * 1024 * 1024; // 100 MiB
+
+pub fn hash_bytes(content: &[u8]) -> String {
+    crate::to_hex(&Sha256::digest(content))
+}
 
 /// Process-wide counter giving each in-flight temp file a unique name, so the
 /// parallel initial scan can have several workers writing distinct snapshots
@@ -124,15 +129,26 @@ pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 /// Caps decompressed output at `MAX_SNAPSHOT_SIZE` to prevent gzip bombs.
 pub fn load(project_id: i64, hash: &str) -> Result<Vec<u8>> {
     let path = snapshot_path(project_id, hash)?;
-    let file = fs::File::open(&path)
-        .map_err(|e| anyhow::anyhow!("snapshot not found ({}): {}", hash, e))?;
+    let file = fs::File::open(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "Saved version is missing: snapshot not found ({}): {}",
+            hash,
+            e
+        )
+    })?;
     let decoder = GzDecoder::new(file);
     let mut content = Vec::with_capacity(8192);
     let limit = MAX_SNAPSHOT_SIZE as u64 + 1;
-    let n = decoder.take(limit).read_to_end(&mut content)?;
+    let n = decoder.take(limit).read_to_end(&mut content).map_err(|e| {
+        anyhow::anyhow!(
+            "Saved version is unreadable: could not decompress snapshot {}: {}",
+            hash,
+            e
+        )
+    })?;
     if n as u64 >= limit {
         anyhow::bail!(
-            "snapshot {} decompresses beyond {} limit — refusing to load",
+            "Saved version is unreadable: snapshot {} decompresses beyond the {}-byte limit",
             hash,
             MAX_SNAPSHOT_SIZE,
         );
@@ -198,7 +214,28 @@ mod tests {
         let result = load(1, "this_hash_does_not_exist_xyz");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
+        assert!(msg.starts_with("Saved version is missing"), "got: {}", msg);
         assert!(msg.contains("snapshot not found"), "got: {}", msg);
+    }
+
+    /// A snapshot that cannot be decompressed names the user-facing problem first
+    /// and keeps the hash and decompression error as diagnostics.
+    #[test]
+    fn load_corrupt_snapshot_leads_with_unreadable_version() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+
+        let path = snapshot_path(1, "corrupt_hash").unwrap();
+        fs::write(path, b"not a gzip stream").unwrap();
+
+        let msg = load(1, "corrupt_hash").unwrap_err().to_string();
+        assert!(
+            msg.starts_with("Saved version is unreadable"),
+            "got: {}",
+            msg
+        );
+        assert!(msg.contains("corrupt_hash"), "got: {}", msg);
+        assert!(msg.contains("decompress"), "got: {}", msg);
     }
 
     /// count() reflects the number of distinct saved snapshots and is unaffected by deduplication.

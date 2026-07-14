@@ -1,11 +1,13 @@
-#[derive(Clone, Debug)]
+use serde::Serialize;
+
+#[derive(Clone, Debug, Serialize)]
 pub struct WatchedProject {
     pub id: i64,
     pub root_path: String,
     pub created_at: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FileEvent {
     pub id: i64,
     pub project_id: i64,
@@ -19,7 +21,7 @@ pub struct FileEvent {
     pub file_size: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FileState {
     pub id: i64,
     pub project_id: i64,
@@ -35,24 +37,104 @@ pub struct FileState {
     pub mtime_nanos: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Checkpoint {
     pub id: i64,
     pub project_id: i64,
+    pub run_id: Option<i64>,
     pub name: String,
     pub timestamp: i64,
+    pub event_id: Option<i64>,
+    pub intent: Option<String>,
     pub created_at: i64,
 }
 
-#[derive(Clone, Debug)]
-pub struct Session {
+impl Checkpoint {
+    pub fn public_id(&self) -> String {
+        format!("cp_{}", self.id)
+    }
+}
+
+/// A bounded period of work. The table is still named `sessions` on disk so
+/// existing installations migrate additively without rewriting their history.
+#[derive(Clone, Debug, Serialize)]
+pub struct Run {
     pub id: i64,
     pub project_id: i64,
     pub name: String,
     pub kind: String,
+    pub actor: String,
+    pub agent: Option<String>,
+    pub command: Option<String>,
+    pub intent: Option<String>,
+    pub external_id: Option<String>,
+    pub status: String,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub start_event_id: i64,
     pub end_event_id: Option<i64>,
     pub created_at: i64,
+}
+
+impl Run {
+    pub fn public_id(&self) -> String {
+        format!("r_{}", self.id)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.ended_at.is_none()
+    }
+}
+
+/// Compatibility name for the pre-Run public API.
+pub type Session = Run;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RunIntent {
+    pub id: i64,
+    pub run_id: i64,
+    pub label: String,
+    pub status: String,
+    pub start_event_id: i64,
+    pub end_event_id: Option<i64>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+impl RunIntent {
+    pub fn public_id(&self) -> String {
+        format!("i_{}", self.id)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Recovery {
+    pub id: i64,
+    pub project_id: i64,
+    pub run_id: Option<i64>,
+    pub request: String,
+    pub kind: String,
+    pub status: String,
+    pub confidence: String,
+    pub ambiguity: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub applied_at: Option<i64>,
+}
+
+impl Recovery {
+    pub fn public_id(&self) -> String {
+        format!("rec_{}", self.id)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveryEntry {
+    pub recovery_id: i64,
+    pub path: String,
+    pub action: String,
+    pub target_hash: Option<String>,
+    pub source_timestamp: Option<i64>,
+    pub expected_hash: Option<String>,
+    pub expected_exists: bool,
 }

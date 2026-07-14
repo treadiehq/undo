@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 
 use crate::db::Database;
 use crate::groups::{self, ChangeGroup};
-use crate::models::{Session, WatchedProject};
-use crate::{BOLD, DIM, GREEN, RESET, YELLOW, find_project, restore};
+use crate::models::{RunIntent, Session, WatchedProject};
+use crate::{BOLD, DIM, GREEN, RESET, YELLOW, find_project, recoveries};
 
 #[derive(Debug)]
 struct AskIntent {
@@ -23,62 +23,131 @@ struct AskProposal {
 
 pub fn cmd_ask(query: &str, session_name: Option<&str>, apply: bool, yes: bool) -> Result<()> {
     if apply && !yes {
-        anyhow::bail!("ask --apply requires --yes");
+        anyhow::bail!(
+            "No files changed: --yes is required to apply a recovery plan.\nPreview first, then rerun with --apply --yes to give Undo permission to change files."
+        );
     }
 
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
-    let session = resolve_session(&db, project.id, session_name)?;
+    let session = resolve_run(&db, project.id, session_name)?;
+    if session.is_active() {
+        anyhow::bail!(
+            "No recovery plan was created because Run {} is still active.\nFinish the Run, then try again.",
+            session.public_id(),
+        );
+    }
     let events = db.get_session_events(&session)?;
     if events.is_empty() {
-        println!("No events recorded for session '{}'.", session.name);
+        println!("Run {} has no recorded file changes.", session.public_id());
+        return Ok(());
+    }
+
+    let intents = db.list_run_intents(session.id)?;
+    if let Some(intent) = match_explicit_intent(query, &intents) {
+        println!(
+            "{}Matched your request to a completed task boundary.{}",
+            BOLD, RESET
+        );
+        println!("Run:     {} ({})", session.public_id(), session.name);
+        println!("Request: {}", query);
+        println!("Task:    {} ({})", intent.label, intent.public_id());
+        println!();
+        let recovery = recoveries::create_intent_recovery(&session, intent, query)?;
+        if apply {
+            recoveries::cmd_apply(&recovery.public_id())?;
+        }
         return Ok(());
     }
 
     let groups = groups::build_groups(&project, &events);
     if groups.is_empty() {
-        println!("No change groups found for session '{}'.", session.name);
+        println!(
+            "Run {} has no recoverable groups of file changes.",
+            session.public_id()
+        );
         return Ok(());
     }
 
     let proposal = build_proposal(query, session, &project, &groups)?;
-    print_proposal(query, &proposal, apply);
+    print_proposal(query, &proposal);
 
     if proposal.revert_groups.is_empty() {
         println!();
         println!(
-            "No matching rollback target found. Run `undo session show {}` to inspect group ids.",
-            proposal.session.name
+            "No file changes matched your request.\nInspect this Run with: undo run show {}",
+            proposal.session.public_id()
         );
         return Ok(());
     }
 
     if !apply {
-        println!();
-        println!(
-            "Apply command: undo ask {:?} --session {} --apply --yes",
-            query, proposal.session.name
-        );
+        let paths = groups::all_group_paths(&proposal.revert_groups);
+        recoveries::create_run_recovery(
+            &proposal.session,
+            &paths,
+            query,
+            "intent-fallback",
+            "path-match",
+            None,
+        )?;
         return Ok(());
     }
 
     let paths = groups::all_group_paths(&proposal.revert_groups);
-    let label = format!("ask proposal for session '{}'", proposal.session.name);
-    restore::restore_paths_at_session_start(&paths, &proposal.session, &label, false, yes)
+    let recovery = recoveries::create_run_recovery(
+        &proposal.session,
+        &paths,
+        query,
+        "intent-fallback",
+        "path-match",
+        None,
+    )?;
+    recoveries::cmd_apply(&recovery.public_id())
 }
 
-fn resolve_session(db: &Database, project_id: i64, name: Option<&str>) -> Result<Session> {
+fn resolve_run(db: &Database, project_id: i64, name: Option<&str>) -> Result<Session> {
     if let Some(name) = name {
         return db
-            .get_session_by_name(project_id, name)?
-            .ok_or_else(|| anyhow::anyhow!("session '{}' not found", name));
+            .get_run_by_ref(project_id, name)?
+            .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", name));
     }
 
     db.list_sessions(project_id)?
         .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no sessions found. Run `undo session start <name>` first."))
+        .find(|run| !run.is_active())
+        .ok_or_else(|| {
+            anyhow::anyhow!("No completed Runs are available.\nStart one with: undo run claude")
+        })
+}
+
+fn match_explicit_intent<'a>(query: &str, intents: &'a [RunIntent]) -> Option<&'a RunIntent> {
+    let query_terms = important_terms(query);
+    let mut matches = intents
+        .iter()
+        .filter(|intent| intent.end_event_id.is_some())
+        .filter_map(|intent| {
+            let normalized = normalize(&intent.label);
+            let compact_label = compact(&normalized);
+            let score = query_terms.iter().fold(0usize, |score, term| {
+                score
+                    + if normalized.split_whitespace().any(|part| part == term) {
+                        5
+                    } else if compact_label.contains(&compact(term)) {
+                        2
+                    } else {
+                        0
+                    }
+            });
+            (score > 0).then_some((score, intent))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    match matches.as_slice() {
+        [(score, intent), ..] if matches.get(1).is_none_or(|next| *score > next.0) => Some(*intent),
+        _ => None,
+    }
 }
 
 fn build_proposal(
@@ -88,8 +157,8 @@ fn build_proposal(
     groups: &[ChangeGroup],
 ) -> Result<AskProposal> {
     let intent = parse_intent(query);
-    let keep_groups = select_groups(groups, project, &intent.keep_terms);
-    let keep_ids = keep_groups
+    let requested_keep_groups = select_groups(groups, project, &intent.keep_terms);
+    let keep_ids = requested_keep_groups
         .iter()
         .map(|group| group.id.as_str())
         .collect::<BTreeSet<_>>();
@@ -100,6 +169,15 @@ fn build_proposal(
         select_groups(groups, project, &intent.revert_terms)
     };
     revert_groups.retain(|group| !keep_ids.contains(group.id.as_str()));
+    let revert_ids = revert_groups
+        .iter()
+        .map(|group| group.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let keep_groups = groups
+        .iter()
+        .filter(|group| !revert_ids.contains(group.id.as_str()))
+        .cloned()
+        .collect();
 
     let matched_terms = matched_terms(groups, project, &intent);
     let requested_terms = intent
@@ -221,16 +299,23 @@ fn compact(input: &str) -> String {
         .collect()
 }
 
-fn print_proposal(query: &str, proposal: &AskProposal, apply: bool) {
-    println!("{}undo ask{} — rollback proposal", BOLD, RESET);
-    println!("Query:   {}", query);
-    println!("Session: {}", proposal.session.name);
+fn print_proposal(query: &str, proposal: &AskProposal) {
+    println!(
+        "{}Checked this Run for matching file changes.{}",
+        BOLD, RESET
+    );
+    println!(
+        "Run:     {} ({})",
+        proposal.session.public_id(),
+        proposal.session.name
+    );
+    println!("Request: {}", query);
     println!();
 
     if proposal.revert_groups.is_empty() {
-        println!("{}Would revert{} nothing yet.", YELLOW, RESET);
+        println!("{}Would undo:{} no matching file changes", YELLOW, RESET);
     } else {
-        println!("{}Would revert{}", YELLOW, RESET);
+        println!("{}Would undo{}", YELLOW, RESET);
         for group in &proposal.revert_groups {
             print_group(group);
         }
@@ -247,7 +332,7 @@ fn print_proposal(query: &str, proposal: &AskProposal, apply: bool) {
     if !proposal.unmatched_terms.is_empty() {
         println!();
         println!(
-            "{}Unmatched terms{}: {}",
+            "{}Words not matched to files{}: {}",
             DIM,
             RESET,
             proposal.unmatched_terms.join(", ")
@@ -255,31 +340,27 @@ fn print_proposal(query: &str, proposal: &AskProposal, apply: bool) {
     }
 
     println!();
-    if apply {
-        println!("Applying proposal because --apply --yes was provided.");
-    } else {
-        println!("No files changed. Add --apply --yes to apply this proposal.");
-    }
+    println!("No files changed.");
 }
 
 fn print_group(group: &ChangeGroup) {
     println!(
-        "  {}{}{} {} - {} file(s), {} event(s), +{} -{}",
-        DIM,
-        group.id,
-        RESET,
+        "  {} — {} files, {} recorded changes, +{} -{} {}({}){}",
         group.label,
         group.paths.len(),
         group.event_count,
         group.inserted,
-        group.deleted
+        group.deleted,
+        DIM,
+        group.id,
+        RESET
     );
 }
 
 fn contains_all_intent(input: &str) -> bool {
     input
         .split_whitespace()
-        .any(|word| matches!(word, "all" | "everything" | "session"))
+        .any(|word| matches!(word, "all" | "everything"))
 }
 
 fn important_terms(input: &str) -> Vec<String> {
@@ -330,6 +411,7 @@ fn is_stopword(word: &str) -> bool {
             | "those"
             | "undo"
             | "revert"
+            | "remove"
             | "rollback"
             | "roll"
             | "back"
@@ -350,6 +432,9 @@ fn is_stopword(word: &str) -> bool {
             | "for"
             | "with"
             | "new"
+            | "only"
+            | "please"
+            | "work"
             | "change"
             | "changes"
             | "improvement"
@@ -378,6 +463,12 @@ mod tests {
             project_id: 1,
             name: "agent-auth-work".to_string(),
             kind: "manual".to_string(),
+            actor: "agent".to_string(),
+            agent: Some("Test Agent".to_string()),
+            command: None,
+            intent: None,
+            external_id: None,
+            status: "completed".to_string(),
             started_at: 100,
             ended_at: Some(200),
             start_event_id: 10,
@@ -414,6 +505,13 @@ mod tests {
         assert!(intent.revert_terms.contains(&"auth".to_string()));
         assert!(intent.keep_terms.contains(&"security".to_string()));
         assert!(!intent.revert_all);
+    }
+
+    #[test]
+    fn mentioning_session_does_not_expand_to_full_run_recovery() {
+        let intent = parse_intent("remove the session storage work");
+        assert!(!intent.revert_all);
+        assert!(intent.revert_terms.contains(&"storage".to_string()));
     }
 
     /// Clause keywords inside hyphenated group ids are target words, not

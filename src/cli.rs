@@ -11,8 +11,9 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 #[derive(Parser)]
 #[command(
     name = "undo",
-    about = "undo: give your files an undo button",
-    long_about = "See what changed, compare versions, and restore files when something goes wrong."
+    version,
+    about = "Preview and undo file changes from coding agents",
+    long_about = "Record file changes, review what the agent did, and safely restore unwanted work."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,22 +26,22 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start saving history for the current folder
+    /// Start recording file changes in the current folder
     Start {
-        /// Skip safety checks (ownership, file-count limit)
+        /// Bypass ownership, file-count, and overlap safety checks
         #[arg(long)]
         force: bool,
     },
 
-    /// Show recent file activity
+    /// Show recent file changes
     Timeline {
-        /// Maximum number of events to show (minimum 1)
+        /// Maximum number of file changes to show (minimum 1)
         #[arg(long, default_value = "20", value_parser = parse_positive_usize)]
         limit: usize,
-        /// Show events since a duration ago (e.g. 2h, 1d)
+        /// Show changes since a duration ago (e.g. 2h, 1d)
         #[arg(long)]
         since: Option<String>,
-        /// Highlight rapid change bursts
+        /// Highlight rapid groups of file changes
         #[arg(long)]
         bursts: bool,
         /// Show only deleted-file activity
@@ -71,17 +72,17 @@ pub enum Command {
         stat: bool,
     },
 
-    /// Preview a restore without writing files
+    /// Preview how restoring an earlier version would change files
     Preview {
-        /// File or directory path to preview
+        /// File or folder to preview
         path: String,
         /// How far back to preview from (e.g. 10m, 1h)
         duration: String,
     },
 
-    /// Bring back an older version of a file
+    /// Restore a file or folder to an earlier version
     Restore {
-        /// File or directory path to restore
+        /// File or folder to restore
         path: Option<String>,
         /// How far back to restore from (e.g. 10m, 1h)
         duration: Option<String>,
@@ -101,19 +102,28 @@ pub enum Command {
         /// Recover the latest deleted version of this path
         #[arg(long)]
         deleted: bool,
-        /// Required for multi-file restores
+        /// Allow Undo to change files in a multi-file restore
         #[arg(long)]
         yes: bool,
     },
 
-    /// Create a named checkpoint for the current project
+    /// Save a named point in history
     #[command(visible_alias = "mark")]
     Checkpoint {
         /// Checkpoint name
         name: String,
+        /// Optional note describing this checkpoint
+        #[arg(long)]
+        intent: Option<String>,
+        /// Run id or name to associate; defaults to the active Run
+        #[arg(long)]
+        run: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
 
-    /// List checkpoints for the current project
+    /// List saved checkpoints for the current folder
     #[command(visible_alias = "marks")]
     Checkpoints,
 
@@ -130,47 +140,79 @@ pub enum Command {
         path: String,
     },
 
-    /// Show a guided recovery dashboard
+    /// Show a read-only emergency recovery summary
     Panic {
         /// Apply the suggested restore before the latest burst
         #[arg(long, visible_alias = "undo-burst")]
         restore_before_latest_burst: bool,
-        /// Required with --restore-before-latest-burst
+        /// Allow Undo to change files for the emergency restore
         #[arg(long)]
         yes: bool,
     },
 
-    /// Start, stop, and inspect semantic rollback sessions
+    /// Record and inspect agent or command work
+    #[command(
+        after_help = "Examples:\n  undo run claude\n  undo run codex -- --full-auto\n  undo run start --agent \"Claude Code\" --intent \"Redesign dashboard\"\n  undo run show r_421"
+    )]
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+
+    /// List recorded work
+    Runs {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Apply an exact saved recovery plan
+    Apply {
+        /// Saved recovery plan id, e.g. rec_812
+        recovery: String,
+    },
+
+    /// Accept one versioned agent lifecycle event as JSON
+    #[command(
+        after_help = "Examples:\n  printf '%s' '{\"version\":1,\"event\":\"run_started\",\"idempotency_key\":\"task-42-start\",\"agent\":\"Claude Code\"}' | undo event\n  undo event --json '{\"version\":1,\"event\":\"run_completed\",\"idempotency_key\":\"task-42-end\",\"run_id\":\"r_421\"}'"
+    )]
+    Event {
+        /// Inline JSON; when omitted, one JSON object is read from stdin
+        #[arg(long, value_name = "OBJECT")]
+        json: Option<String>,
+    },
+
+    /// Compatibility alias for the pre-Run session commands
     Session {
         #[command(subcommand)]
         command: SessionCommand,
     },
 
-    /// List semantic rollback sessions
+    /// Compatibility alias for `undo runs`
     Sessions,
 
-    /// Preview or apply recovery for a session or change group
+    /// Preview or apply recovery for a Run or group of file changes
     Recover(RecoverArgs),
 
-    /// Turn rollback intent into a preview-first recovery proposal
+    /// Describe unwanted work and preview a recovery plan
     Ask(AskArgs),
 
-    /// Show whether Undo is running and how much space it uses
+    /// Show recording health and storage use
     Status,
 
-    /// Stop saving history
+    /// Stop recording file changes
     Stop {
         /// Stop Undo in every watched folder
         #[arg(long)]
         all: bool,
     },
 
-    /// Delete old saved history
+    /// Delete old saved versions
     Prune {
         /// Keep this much history for this cleanup run (e.g. 30d, 12h)
         #[arg(long)]
         keep: Option<String>,
-        /// Show what would be deleted without deleting it
+        /// Show what would be deleted and freed without changing anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -181,55 +223,135 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum SessionCommand {
-    /// Start a named recovery session
+    /// Start a named Run
     Start {
         /// Session name, e.g. agent-auth-work
         name: String,
     },
-    /// Stop the active recovery session
+    /// Finish the active Run
     Stop,
-    /// Show one recovery session and its change groups
+    /// Show one Run and its groups of file changes
     Show {
         /// Session name
         name: String,
     },
 }
 
+#[derive(Subcommand)]
+pub enum RunCommand {
+    /// Start recording a Run without launching a command
+    Start {
+        /// Optional human-readable name
+        #[arg(long)]
+        name: Option<String>,
+        /// Actor type: human, agent, tool, or mixed
+        #[arg(long)]
+        actor: Option<String>,
+        /// Agent identity, e.g. Claude Code
+        #[arg(long)]
+        agent: Option<String>,
+        /// Optional note describing this Run
+        #[arg(long)]
+        intent: Option<String>,
+        /// External integration id
+        #[arg(long)]
+        external_id: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Finish the active Run
+    Stop {
+        /// Run id or legacy name; defaults to the active Run
+        reference: Option<String>,
+        /// Final status: completed, failed, or aborted
+        #[arg(long, default_value = "completed")]
+        status: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one Run, its checkpoints, task markers, and file changes
+    Show {
+        /// Run id or legacy name
+        reference: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recorded work
+    List {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute an arbitrary command inside a Run
+    Exec {
+        /// Override inferred agent identity
+        #[arg(long)]
+        agent: Option<String>,
+        /// Optional human-readable Run name
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional note describing this Run
+        #[arg(long)]
+        intent: Option<String>,
+        /// Command and arguments after `--`
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Shorthand: an unknown subcommand is executed as the Run command
+    #[command(external_subcommand)]
+    External(Vec<String>),
+}
+
 #[derive(Args)]
 pub struct RecoverArgs {
-    /// Session name to recover from
-    #[arg(long)]
-    pub session: String,
-    /// Optional group id to recover instead of the whole session
+    /// Run id or legacy name to recover from
+    #[arg(long, visible_alias = "session")]
+    pub run: String,
+    /// Optional file-change group to recover instead of the whole Run
     #[arg(long)]
     pub group: Option<String>,
-    /// Preview the recovery plan without writing files
+    /// Preview the recovery plan without changing files
     #[arg(long)]
     pub preview: bool,
-    /// Required to apply a recovery plan
+    /// Allow Undo to change files using the saved recovery plan
     #[arg(long)]
     pub yes: bool,
 }
 
 #[derive(Args)]
 pub struct AskArgs {
-    /// Natural-language rollback request
-    pub query: String,
-    /// Session name to search. Defaults to the latest session.
-    #[arg(long)]
-    pub session: Option<String>,
-    /// Apply the proposal. Without this, ask only previews.
+    /// Either QUERY, or RUN_ID followed by QUERY
+    #[arg(required = true, num_args = 1..=2)]
+    pub input: Vec<String>,
+    /// Run id or legacy name. Defaults to the latest completed Run.
+    #[arg(long, visible_alias = "session")]
+    pub run: Option<String>,
+    /// Apply the saved plan; without this, ask only previews
     #[arg(long)]
     pub apply: bool,
-    /// Required with --apply
+    /// Allow Undo to change files with --apply
     #[arg(long)]
     pub yes: bool,
+}
+
+impl AskArgs {
+    pub fn resolve(&self) -> Result<(Option<&str>, &str), String> {
+        match self.input.as_slice() {
+            [query] => Ok((self.run.as_deref(), query)),
+            [run, query] if self.run.is_none() => Ok((Some(run), query)),
+            [_, _] => Err("use either positional RUN_ID or --run, not both".to_string()),
+            _ => Err("ask requires QUERY, optionally preceded by RUN_ID".to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn parses_timeline_recovery_flags() {
@@ -421,7 +543,7 @@ mod tests {
 
         match cli.command {
             Command::Recover(args) => {
-                assert_eq!(args.session, "agent-auth-work");
+                assert_eq!(args.run, "agent-auth-work");
                 assert_eq!(args.group.as_deref(), Some("auth"));
                 assert!(args.preview);
                 assert!(!args.yes);
@@ -443,8 +565,9 @@ mod tests {
 
         match cli.command {
             Command::Ask(args) => {
-                assert_eq!(args.query, "undo the auth refactor but keep security");
-                assert_eq!(args.session.as_deref(), Some("agent-auth-work"));
+                let (run, query) = args.resolve().unwrap();
+                assert_eq!(query, "undo the auth refactor but keep security");
+                assert_eq!(run, Some("agent-auth-work"));
                 assert!(!args.apply);
                 assert!(!args.yes);
             }
@@ -465,12 +588,100 @@ mod tests {
 
         match cli.command {
             Command::Ask(args) => {
-                assert_eq!(args.query, "revert everything except bug fixes");
-                assert!(args.session.is_none());
+                let (run, query) = args.resolve().unwrap();
+                assert_eq!(query, "revert everything except bug fixes");
+                assert!(run.is_none());
                 assert!(args.apply);
                 assert!(args.yes);
             }
             _ => panic!("expected ask command"),
         }
+    }
+
+    #[test]
+    fn parses_canonical_run_and_ask_commands() {
+        let cli = Cli::try_parse_from(["undo", "run", "claude"]).unwrap();
+        match cli.command {
+            Command::Run {
+                command: RunCommand::External(command),
+            } => assert_eq!(command, vec!["claude"]),
+            _ => panic!("expected shorthand Run command"),
+        }
+        let cli = Cli::try_parse_from(["undo", "run", "codex", "--", "--full-auto"]).unwrap();
+        match cli.command {
+            Command::Run {
+                command: RunCommand::External(command),
+            } => assert_eq!(command, vec!["codex", "--", "--full-auto"]),
+            _ => panic!("expected shorthand Run command with arguments"),
+        }
+        let cli = Cli::try_parse_from([
+            "undo",
+            "run",
+            "exec",
+            "--",
+            "cargo",
+            "test",
+            "--",
+            "--nocapture",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run {
+                command: RunCommand::Exec { command, .. },
+            } => assert_eq!(command, vec!["cargo", "test", "--", "--nocapture"]),
+            _ => panic!("expected explicit Run command"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["undo", "ask", "r_421", "remove the database migration work"])
+                .unwrap();
+        match cli.command {
+            Command::Ask(args) => {
+                let (run, query) = args.resolve().unwrap();
+                assert_eq!(run, Some("r_421"));
+                assert_eq!(query, "remove the database migration work");
+            }
+            _ => panic!("expected ask command"),
+        }
+    }
+
+    #[test]
+    fn help_explains_file_change_permissions_and_safety_bypasses() {
+        let mut command = Cli::command();
+        let start_help = command
+            .find_subcommand_mut("start")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(start_help.contains("Bypass ownership, file-count, and overlap safety checks"));
+
+        let restore_help = command
+            .find_subcommand_mut("restore")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(restore_help.contains("Allow Undo to change files in a multi-file restore"));
+    }
+
+    #[test]
+    fn metadata_intent_help_does_not_call_it_an_explicit_intent() {
+        let mut command = Cli::command();
+        let checkpoint_help = command
+            .find_subcommand_mut("checkpoint")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(checkpoint_help.contains("Optional note describing this checkpoint"));
+        assert!(!checkpoint_help.contains("explicit intent"));
+
+        let run_help = command
+            .find_subcommand_mut("run")
+            .unwrap()
+            .find_subcommand_mut("start")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(run_help.contains("Optional note describing this Run"));
+        assert!(!run_help.contains("explicit intent"));
     }
 }

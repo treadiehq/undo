@@ -44,7 +44,7 @@ pub fn cmd_diff(
     let event = match diff_event(&db, project.id, &abs_path_str, duration, checkpoint)? {
         Some(e) => e,
         None => {
-            println!("No saved version available for this file.");
+            println!("No saved version matches this selection.");
             return Ok(());
         }
     };
@@ -52,7 +52,7 @@ pub fn cmd_diff(
     let hash = match saved_hash_for_diff(&event) {
         Some(h) => h,
         None => {
-            println!("No saved version available for this file.");
+            println!("No saved version matches this selection.");
             return Ok(());
         }
     };
@@ -60,7 +60,7 @@ pub fn cmd_diff(
     let snapshot_content = snapshots::load(project.id, hash)?;
 
     if is_binary(&snapshot_content) {
-        println!("Binary file — text comparison not available.");
+        println!("The selected saved version is binary, so a text comparison is not available.");
         return Ok(());
     }
 
@@ -69,13 +69,13 @@ pub fn cmd_diff(
     if !abs_path.exists() {
         if event.event_type == "DELETED" {
             println!(
-                "File was deleted. Use {}undo restore{} to recover it.",
-                BOLD, RESET
+                "This file is deleted. Recover it with:\n  {}undo restore-deleted {:?}{}",
+                BOLD, path_str, RESET
             );
             return Ok(());
         }
 
-        println!("File does not exist on disk. Showing last known content.");
+        println!("The current file is missing. Showing the selected saved version.");
         println!();
         for line in snapshot_text.lines() {
             println!(" {}", line);
@@ -95,14 +95,14 @@ pub fn cmd_diff(
     };
 
     if is_binary(&current_content) {
-        println!("Binary file — text comparison not available.");
+        println!("The current file is binary, so a text comparison is not available.");
         return Ok(());
     }
 
     let current_text = String::from_utf8_lossy(&current_content);
 
     if snapshot_text == current_text {
-        println!("No changes since the last saved version.");
+        println!("The current file matches the selected saved version.");
         return Ok(());
     }
 
@@ -133,7 +133,7 @@ fn diff_event(
         }
         (None, Some(name)) => {
             let checkpoint = db
-                .get_checkpoint(project_id, name)?
+                .get_checkpoint_by_ref(project_id, name)?
                 .ok_or_else(|| anyhow::anyhow!("checkpoint '{}' not found", name))?;
             db.get_event_at_time(project_id, path, checkpoint.timestamp)
         }
@@ -150,7 +150,7 @@ pub(crate) fn saved_hash_for_diff(event: &FileEvent) -> Option<&str> {
 }
 
 pub(crate) fn print_unified_diff(old: &str, new: &str, path: &str) {
-    print_unified_diff_with_labels(old, new, path, "saved", "current");
+    print_unified_diff_with_labels(old, new, path, "selected saved", "current");
 }
 
 pub(crate) fn print_unified_diff_with_labels(

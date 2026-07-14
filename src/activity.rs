@@ -22,19 +22,54 @@ struct Burst {
     deleted_count: usize,
 }
 
-pub fn cmd_checkpoint(name: &str) -> Result<()> {
+pub fn cmd_checkpoint_for(
+    name: &str,
+    intent: Option<&str>,
+    run_reference: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
-        anyhow::bail!("checkpoint name cannot be empty");
+        anyhow::bail!("A checkpoint needs a name.");
     }
 
-    let cwd = std::env::current_dir()?.canonicalize()?;
-    let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let (db, project, _) = crate::runs::prepare_project_boundary()?;
+    let run_id = match run_reference {
+        Some(reference) => Some(
+            db.get_run_by_ref(project.id, reference)?
+                .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", reference))?
+                .id,
+        ),
+        None => db.get_active_session(project.id)?.map(|run| run.id),
+    };
     let now = Utc::now().timestamp();
-    db.create_checkpoint(project.id, name, now)?;
+    let event_id = db.max_event_id(project.id)?;
+    let (checkpoint, created) =
+        db.create_checkpoint_at(project.id, run_id, name, now, event_id, intent)?;
 
-    println!("{}Checkpoint saved{} {}", GREEN, RESET, name);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "checkpoint": checkpoint,
+                "checkpoint_id": checkpoint.public_id(),
+                "created": created,
+            }))?
+        );
+    } else if created {
+        println!(
+            "{}Checkpoint saved:{} {} ({})",
+            GREEN,
+            RESET,
+            name,
+            checkpoint.public_id()
+        );
+    } else {
+        println!(
+            "Checkpoint {} already exists at this point; no changes made.",
+            checkpoint.public_id()
+        );
+    }
     Ok(())
 }
 
@@ -46,14 +81,30 @@ pub fn cmd_checkpoints() -> Result<()> {
 
     if checkpoints.is_empty() {
         println!("No checkpoints yet.");
+        println!("Create one with: undo checkpoint <name>");
         return Ok(());
     }
 
-    println!("{}undo{} — checkpoints", BOLD, RESET);
+    println!("{}Checkpoints{}", BOLD, RESET);
     println!();
     for checkpoint in checkpoints {
         let age = duration::format_elapsed(Utc::now().timestamp() - checkpoint.timestamp);
-        println!("{}{}{} {}", DIM, age, RESET, checkpoint.name);
+        println!(
+            "{:<8} {}{}{} {}{}{}",
+            checkpoint.public_id(),
+            DIM,
+            age,
+            RESET,
+            checkpoint.name,
+            checkpoint
+                .run_id
+                .map(|run_id| format!(" (Run r_{})", run_id))
+                .unwrap_or_default(),
+            checkpoint
+                .event_id
+                .map(|event_id| format!(" (change {})", event_id))
+                .unwrap_or_else(|| " (saved by time)".to_string())
+        );
     }
 
     Ok(())
@@ -79,13 +130,13 @@ pub fn cmd_timeline(
     }
 
     if events.is_empty() {
-        println!("No events recorded yet.");
+        println!("No file changes recorded yet.");
         return Ok(());
     }
 
     let bursts = detect_bursts(&events);
 
-    println!("{}undo{} — recent activity", BOLD, RESET);
+    println!("{}Recent file changes{}", BOLD, RESET);
     if show_bursts {
         print_bursts(&bursts);
     }
@@ -120,20 +171,24 @@ pub fn cmd_deleted(limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    println!("{}undo{} — recoverable deleted files", BOLD, RESET);
+    println!("{}Recoverable deleted files{}", BOLD, RESET);
     println!();
     for event in events {
         let age = duration::format_elapsed(Utc::now().timestamp() - event.timestamp);
         let rel = relative_path(&event.path, &project.root_path);
         println!("{}{}{} {}", DIM, age, RESET, rel);
     }
+    println!();
+    println!("Restore one with: undo restore-deleted <path>");
 
     Ok(())
 }
 
 pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
     if restore_before_latest_burst && !yes {
-        anyhow::bail!("panic restore requires --yes");
+        anyhow::bail!(
+            "No files changed: the emergency restore requires --yes.\nRerun with --yes to give Undo permission to change files."
+        );
     }
 
     let cwd = std::env::current_dir()?.canonicalize()?;
@@ -145,24 +200,24 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
 
     if restore_before_latest_burst {
         let Some(latest) = bursts.iter().max_by_key(|b| b.end) else {
-            anyhow::bail!("no recent change burst found to restore before");
+            anyhow::bail!("No recent group of rapid file changes was found.");
         };
         let target = latest.start.saturating_sub(1);
-        return crate::restore::restore_at_timestamp(
+        let recovery = crate::recoveries::create_timestamp_recovery(
             ".",
             target,
-            "before latest burst",
-            false,
-            yes,
-        );
+            "Emergency recovery to before the latest destructive burst",
+            "panic",
+        )?;
+        return crate::recoveries::cmd_apply(&recovery.public_id());
     }
 
-    println!("{}undo panic{} — recovery dashboard", BOLD, RESET);
+    println!("{}Emergency recovery options{}", BOLD, RESET);
     println!();
 
     if let Some(latest) = bursts.iter().max_by_key(|b| b.end) {
         println!(
-            "{}Latest burst{}: {} files, {} events, {} deleted around {}",
+            "{}Latest rapid change group{}: {} files, {} changes, {} deleted around {}",
             YELLOW,
             RESET,
             latest.path_count,
@@ -176,7 +231,7 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
         println!("  Preview: {}", preview_command);
         println!("  Restore: {}", restore_command);
     } else {
-        println!("No large recent change bursts found.");
+        println!("No large group of recent file changes was found.");
     }
 
     let deleted = db.get_deleted_events(project.id, 5)?;
@@ -188,6 +243,7 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
             let age = duration::format_elapsed(Utc::now().timestamp() - event.timestamp);
             println!("  {}{}{} {}", DIM, age, RESET, rel);
         }
+        println!("  Restore one with: undo restore-deleted <path>");
     }
 
     let checkpoints = db.list_checkpoints(project.id)?;
@@ -206,7 +262,10 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
     }
 
     println!();
-    println!("Recommended first step: run a preview command before restoring.");
+    println!(
+        "Emergency recovery uses timing, not task ownership. Prefer a Run or checkpoint when available."
+    );
+    println!("Next: run the Preview command before using Restore.");
     Ok(())
 }
 
@@ -288,14 +347,14 @@ fn maybe_push_burst(bursts: &mut Vec<Burst>, group: &[FileEvent]) {
 fn print_bursts(bursts: &[Burst]) {
     println!();
     if bursts.is_empty() {
-        println!("No large change bursts found.");
+        println!("No large groups of rapid file changes found.");
         return;
     }
 
-    println!("{}Change bursts{}", BOLD, RESET);
+    println!("{}Rapid file changes{}", BOLD, RESET);
     for burst in bursts.iter().rev() {
         println!(
-            "  {}{}{} {} files, {} events, {} deleted",
+            "  {}{}{} {} files, {} changes, {} deleted",
             DIM,
             format_local_time(burst.end),
             RESET,
@@ -316,13 +375,36 @@ fn print_event(project: &WatchedProject, event: &FileEvent) {
         let old_rel = relative_path(old, &project.root_path);
         println!(
             "{}{}{} {}{}{} {} -> {}",
-            DIM, time, RESET, color, event.event_type, RESET, old_rel, rel
+            DIM,
+            time,
+            RESET,
+            color,
+            event_label(&event.event_type),
+            RESET,
+            old_rel,
+            rel
         );
     } else {
         println!(
             "{}{}{} {}{}{} {}",
-            DIM, time, RESET, color, event.event_type, RESET, rel
+            DIM,
+            time,
+            RESET,
+            color,
+            event_label(&event.event_type),
+            RESET,
+            rel
         );
+    }
+}
+
+fn event_label(event_type: &str) -> &str {
+    match event_type {
+        "MODIFIED" => "Modified",
+        "CREATED" => "Created",
+        "DELETED" => "Deleted",
+        "RENAMED" => "Renamed",
+        other => other,
     }
 }
 
@@ -413,5 +495,14 @@ mod tests {
 
         assert_eq!(preview, "undo restore . --timestamp 999 --preview");
         assert_eq!(restore, "undo restore . --timestamp 999 --yes");
+    }
+
+    #[test]
+    fn event_labels_are_plain_language_without_changing_event_values() {
+        assert_eq!(event_label("MODIFIED"), "Modified");
+        assert_eq!(event_label("CREATED"), "Created");
+        assert_eq!(event_label("DELETED"), "Deleted");
+        assert_eq!(event_label("RENAMED"), "Renamed");
+        assert_eq!(event_label("CUSTOM"), "CUSTOM");
     }
 }

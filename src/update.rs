@@ -11,6 +11,7 @@ pub fn cmd_update() -> Result<()> {
     println!("{}undo{} — self-update", crate::BOLD, crate::RESET);
     println!();
     println!("  Current version: v{}", CURRENT_VERSION);
+    println!("Checking for updates...");
 
     let latest_tag = fetch_latest_tag()?;
     let latest_ver = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
@@ -37,7 +38,8 @@ pub fn cmd_update() -> Result<()> {
 
     println!("Downloading undo {} for {}...", latest_tag, target);
 
-    let tmpdir = tempfile::TempDir::new().context("failed to create temp directory")?;
+    let tmpdir = tempfile::TempDir::new()
+        .context("Downloading update failed: could not create a temporary directory")?;
 
     let tarball = tmpdir.path().join("undo.tar.gz");
 
@@ -45,11 +47,11 @@ pub fn cmd_update() -> Result<()> {
         .args(["-fsSL", &url, "-o"])
         .arg(&tarball)
         .status()
-        .context("failed to run curl — is it installed?")?;
+        .context("Downloading update failed: could not start curl; install curl and try again")?;
 
     if !dl_status.success() {
         anyhow::bail!(
-            "download failed (HTTP error). Check that release {} exists for {}.",
+            "Downloading update failed: GitHub did not provide release {} for {}.",
             latest_tag,
             target
         );
@@ -58,27 +60,29 @@ pub fn cmd_update() -> Result<()> {
     // Verify integrity before we extract or install anything (#33). For a tool
     // that overwrites its own executable, refusing to install an artifact we
     // can't verify is the expected posture.
+    println!("Verifying download...");
     verify_checksum(&tarball, &latest_tag, &target, tmpdir.path())?;
 
+    println!("Installing update...");
     let tar_status = Command::new("tar")
         .args(["xzf"])
         .arg(&tarball)
         .arg("-C")
         .arg(tmpdir.path())
         .status()
-        .context("failed to extract archive")?;
+        .context("Installing update failed: could not start tar to extract the download")?;
 
     if !tar_status.success() {
-        anyhow::bail!("failed to extract downloaded archive");
+        anyhow::bail!("Installing update failed: tar could not extract the downloaded archive");
     }
 
     let new_binary = tmpdir.path().join("undo");
     if !new_binary.exists() {
-        anyhow::bail!("extracted archive does not contain 'undo' binary");
+        anyhow::bail!("Installing update failed: the downloaded archive has no 'undo' binary");
     }
 
-    let current_exe =
-        std::env::current_exe().context("cannot determine current executable path")?;
+    let current_exe = std::env::current_exe()
+        .context("Installing update failed: could not find the current executable")?;
 
     // Move the old binary aside, then install the new one. Both steps must work
     // even though `new_binary` lives in a tempdir that is very often on a
@@ -87,12 +91,16 @@ pub fn cmd_update() -> Result<()> {
     // `rename` across filesystems fails with EXDEV, which silently broke every
     // self-update in those (very common) setups.
     let backup = current_exe.with_extension("old");
-    std::fs::rename(&current_exe, &backup)
-        .context("failed to replace binary — try running with sudo")?;
+    std::fs::rename(&current_exe, &backup).with_context(|| {
+        format!(
+            "Installing update failed: could not replace {}. Check that you own the file and its directory",
+            current_exe.display()
+        )
+    })?;
 
     if let Err(e) = install_binary(&new_binary, &current_exe) {
         std::fs::rename(&backup, &current_exe).ok();
-        return Err(e).context("failed to install new binary");
+        return Err(e).context("Installing update failed");
     }
 
     std::fs::remove_file(&backup).ok();
@@ -116,10 +124,10 @@ fn fetch_latest_tag() -> Result<String> {
             &format!("https://api.github.com/repos/{REPO}/releases/latest"),
         ])
         .output()
-        .context("failed to run curl — is it installed?")?;
+        .context("Checking for updates failed: could not start curl; install curl and try again")?;
 
     if !output.status.success() {
-        anyhow::bail!("failed to fetch latest release from GitHub");
+        anyhow::bail!("Checking for updates failed: GitHub did not return the latest release");
     }
 
     let body = String::from_utf8_lossy(&output.stdout);
@@ -131,15 +139,22 @@ fn fetch_latest_tag() -> Result<String> {
         .nth(1)
         .and_then(|s| s.split('"').nth(1))
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("could not parse latest release tag from GitHub API"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Checking for updates failed: GitHub returned no readable release version"
+            )
+        })?;
 
     Ok(tag)
 }
 
 fn parse_release_version(version: &str) -> Result<Version> {
     let version = version.strip_prefix('v').unwrap_or(version);
-    Version::parse(version)
-        .with_context(|| format!("release version '{version}' is not valid semantic version"))
+    Version::parse(version).with_context(|| {
+        format!(
+            "Checking for updates failed: release version '{version}' is not a valid semantic version"
+        )
+    })
 }
 
 fn compare_release_versions(latest: &str, current: &str) -> Result<Ordering> {
@@ -163,15 +178,17 @@ fn verify_checksum(
         .args(["-fsSL", &sums_url, "-o"])
         .arg(&sums_path)
         .status()
-        .context("failed to run curl — is it installed?")?;
+        .context("Verifying download failed: could not start curl; install curl and try again")?;
     if !status.success() {
         anyhow::bail!(
-            "could not download SHA256SUMS for {tag} — refusing to install an unverified binary"
+            "Verifying download failed: could not download SHA256SUMS for {tag}; the update was not installed"
         );
     }
 
-    let sums = std::fs::read_to_string(&sums_path).context("failed to read SHA256SUMS")?;
-    let bytes = std::fs::read(tarball).context("failed to read downloaded archive")?;
+    let sums = std::fs::read_to_string(&sums_path)
+        .context("Verifying download failed: could not read SHA256SUMS")?;
+    let bytes = std::fs::read(tarball)
+        .context("Verifying download failed: could not read the downloaded archive")?;
     let actual = crate::to_hex(&Sha256::digest(&bytes));
 
     let artifact = format!("undo-{tag}-{target}.tar.gz");
@@ -198,14 +215,14 @@ fn verify_against_sums(sums: &str, artifact: &str, actual_hex: &str) -> Result<(
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "SHA256SUMS has no entry for {artifact} — refusing to install an unverified binary"
+                "Verifying download failed: SHA256SUMS has no entry for {artifact}; the update was not installed"
             )
         })?;
 
     if actual_hex.to_ascii_lowercase() != expected {
         anyhow::bail!(
-            "checksum mismatch for {artifact}\n  expected: {expected}\n  actual:   {actual_hex}\n\
-             The download may be corrupt or tampered with — not installing."
+            "Verifying download failed: checksum mismatch for {artifact}\n  expected: {expected}\n  actual:   {actual_hex}\n\
+             The download may be corrupt or tampered with; the update was not installed."
         );
     }
 
@@ -238,7 +255,7 @@ fn install_binary(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     if result.is_err() {
         let _ = std::fs::remove_file(&staged);
     }
-    result.context("failed to stage and install new binary")
+    result.context("could not stage and install the new binary")
 }
 
 /// A temp path adjacent to `dest` (same directory, hence same filesystem) so
@@ -263,13 +280,19 @@ fn detect_target() -> Result<String> {
     let os_part = match os {
         "macos" => "apple-darwin",
         "linux" => "unknown-linux-gnu",
-        _ => anyhow::bail!("unsupported OS: {}", os),
+        _ => anyhow::bail!(
+            "Downloading update failed: operating system '{}' is not supported",
+            os
+        ),
     };
 
     let arch_part = match arch {
         "aarch64" => "aarch64",
         "x86_64" => "x86_64",
-        _ => anyhow::bail!("unsupported architecture: {}", arch),
+        _ => anyhow::bail!(
+            "Downloading update failed: architecture '{}' is not supported",
+            arch
+        ),
     };
 
     Ok(format!("{}-{}", arch_part, os_part))

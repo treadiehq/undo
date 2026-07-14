@@ -25,7 +25,7 @@ pub(crate) fn build_groups(project: &WatchedProject, events: &[FileEvent]) -> Ve
 
     grouped
         .into_iter()
-        .map(|(id, events)| group_from_events(id, events))
+        .map(|(id, events)| group_from_events(project, id, events))
         .collect()
 }
 
@@ -38,10 +38,17 @@ pub(crate) fn all_group_paths(groups: &[ChangeGroup]) -> Vec<String> {
         .collect()
 }
 
-fn group_from_events(id: String, events: Vec<&FileEvent>) -> ChangeGroup {
+fn group_from_events(project: &WatchedProject, id: String, events: Vec<&FileEvent>) -> ChangeGroup {
     let mut paths = BTreeSet::new();
     let mut inserted = 0usize;
     let mut deleted = 0usize;
+    let label = events
+        .iter()
+        .map(|event| label_for_path(relative_path(&event.path, &project.root_path)))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| id.clone());
 
     for event in &events {
         paths.insert(event.path.clone());
@@ -54,7 +61,7 @@ fn group_from_events(id: String, events: Vec<&FileEvent>) -> ChangeGroup {
     }
 
     ChangeGroup {
-        label: label_for_group(&id),
+        label,
         id,
         paths: paths.into_iter().collect(),
         event_count: events.len(),
@@ -149,18 +156,16 @@ fn slugify(input: &str) -> String {
     }
 }
 
-fn label_for_group(id: &str) -> String {
-    id.split('-')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn label_for_path(rel_path: &str) -> String {
+    let mut parts = rel_path.split('/').filter(|part| !part.is_empty());
+    let first = parts.next().unwrap_or("root");
+    match first {
+        "src" | "app" | "lib" | "crates" | "packages" | "components" => parts
+            .next()
+            .map(|part| format!("{first}/{part}"))
+            .unwrap_or_else(|| first.to_string()),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +208,8 @@ mod tests {
 
         let ids = groups.iter().map(|g| g.id.as_str()).collect::<Vec<_>>();
         assert_eq!(ids, vec!["auth", "billing"]);
+        assert_eq!(groups[0].label, "src/auth");
+        assert_eq!(groups[1].label, "src/billing");
         assert_eq!(groups[0].paths.len(), 2);
     }
 
@@ -215,6 +222,11 @@ mod tests {
 
         let ids = groups.iter().map(|g| g.id.as_str()).collect::<Vec<_>>();
         assert_eq!(ids, vec!["cargo", "readme"]);
+        let labels = groups
+            .iter()
+            .map(|group| group.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["Cargo.toml", "README.md"]);
     }
 
     /// Reverting a rename requires both names: write the source path as it

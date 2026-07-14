@@ -61,25 +61,48 @@ access is required.
 
 All source lives in `src/`. Each module is focused:
 
-| Module | Responsibility |
-|--------|----------------|
-| `main.rs` | Entry point, command dispatch, `safe_resolve_path` (path-traversal/symlink bounds checks), shared helpers |
-| `cli.rs` | `clap` command and flag definitions |
-| `daemon.rs` | `start` / `stop` / `status`; PID files, `flock` liveness, safety guards, overlap detection |
-| `watcher.rs` | The watch loop and initial scan; debouncing, the fs-timeout watchdog, per-event handlers |
-| `snapshots.rs` | Content-addressed gzip snapshot store (atomic temp-file + rename) |
-| `db.rs` | SQLite schema and all queries (events, file state, retention) |
-| `restore.rs` | `restore` — symlink refusal, safety backup, atomic write |
-| `diff.rs` | `diff` — binary detection, capped reads, unified diff |
-| `retention.rs` | Config loading (`config.toml` / `.undorc`), pruning (including leaked temp-file reaping), disk-usage accounting |
-| `ignore.rs` | Builtin ignore list + `.gitignore`/`.undoignore` matching |
-| `duration.rs` | Human-friendly duration parsing/formatting (`5m`, `2h`, `1d`) |
-| `logging.rs` | Persistent daemon log at `~/.undo/undo.log` (with rotation) |
-| `update.rs` | `update` — self-update with `SHA256SUMS` verification |
-| `models.rs` | Plain data structs shared across modules |
+- `main.rs` — entry point, command dispatch, path-boundary checks, and shared
+  helpers.
+- `cli.rs` — `clap` commands, aliases, arguments, and machine-output flags.
+- `runs.rs` — Run start/stop/list/show, child-process wrappers, actor inference,
+  and automatic recorder synchronization.
+- `agent_events.rs` — strict version 1 lifecycle JSON validation, processing,
+  responses, and retry idempotency.
+- `recoveries.rs` — persisted Recovery plans, expected-hash preflight, apply
+  idempotency, and explicit-intent inverse patches.
+- `ask.rs` — deterministic intent-label and path-group selection.
+- `recover.rs` — explicit whole-Run and whole-group compatibility recovery.
+- `sessions.rs` — pre-Run session command compatibility.
+- `activity.rs` — checkpoints, timeline, deleted-file listing, burst detection,
+  and panic mode.
+- `groups.rs` — deterministic path-derived change groups and diff statistics.
+- `daemon.rs` — recorder start/stop/status, PID files, `flock` liveness, safety
+  guards, overlap detection, and automatic startup.
+- `watcher.rs` — initial scan and watch loop, reconciliation, debouncing,
+  filesystem watchdog, and event handlers.
+- `snapshots.rs` — content-addressed gzip snapshot storage.
+- `db.rs` — SQLite schema, migrations, and queries.
+- `restore.rs` — point-in-time planning, symlink refusal, backups, and per-file
+  atomic writes.
+- `diff.rs` — capped reads, binary detection, and unified diff.
+- `retention.rs` — config, pruning, stale temp-file reaping, and disk accounting.
+- `ignore.rs` — built-in and root `.gitignore`/`.undoignore` matching.
+- `integrity.rs` — shallow startup and deep on-demand snapshot verification.
+- `duration.rs`, `logging.rs`, `update.rs`, and `models.rs` — duration parsing,
+  logs, self-update, and shared data records.
 
-Architecture and storage details are documented in
-[`docs/detailed.md`](docs/detailed.md).
+Documentation is organized under `docs/`:
+
+- `docs/README.md` is the introduction and index.
+- `docs/getting-started.md`, `concepts.md`, and `recovery.md` explain the primary
+  user model.
+- `docs/cli.md` and `machine-output.md` are command/output references.
+- `docs/agent-integration-spec.md` defines `undo event` version 1.
+- `docs/agents/` contains practical agent wrapper and lifecycle guides.
+- `docs/storage.md` covers local data and operations.
+- `docs/demos.md` contains reproducible recovery exercises.
+- `docs/detailed.md` preserves compatibility links and remaining operational
+  notes.
 
 ## Testing conventions
 
@@ -102,8 +125,8 @@ The codebase leans heavily on unit tests, and a few patterns keep them isolated:
   `#[cfg(test)]`-only changes to files that ship in the binary).
 - Make sure `fmt`, `clippy -D warnings`, and the tests all pass — CI gates on them.
 - Add or update tests for behavior changes, and update
-  [`docs/detailed.md`](docs/detailed.md) / [`README.md`](README.md) when behavior
-  or commands change.
+  the relevant page under [`docs/`](docs/README.md) and [`README.md`](README.md)
+  when behavior or commands change.
 - Note user-facing changes in [`CHANGELOG.md`](CHANGELOG.md) under `Unreleased`.
 
 ## Reporting bugs and security issues

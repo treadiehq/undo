@@ -10,6 +10,39 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-14
+
+- Added Run-first recovery with stable `r_...` IDs, actor/agent/command metadata,
+  completion status, and one active Run per project for honest filesystem-event
+  attribution.
+- `undo run <command>` now starts recording when needed, launches the child, and
+  completes the Run on exit; `undo runs` and `undo run show` expose the recorded
+  boundary and changes.
+- New checkpoints are immutable and anchored to filesystem event IDs. Legacy
+  checkpoints remain timestamp-only and recover through the compatibility path.
+- Recovery previews now persist for 24 hours with stable `rec_...` IDs.
+  `undo apply` verifies expected current existence/hashes, refuses stale
+  conflicts, and is idempotent after success.
+- Explicit completed intent boundaries support same-file selective reversal
+  through inverse patch application, preserving clean non-overlapping later
+  edits while blocking overlaps and ambiguous create/delete/rename states.
+- Added the strict version 1 `undo event` JSON lifecycle format with
+  `run_started`, `checkpoint`, `intent_started`, `intent_completed`, and
+  `run_completed` events plus persisted idempotency responses.
+- Run, checkpoint, and event boundaries automatically start and synchronize the
+  local recorder when it is not already active.
+- Point-in-time reconstruction now treats deletion and rename-away as real
+  states, and restore writes preserve the current Unix mode of existing files.
+- Panic apply now creates and previews a hash-checked persisted Recovery before
+  mutation.
+- Fixed `undo ask` treating the word `session` as a request to revert an entire
+  Run.
+- Existing `session` commands, `sessions`, `--session`, `mark`/`marks`, `--cp`,
+  and panic burst names remain as compatibility aliases.
+- The SQLite schema migrates existing stores to version 3, retaining the
+  compatibility-named sessions table while adding Run metadata, event-anchored
+  checkpoints, intents, Recoveries, and integration idempotency records.
+
 ## [0.1.17] — 2026-07-14
 
 - Restore now detects deleted directory scopes, allowing selective recovery
@@ -154,7 +187,9 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.1.15...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/treadiehq/undo/compare/v0.1.16...v0.1.17
+[0.1.16]: https://github.com/treadiehq/undo/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/treadiehq/undo/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/treadiehq/undo/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/treadiehq/undo/compare/v0.1.12...v0.1.13
