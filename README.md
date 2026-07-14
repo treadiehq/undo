@@ -39,6 +39,9 @@ Undo can also restore recorded files by time, recover deleted files, and help
 after a large unexpected change:
 
 ```bash
+undo timeline --since 10m
+undo what-changed 10m
+undo preview src/server.rs 10m
 undo restore src/server.rs 10m
 undo restore-deleted src/old-api.rs
 undo panic
