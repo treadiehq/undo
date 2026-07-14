@@ -122,9 +122,8 @@ fn build_proposal(
 }
 
 fn parse_intent(query: &str) -> AskIntent {
-    let normalized = normalize(query);
-    let (revert_part, keep_part) = split_keep_clause(&normalized);
-    let revert_all = contains_all_intent(revert_part);
+    let (revert_part, keep_part) = split_keep_clause(query);
+    let revert_all = contains_all_intent(&normalize(revert_part));
     AskIntent {
         revert_terms: important_terms(revert_part),
         keep_terms: important_terms(keep_part.unwrap_or_default()),
@@ -133,9 +132,11 @@ fn parse_intent(query: &str) -> AskIntent {
 }
 
 fn split_keep_clause(query: &str) -> (&str, Option<&str>) {
+    let lowercase = query.to_ascii_lowercase();
     for marker in [" but keep ", " except ", " keep ", " without "] {
-        if let Some((before, after)) = query.split_once(marker) {
-            return (before, Some(after));
+        if let Some(marker_start) = lowercase.find(marker) {
+            let after_start = marker_start + marker.len();
+            return (&query[..marker_start], Some(&query[after_start..]));
         }
     }
     (query, None)
@@ -178,6 +179,7 @@ fn matched_terms(
 fn score_group(group: &ChangeGroup, project: &WatchedProject, terms: &[impl AsRef<str>]) -> usize {
     let mut score = 0usize;
     let id = group.id.to_ascii_lowercase();
+    let compact_id = compact(&id);
     let label = group.label.to_ascii_lowercase();
     for term in terms {
         let term = term.as_ref();
@@ -186,6 +188,8 @@ fn score_group(group: &ChangeGroup, project: &WatchedProject, terms: &[impl AsRe
         }
         if id == term {
             score += 10;
+        } else if compact_id == compact(term) {
+            score += 8;
         } else if id.contains(term) || term.contains(&id) {
             score += 6;
         }
@@ -207,6 +211,14 @@ fn score_group(group: &ChangeGroup, project: &WatchedProject, terms: &[impl AsRe
         }
     }
     score
+}
+
+fn compact(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 fn print_proposal(query: &str, proposal: &AskProposal, apply: bool) {
@@ -404,6 +416,37 @@ mod tests {
         assert!(!intent.revert_all);
     }
 
+    /// Clause keywords inside hyphenated group ids are target words, not
+    /// instructions to preserve the rest of the query.
+    #[test]
+    fn intent_does_not_split_hyphenated_group_ids() {
+        for (query, expected_term) in [
+            ("revert keep-alive", "alive"),
+            ("revert except-handler", "handler"),
+            ("revert without-cache", "cache"),
+        ] {
+            let intent = parse_intent(query);
+            assert!(
+                intent.keep_terms.is_empty(),
+                "{query:?} unexpectedly produced keep terms"
+            );
+            assert!(
+                intent.revert_terms.contains(&expected_term.to_string()),
+                "{query:?} did not preserve its target term"
+            );
+        }
+    }
+
+    /// Splitting the raw query must remain case-insensitive and retain the
+    /// concise comma-plus-keep syntax used in the CLI documentation.
+    #[test]
+    fn intent_splits_bare_keep_clause_case_insensitively() {
+        let intent = parse_intent("undo auth, KEEP security");
+
+        assert_eq!(intent.revert_terms, vec!["auth"]);
+        assert_eq!(intent.keep_terms, vec!["security"]);
+    }
+
     #[test]
     fn proposal_reverts_matching_group_and_keeps_keep_group() {
         let groups = vec![
@@ -435,6 +478,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["security"]
         );
+    }
+
+    /// Group ids should match whether users include or omit generated
+    /// punctuation such as the dash in `keep-alive`.
+    #[test]
+    fn proposal_matches_compact_group_id() {
+        let groups = vec![group("keep-alive", &["/repo/src/keep-alive/ping.rs"])];
+
+        for query in ["revert keep-alive", "revert keepalive"] {
+            let proposal = build_proposal(query, session(), &project(), &groups).unwrap();
+
+            assert_eq!(
+                proposal
+                    .revert_groups
+                    .iter()
+                    .map(|group| group.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["keep-alive"],
+                "{query:?} did not select the requested group"
+            );
+            assert!(proposal.keep_groups.is_empty());
+        }
     }
 
     #[test]

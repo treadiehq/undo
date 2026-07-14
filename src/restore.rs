@@ -1,6 +1,6 @@
 use crate::db::Database;
 use crate::duration;
-use crate::models::{Session, WatchedProject};
+use crate::models::{FileEvent, Session, WatchedProject};
 use crate::snapshots;
 use crate::{BOLD, GREEN, RED, RESET, YELLOW, find_project};
 use anyhow::Result;
@@ -13,20 +13,23 @@ pub fn cmd_restore(
     path: Option<&str>,
     duration: Option<&str>,
     checkpoint: Option<&str>,
+    timestamp: Option<i64>,
     preview: bool,
     deleted: bool,
     yes: bool,
 ) -> Result<()> {
     if deleted {
         let path = path.ok_or_else(|| anyhow::anyhow!("restore --deleted requires a path"))?;
-        if duration.is_some() || checkpoint.is_some() {
-            anyhow::bail!("restore --deleted cannot be combined with a duration or --checkpoint");
+        if duration.is_some() || checkpoint.is_some() || timestamp.is_some() {
+            anyhow::bail!(
+                "restore --deleted cannot be combined with a duration, --checkpoint, or --timestamp"
+            );
         }
         return restore_deleted(path, preview);
     }
 
     let path = path.ok_or_else(|| anyhow::anyhow!("restore requires a path"))?;
-    let (target_time, label) = resolve_restore_time(duration, checkpoint)?;
+    let (target_time, label) = resolve_restore_time(duration, checkpoint, timestamp)?;
     restore_at_timestamp(path, target_time, &label, preview, yes)
 }
 
@@ -92,15 +95,21 @@ pub(crate) fn restore_paths_at_session_start(
     apply_restore_plan(&project, &plan, yes)
 }
 
-fn resolve_restore_time(duration: Option<&str>, checkpoint: Option<&str>) -> Result<(i64, String)> {
-    match (duration, checkpoint) {
-        (Some(_), Some(_)) => anyhow::bail!("use either a duration or --checkpoint, not both"),
-        (Some(duration), None) => {
+fn resolve_restore_time(
+    duration: Option<&str>,
+    checkpoint: Option<&str>,
+    timestamp: Option<i64>,
+) -> Result<(i64, String)> {
+    match (duration, checkpoint, timestamp) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            anyhow::bail!("use only one restore target: a duration, --checkpoint, or --timestamp")
+        }
+        (Some(duration), None, None) => {
             let secs = duration::parse_duration(duration)?;
             let target_time = Utc::now().timestamp().saturating_sub(secs);
             Ok((target_time, format!("{} ago", duration)))
         }
-        (None, Some(name)) => {
+        (None, Some(name), None) => {
             let cwd = std::env::current_dir()?.canonicalize()?;
             let db = Database::open()?;
             let project = find_project(&db, &cwd)?;
@@ -109,7 +118,10 @@ fn resolve_restore_time(duration: Option<&str>, checkpoint: Option<&str>) -> Res
                 .ok_or_else(|| anyhow::anyhow!("checkpoint '{}' not found", name))?;
             Ok((checkpoint.timestamp, format!("checkpoint '{}'", name)))
         }
-        (None, None) => anyhow::bail!("restore requires a duration or --checkpoint"),
+        (None, None, Some(timestamp)) => Ok((timestamp, format!("Unix timestamp {}", timestamp))),
+        (None, None, None) => {
+            anyhow::bail!("restore requires a duration, --checkpoint, or --timestamp")
+        }
     }
 }
 
@@ -197,6 +209,17 @@ fn plan_restore(
     let is_directory_scope = abs_path.is_dir() || path_str == ".";
     let mut entries = if is_directory_scope {
         plan_directory_restore(db, project, &abs_path, target_time)?
+    } else if !abs_path.exists() {
+        // A deleted path no longer carries filesystem type information. Try
+        // scoped recovery first so tracked descendants (including old paths
+        // from renames) can identify a deleted directory, while preserving
+        // single-file fallbacks when the scoped plan has nothing to restore.
+        let directory_entries = plan_directory_restore(db, project, &abs_path, target_time)?;
+        if directory_entries.is_empty() {
+            plan_single_file_restore(db, project, &abs_path, target_time, allow_single_fallbacks)?
+        } else {
+            directory_entries
+        }
     } else {
         plan_single_file_restore(db, project, &abs_path, target_time, allow_single_fallbacks)?
     };
@@ -498,11 +521,13 @@ pub(crate) enum RestoreKind {
 ///
 /// Resolution order:
 /// 1. the newest non-DELETE snapshot at or before `target_time`,
-/// 2. the earliest recorded snapshot (when the window predates all history),
-/// 3. the last contents of a deleted file, recovered from the most recent
+/// 2. the state immediately before the first later change, when older history
+///    was pruned but that event's `previous_hash` still proves the path existed,
+/// 3. the earliest recorded snapshot (when the window predates all history),
+/// 4. the last contents of a deleted file, recovered from the most recent
 ///    DELETED event's `previous_hash`.
 ///
-/// Step 3 is the fix for files that were deleted after their creating event
+/// Step 4 is the fix for files that were deleted after their creating event
 /// aged out of retention: previously both earlier lookups returned `None` and
 /// restore reported "No snapshots found", even though the deletion itself was
 /// well within the retention window and the snapshot was still on disk.
@@ -512,14 +537,8 @@ fn resolve_restore_source(
     path: &str,
     target_time: i64,
 ) -> Result<Option<RestoreSource>> {
-    if let Some(e) = db.get_event_at_time(project_id, path, target_time)?
-        && let Some(hash) = e.current_hash
-    {
-        return Ok(Some(RestoreSource {
-            hash,
-            timestamp: e.timestamp,
-            kind: RestoreKind::Exact,
-        }));
+    if let Some(source) = resolve_exact_source_at_time(db, project_id, path, target_time)? {
+        return Ok(Some(source));
     }
 
     if let Some(e) = db.get_oldest_event(project_id, path)?
@@ -545,6 +564,20 @@ fn resolve_restore_source(
     Ok(None)
 }
 
+fn source_before_event(event: FileEvent, path: &str) -> Option<RestoreSource> {
+    let path_was_present = event.old_path.as_deref() == Some(path)
+        || (event.path == path && matches!(event.event_type.as_str(), "MODIFIED" | "DELETED"));
+    if !path_was_present {
+        return None;
+    }
+
+    Some(RestoreSource {
+        hash: event.previous_hash?,
+        timestamp: event.timestamp,
+        kind: RestoreKind::Exact,
+    })
+}
+
 fn resolve_exact_source_at_time(
     db: &Database,
     project_id: i64,
@@ -559,6 +592,10 @@ fn resolve_exact_source_at_time(
             timestamp: e.timestamp,
             kind: RestoreKind::Exact,
         }));
+    }
+
+    if let Some(event) = db.get_first_path_event_after(project_id, path, target_time)? {
+        return Ok(source_before_event(event, path));
     }
 
     Ok(None)
@@ -577,6 +614,10 @@ fn resolve_exact_source_at_session_start(
             timestamp: e.timestamp,
             kind: RestoreKind::Exact,
         }));
+    }
+
+    if let Some(event) = db.get_first_path_event_in_session(session, path)? {
+        return Ok(source_before_event(event, path));
     }
 
     Ok(None)
@@ -758,7 +799,7 @@ mod tests {
     use super::{
         RestoreAction, RestoreKind, backup_path_for, create_restore_backup_at, path_in_scope,
         plan_paths_restore_at_session_start, plan_restore, resolve_exact_source_at_time,
-        resolve_restore_source,
+        resolve_restore_source, resolve_restore_time,
     };
     use crate::db::Database;
 
@@ -768,6 +809,14 @@ mod tests {
             .get_or_create_project(std::path::Path::new("/proj"))
             .unwrap();
         (db, p.id)
+    }
+
+    #[test]
+    fn absolute_timestamp_restore_target_is_stable() {
+        let (target, label) = resolve_restore_time(None, None, Some(1_713_200_000)).unwrap();
+
+        assert_eq!(target, 1_713_200_000);
+        assert_eq!(label, "Unix timestamp 1713200000");
     }
 
     /// Same-basename files in different directories must not collapse to the
@@ -935,6 +984,70 @@ mod tests {
         );
     }
 
+    /// When older source-path history has been pruned, the first rename after
+    /// the target still carries the source contents in `previous_hash`.
+    #[test]
+    fn exact_resolver_recovers_rename_source_from_previous_hash() {
+        let (db, pid) = mem_db();
+        let old_path = "/proj/src/auth/login.rs";
+        let new_path = "/proj/src/billing/signin.rs";
+        let target_before_rename = chrono::Utc::now().timestamp().saturating_sub(60);
+        db.insert_event(
+            pid,
+            new_path,
+            "RENAMED",
+            Some("current_hash"),
+            Some("source_hash"),
+            None,
+            Some(old_path),
+            Some(16),
+        )
+        .unwrap();
+
+        let source =
+            resolve_exact_source_at_time(&db, pid, old_path, target_before_rename).unwrap();
+
+        assert_eq!(source.unwrap().hash, "source_hash");
+    }
+
+    /// A later rename does not prove its source path existed at the target when
+    /// the first event after that target created the source path.
+    #[test]
+    fn exact_resolver_does_not_restore_path_created_after_target() {
+        let (db, pid) = mem_db();
+        let old_path = "/proj/src/generated.rs";
+        let new_path = "/proj/archive/generated.rs";
+        let target_before_creation = chrono::Utc::now().timestamp().saturating_sub(60);
+        db.insert_event(
+            pid,
+            old_path,
+            "CREATED",
+            Some("generated_hash"),
+            None,
+            None,
+            None,
+            Some(16),
+        )
+        .unwrap();
+        db.insert_event(
+            pid,
+            new_path,
+            "RENAMED",
+            Some("generated_hash"),
+            Some("generated_hash"),
+            None,
+            Some(old_path),
+            Some(16),
+        )
+        .unwrap();
+
+        assert!(
+            resolve_exact_source_at_time(&db, pid, old_path, target_before_creation)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Scope checks must treat sibling string prefixes as outside the directory.
     #[test]
     fn path_in_scope_rejects_shared_prefix_siblings() {
@@ -982,6 +1095,60 @@ mod tests {
         }
     }
 
+    /// A deleted directory has no filesystem type, so restore planning must
+    /// discover its tracked children instead of treating its path as a file.
+    #[test]
+    fn plan_restore_finds_files_in_deleted_directory() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let src_dir = root.join("src");
+        let file = src_dir.join("main.rs");
+        std::fs::create_dir(&src_dir).unwrap();
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let file_str = file.to_string_lossy().to_string();
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        db.insert_event(
+            project.id,
+            &file_str,
+            "MODIFIED",
+            Some("saved_hash"),
+            None,
+            None,
+            None,
+            Some(12),
+        )
+        .unwrap();
+        let target_before_deletion = chrono::Utc::now().timestamp();
+        db.insert_event(
+            project.id,
+            &file_str,
+            "DELETED",
+            None,
+            Some("saved_hash"),
+            None,
+            None,
+            Some(12),
+        )
+        .unwrap();
+
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&src_dir).unwrap();
+
+        let plan = plan_restore(&db, &project, &root, "src", target_before_deletion, true).unwrap();
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].rel_path, "src/main.rs");
+        match &plan.entries[0].action {
+            RestoreAction::Write { source } => {
+                assert_eq!(source.hash, "saved_hash");
+                assert_eq!(source.kind, RestoreKind::Exact);
+            }
+            other => panic!("expected write action, got {other:?}"),
+        }
+    }
+
     /// A directory rollback to before a generated file existed should plan a
     /// delete, not resurrect that file via the single-file oldest fallback.
     #[test]
@@ -1015,6 +1182,173 @@ mod tests {
             plan.entries[0].action,
             RestoreAction::DeleteCreatedAfterTarget
         ));
+    }
+
+    /// Rolling back a cross-directory rename writes the original source path
+    /// and removes the destination, even if only the rename event remains.
+    #[test]
+    fn plan_directory_restore_reverses_cross_directory_rename() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let old_path = root.join("src/auth/login.rs");
+        let new_path = root.join("src/billing/signin.rs");
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        std::fs::write(&new_path, "original content").unwrap();
+        let old_str = old_path.to_string_lossy().to_string();
+        let new_str = new_path.to_string_lossy().to_string();
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let target_before_rename = chrono::Utc::now().timestamp().saturating_sub(60);
+        db.insert_event(
+            project.id,
+            &new_str,
+            "RENAMED",
+            Some("current_hash"),
+            Some("source_hash"),
+            None,
+            Some(&old_str),
+            Some(16),
+        )
+        .unwrap();
+
+        let plan = plan_restore(&db, &project, &root, ".", target_before_rename, true).unwrap();
+        let old_entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.path == old_str)
+            .expect("the rename source should be restored");
+        let new_entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.path == new_str)
+            .expect("the rename destination should be removed");
+
+        match &old_entry.action {
+            RestoreAction::Write { source } => assert_eq!(source.hash, "source_hash"),
+            other => panic!("expected source write, got {other:?}"),
+        }
+        assert!(matches!(
+            new_entry.action,
+            RestoreAction::DeleteCreatedAfterTarget
+        ));
+    }
+
+    /// Session recovery uses the rename event itself when the source path's
+    /// older event has already aged out of retention.
+    #[test]
+    fn plan_session_restore_reverses_rename_with_pruned_source_history() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let old_path = root.join("src/auth/login.rs");
+        let new_path = root.join("src/billing/signin.rs");
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        std::fs::write(&new_path, "original content").unwrap();
+        let old_str = old_path.to_string_lossy().to_string();
+        let new_str = new_path.to_string_lossy().to_string();
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        db.start_session(project.id, "rename-run", "manual")
+            .unwrap();
+        db.insert_event(
+            project.id,
+            &new_str,
+            "RENAMED",
+            Some("current_hash"),
+            Some("source_hash"),
+            None,
+            Some(&old_str),
+            Some(16),
+        )
+        .unwrap();
+        let session = db.stop_active_session(project.id).unwrap().unwrap();
+
+        let plan = plan_paths_restore_at_session_start(
+            &db,
+            &project,
+            &root,
+            &[old_str.clone(), new_str.clone()],
+            &session,
+        )
+        .unwrap();
+
+        let old_entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.path == old_str)
+            .expect("the session should restore the rename source");
+        let new_entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.path == new_str)
+            .expect("the session should remove the rename destination");
+        match &old_entry.action {
+            RestoreAction::Write { source } => assert_eq!(source.hash, "source_hash"),
+            other => panic!("expected source write, got {other:?}"),
+        }
+        assert!(matches!(
+            new_entry.action,
+            RestoreAction::DeleteCreatedAfterTarget
+        ));
+    }
+
+    /// Retention may remove the pre-session event while preserving its snapshot
+    /// through the first in-session modification's `previous_hash`. Recovery
+    /// must write that baseline instead of treating the existing file as new.
+    #[test]
+    fn plan_session_restore_uses_previous_hash_after_baseline_pruned() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "changed during session").unwrap();
+        let file_str = file.to_string_lossy().to_string();
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        db.start_session(project.id, "modify-run", "manual")
+            .unwrap();
+        // This is the post-retention state: the older baseline row is gone,
+        // while the surviving modification still pins its snapshot.
+        db.insert_event(
+            project.id,
+            &file_str,
+            "MODIFIED",
+            Some("during_hash"),
+            Some("baseline_hash"),
+            None,
+            None,
+            Some(22),
+        )
+        .unwrap();
+        let session = db.stop_active_session(project.id).unwrap().unwrap();
+
+        assert!(
+            db.get_event_at_session_start(&session, &file_str)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_live_hashes(project.id)
+                .unwrap()
+                .contains("baseline_hash")
+        );
+
+        let plan = plan_paths_restore_at_session_start(
+            &db,
+            &project,
+            &root,
+            std::slice::from_ref(&file_str),
+            &session,
+        )
+        .unwrap();
+
+        assert_eq!(plan.entries.len(), 1);
+        match &plan.entries[0].action {
+            RestoreAction::Write { source } => assert_eq!(source.hash, "baseline_hash"),
+            other => panic!("expected baseline write, got {other:?}"),
+        }
     }
 
     /// Group recovery should only plan changes for the selected group's paths.

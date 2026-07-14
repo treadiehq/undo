@@ -45,6 +45,9 @@ fn group_from_events(id: String, events: Vec<&FileEvent>) -> ChangeGroup {
 
     for event in &events {
         paths.insert(event.path.clone());
+        if let Some(old_path) = &event.old_path {
+            paths.insert(old_path.clone());
+        }
         let (adds, dels) = diff_stats_for_event(event);
         inserted += adds;
         deleted += dels;
@@ -212,5 +215,26 @@ mod tests {
 
         let ids = groups.iter().map(|g| g.id.as_str()).collect::<Vec<_>>();
         assert_eq!(ids, vec!["cargo", "readme"]);
+    }
+
+    /// Reverting a rename requires both names: write the source path as it
+    /// existed before the session and remove the destination created by it.
+    #[test]
+    fn renamed_events_include_old_path_in_group_paths() {
+        let mut renamed = event(1, "/repo/src/billing/signin.rs");
+        renamed.event_type = "RENAMED".to_string();
+        renamed.old_path = Some("/repo/src/auth/login.rs".to_string());
+
+        let groups = build_groups(&project(), &[renamed]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "billing");
+        assert_eq!(
+            groups[0].paths,
+            vec![
+                "/repo/src/auth/login.rs".to_string(),
+                "/repo/src/billing/signin.rs".to_string()
+            ]
+        );
     }
 }

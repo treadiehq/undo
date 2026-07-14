@@ -433,6 +433,32 @@ impl Database {
             .context("failed to query event at time")
     }
 
+    /// Find the first event after a restore target that changed whether `path`
+    /// existed or what it contained. Matching `old_path` makes renames usable
+    /// for reconstructing the source name after older history is pruned.
+    pub fn get_first_path_event_after(
+        &self,
+        project_id: i64,
+        path: &str,
+        after_ts: i64,
+    ) -> Result<Option<FileEvent>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND timestamp > ?3
+                   AND (path = ?2 OR old_path = ?2)
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT 1",
+                params![project_id, path, after_ts],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query first path event after target")
+    }
+
     /// Find the newest restorable event at the exact start boundary of a
     /// session. The event id fence matters because watcher events and session
     /// commands are timestamped to whole seconds; events recorded after
@@ -466,6 +492,41 @@ impl Database {
             )
             .optional()
             .context("failed to query event at session start")
+    }
+
+    /// Find the first event involving `path` inside a session. Event-id fences
+    /// preserve the exact start boundary even when several events share a
+    /// second, and `old_path` exposes the source side of renames.
+    pub fn get_first_path_event_in_session(
+        &self,
+        session: &Session,
+        path: &str,
+    ) -> Result<Option<FileEvent>> {
+        let end_event_id = match session.end_event_id {
+            Some(id) => id,
+            None => self.max_event_id(session.project_id)?,
+        };
+        self.conn
+            .query_row(
+                "SELECT id, project_id, timestamp, path, event_type,
+                        current_hash, previous_hash, snapshot_path, old_path, file_size
+                 FROM file_events
+                 WHERE project_id = ?1
+                   AND id > ?3
+                   AND id <= ?4
+                   AND (path = ?2 OR old_path = ?2)
+                 ORDER BY id ASC
+                 LIMIT 1",
+                params![
+                    session.project_id,
+                    path,
+                    session.start_event_id,
+                    end_event_id
+                ],
+                row_to_event,
+            )
+            .optional()
+            .context("failed to query first path event in session")
     }
 
     /// Find the most recent DELETED event for a path, if any. A deleted file's

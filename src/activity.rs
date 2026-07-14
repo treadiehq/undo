@@ -170,11 +170,11 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
             latest.deleted_count,
             format_local_time(latest.end)
         );
-        let age_secs = Utc::now()
-            .timestamp()
-            .saturating_sub(latest.start.saturating_sub(1));
-        println!("  Preview: undo preview . {}s", age_secs);
-        println!("  Restore: undo panic --restore-before-latest-burst --yes");
+        let target = latest.start.saturating_sub(1);
+        let (preview_command, restore_command) = panic_restore_commands(target);
+        println!("  Target timestamp: {}", target);
+        println!("  Preview: {}", preview_command);
+        println!("  Restore: {}", restore_command);
     } else {
         println!("No large recent change bursts found.");
     }
@@ -208,6 +208,13 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
     println!();
     println!("Recommended first step: run a preview command before restoring.");
     Ok(())
+}
+
+fn panic_restore_commands(target: i64) -> (String, String) {
+    (
+        format!("undo restore . --timestamp {} --preview", target),
+        format!("undo restore . --timestamp {} --yes", target),
+    )
 }
 
 fn parse_since(since: Option<&str>) -> Result<Option<i64>> {
@@ -398,5 +405,13 @@ mod tests {
         let bursts = detect_bursts(&events);
         assert_eq!(bursts.len(), 1);
         assert_eq!(bursts[0].start, 120);
+    }
+
+    #[test]
+    fn panic_commands_share_the_exact_restore_target() {
+        let (preview, restore) = panic_restore_commands(999);
+
+        assert_eq!(preview, "undo restore . --timestamp 999 --preview");
+        assert_eq!(restore, "undo restore . --timestamp 999 --yes");
     }
 }

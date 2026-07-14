@@ -154,13 +154,16 @@ diff. For binary or oversized files it explains why text comparison is skipped.
 
 ### `undo restore <path> <duration>`
 
-Bring back an older version of a file or directory.
+Bring back an older version of a file or directory. Use `--timestamp` when an
+exact Unix timestamp must remain stable between preview and restore.
 
 ```bash
 undo restore src/server.rs 10m
 undo restore . 30m --preview
 undo restore . 30m --yes
 undo restore -c pre src/server.rs
+undo restore . --timestamp 1713200000 --preview
+undo restore . --timestamp 1713200000 --yes
 ```
 
 ```text

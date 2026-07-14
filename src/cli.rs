@@ -91,6 +91,13 @@ pub enum Command {
         /// Restore from a named checkpoint
         #[arg(short = 'c', long, visible_alias = "cp")]
         checkpoint: Option<String>,
+        /// Restore at an exact Unix timestamp in seconds
+        #[arg(
+            long,
+            value_name = "UNIX_SECONDS",
+            conflicts_with_all = ["duration", "checkpoint", "deleted"]
+        )]
+        timestamp: Option<i64>,
         /// Recover the latest deleted version of this path
         #[arg(long)]
         deleted: bool,
@@ -305,6 +312,7 @@ mod tests {
                 duration,
                 preview,
                 checkpoint,
+                timestamp,
                 deleted,
                 yes,
             } => {
@@ -312,11 +320,54 @@ mod tests {
                 assert_eq!(duration, None);
                 assert!(preview);
                 assert_eq!(checkpoint.as_deref(), Some("before-agent"));
+                assert_eq!(timestamp, None);
                 assert!(!deleted);
                 assert!(yes);
             }
             _ => panic!("expected restore command"),
         }
+    }
+
+    #[test]
+    fn parses_restore_absolute_timestamp_preview() {
+        let cli = Cli::try_parse_from([
+            "undo",
+            "restore",
+            ".",
+            "--timestamp",
+            "1713200000",
+            "--preview",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Restore {
+                path,
+                duration,
+                preview,
+                checkpoint,
+                timestamp,
+                deleted,
+                yes,
+            } => {
+                assert_eq!(path.as_deref(), Some("."));
+                assert_eq!(duration, None);
+                assert!(preview);
+                assert_eq!(checkpoint, None);
+                assert_eq!(timestamp, Some(1_713_200_000));
+                assert!(!deleted);
+                assert!(!yes);
+            }
+            _ => panic!("expected restore command"),
+        }
+    }
+
+    #[test]
+    fn restore_timestamp_conflicts_with_relative_duration() {
+        let result =
+            Cli::try_parse_from(["undo", "restore", ".", "10m", "--timestamp", "1713200000"]);
+
+        assert!(result.is_err());
     }
 
     #[test]

@@ -10,6 +10,19 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.1.17] — 2026-07-14
+
+- Restore now detects deleted directory scopes, allowing selective recovery
+  without restoring unrelated project changes.
+- Cross-directory renames and session baselines remain recoverable after older
+  event rows are pruned, using pinned `previous_hash` snapshots without
+  misclassifying files created after the restore target.
+- `undo ask` no longer mistakes clause keywords inside hyphenated group IDs for
+  preserve intent, and compact queries such as `keepalive` match `keep-alive`.
+- Panic-dashboard preview and restore commands now share an exact
+  `--timestamp` target, preventing relative-duration drift between preview and
+  application.
+
 ## [0.1.16] — 2026-07-09
 
 - Recovery UX: added checkpoint, preview, deleted-file listing, timeline burst,
