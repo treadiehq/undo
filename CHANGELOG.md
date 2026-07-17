@@ -10,6 +10,11 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-07-17
+
+- Fixed existing-file restore and delete operations failing on Linux with
+  `EBADF` while syncing capability-based backup directories.
+
 ## [0.2.1] — 2026-07-17
 
 - Restore and Recovery filesystem operations are now capability-confined to the
@@ -208,7 +213,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/treadiehq/undo/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/treadiehq/undo/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/treadiehq/undo/compare/v0.1.17...v0.2.0
 [0.1.17]: https://github.com/treadiehq/undo/compare/v0.1.16...v0.1.17

@@ -451,7 +451,16 @@ fn backup_name(
 }
 
 fn sync_dir(dir: &Dir) -> std::io::Result<()> {
-    dir.try_clone()?.into_std_file().sync_all()
+    // `Dir::open_dir` uses an O_PATH descriptor on Linux. O_PATH is sufficient
+    // for capability-relative traversal but fsync(2) rejects it with EBADF.
+    // Reopen "." through the capability with an explicit readable directory
+    // descriptor before syncing.
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .follow(FollowSymlinks::No);
+    dir.open_with(Path::new("."), &options)?.sync_all()
 }
 
 #[cfg(test)]
@@ -669,6 +678,16 @@ mod tests {
         assert_ne!(first_name, second_name);
         assert!(fs.project.symlink_metadata(&first_name).is_ok());
         assert!(fs.project.symlink_metadata(&second_name).is_ok());
+    }
+
+    #[test]
+    fn directory_sync_reopens_linux_path_only_capability() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = Dir::open_ambient_dir(tree.path(), ambient_authority()).unwrap();
+        root.create_dir("nested").unwrap();
+        let nested = root.open_dir("nested").unwrap();
+
+        sync_dir(&nested).unwrap();
     }
 
     #[test]
