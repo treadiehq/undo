@@ -19,6 +19,7 @@ mod models;
 mod recover;
 mod recoveries;
 mod restore;
+mod restore_fs;
 mod retention;
 mod runs;
 mod sessions;
@@ -58,16 +59,11 @@ pub fn set_test_data_dir(path: std::path::PathBuf) {
     TEST_DATA_DIR.with(|d| *d.borrow_mut() = Some(path));
 }
 
-pub fn backtrack_dir() -> Result<std::path::PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    // In test builds, honour the per-thread override so snapshot and retention
-    // I/O lands in a tempdir rather than ~/.undo.
+pub fn backtrack_dir_path() -> Result<std::path::PathBuf> {
     #[cfg(test)]
     {
         let test_dir = TEST_DATA_DIR.with(|d| d.borrow().clone());
         if let Some(dir) = test_dir {
-            std::fs::create_dir_all(&dir)?;
             return Ok(dir);
         }
     }
@@ -75,6 +71,13 @@ pub fn backtrack_dir() -> Result<std::path::PathBuf> {
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
         .join(".undo");
+    Ok(dir)
+}
+
+pub fn backtrack_dir() -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let dir = backtrack_dir_path()?;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(&dir)?;
@@ -372,7 +375,6 @@ fn main() {
             cli::SessionCommand::Stop => sessions::cmd_session_stop(),
             cli::SessionCommand::Show { name } => sessions::cmd_session_show(&name),
         },
-        cli::Command::Sessions => runs::cmd_runs(runs::Output::Text),
         cli::Command::Recover(args) => {
             recover::cmd_recover(&args.run, args.group.as_deref(), args.preview, args.yes)
         }

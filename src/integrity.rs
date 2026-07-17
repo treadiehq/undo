@@ -117,7 +117,8 @@ mod tests {
     fn verify_passes_when_snapshots_present() {
         let (_dir, db, pid) = setup();
         let content = b"present and readable";
-        snapshots::save_durable(pid, "good_hash", content).unwrap();
+        let publish_guard = snapshots::acquire_publish_guard().unwrap();
+        snapshots::save_durable(&publish_guard, pid, "good_hash", content).unwrap();
         db.insert_event(
             pid,
             "/proj/a.rs",

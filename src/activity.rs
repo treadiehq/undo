@@ -42,10 +42,7 @@ pub fn cmd_checkpoint_for(
         ),
         None => db.get_active_session(project.id)?.map(|run| run.id),
     };
-    let now = Utc::now().timestamp();
-    let event_id = db.max_event_id(project.id)?;
-    let (checkpoint, created) =
-        db.create_checkpoint_at(project.id, run_id, name, now, event_id, intent)?;
+    let (checkpoint, created) = db.create_checkpoint_now(project.id, run_id, name, intent)?;
 
     if json {
         println!(
@@ -121,7 +118,7 @@ pub fn cmd_timeline(
     let project = find_project(&db, &cwd)?;
     let since_ts = parse_since(since)?;
     let mut events = match since_ts {
-        Some(ts) => db.get_events_since(project.id, ts)?,
+        Some(ts) => db.get_events_since_limited(project.id, ts, limit)?,
         None => db.get_timeline(project.id, limit)?,
     };
 

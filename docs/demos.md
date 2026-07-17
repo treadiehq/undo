@@ -67,9 +67,9 @@ title=Realtime Dashboard
 ```
 
 Why it works: when a Run has no explicit intent boundaries, Undo uses
-deterministic path groups. Here those groups are `auth` and `dashboard`. There
-is no semantic model involved. Because the wanted and unwanted work use
-different files, whole-file baseline recovery is sufficient.
+deterministic path groups. Here those groups are `app-auth` and
+`app-dashboard`. There is no semantic model involved. Because the wanted and
+unwanted work use different files, whole-file baseline recovery is sufficient.
 
 Clean up the recorder before deleting the temporary project:
 

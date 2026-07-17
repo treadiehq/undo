@@ -108,6 +108,11 @@ undo recover --run r_421 --group auth --preview
 undo recover --run r_421 --group auth --yes
 ```
 
+Use the group IDs printed by `undo run show`. IDs retain enough path context to
+stay distinct: for example, `app/auth` and `lib/auth` are `app-auth` and
+`lib-auth`. If different paths still produce the same slug, Undo adds stable
+hash suffixes rather than merging their files.
+
 `--session` is an alias for `--run`. This path uses whole-file Run baselines; it
 does not use explicit intent inverse patches.
 

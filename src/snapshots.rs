@@ -1,14 +1,72 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_SNAPSHOT_SIZE: usize = 100 * 1024 * 1024; // 100 MiB
+const STORE_LOCK_FILE_NAME: &str = "snapshot-store.lock";
+
+/// Shared guard held while a snapshot is published and its database reference
+/// is committed. Garbage collection takes the corresponding exclusive lock, so
+/// it can never observe a published snapshot before its reference is visible.
+#[must_use = "the publication lock must be held through the database commit"]
+pub(crate) struct PublishGuard {
+    _file: fs::File,
+}
+
+/// Exclusive guard held while retention identifies and removes unreferenced
+/// snapshots. Dropping the file releases the advisory lock, including on panic.
+#[must_use = "the garbage-collection lock must be held through snapshot deletion"]
+pub(crate) struct GarbageCollectGuard {
+    _file: fs::File,
+}
+
+pub(crate) fn acquire_publish_guard() -> Result<PublishGuard> {
+    let base = crate::backtrack_dir()?;
+    Ok(PublishGuard {
+        _file: acquire_store_lock(&base, libc::LOCK_SH)?,
+    })
+}
+
+pub(crate) fn acquire_gc_guard() -> Result<GarbageCollectGuard> {
+    let base = crate::backtrack_dir()?;
+    Ok(GarbageCollectGuard {
+        _file: acquire_store_lock(&base, libc::LOCK_EX)?,
+    })
+}
+
+fn acquire_store_lock(base: &Path, operation: libc::c_int) -> Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = base.join(STORE_LOCK_FILE_NAME);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("failed to open snapshot store lock {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure snapshot store lock {}", path.display()))?;
+
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error)
+                .with_context(|| format!("failed to lock snapshot store {}", path.display()));
+        }
+    }
+}
 
 pub fn hash_bytes(content: &[u8]) -> String {
     crate::to_hex(&Sha256::digest(content))
@@ -106,14 +164,25 @@ fn write_snapshot_in(
 
 /// Fast, non-durable snapshot write under an explicit data-dir `base`, used by the
 /// parallel initial scan (see [`write_snapshot_in`] for why the scan skips fsync).
-pub fn save_in(base: &Path, project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
+pub fn save_in(
+    _guard: &PublishGuard,
+    base: &Path,
+    project_id: i64,
+    hash: &str,
+    content: &[u8],
+) -> Result<String> {
     write_snapshot_in(base, project_id, hash, content, false)
 }
 
 /// Durable snapshot write for the live watch path: fsyncs the snapshot file and its
 /// parent directory so a freshly captured version survives power loss. Use this for
 /// content that may be irreplaceable; the scan path uses the non-durable [`save_in`].
-pub fn save_durable(project_id: i64, hash: &str, content: &[u8]) -> Result<String> {
+pub fn save_durable(
+    _guard: &PublishGuard,
+    project_id: i64,
+    hash: &str,
+    content: &[u8],
+) -> Result<String> {
     write_snapshot_in(&crate::backtrack_dir()?, project_id, hash, content, true)
 }
 
@@ -179,6 +248,11 @@ pub fn count(project_id: i64) -> Result<usize> {
 mod tests {
     use super::*;
 
+    fn save_for_test(project_id: i64, hash: &str, content: &[u8]) {
+        let guard = acquire_publish_guard().unwrap();
+        save_durable(&guard, project_id, hash, content).unwrap();
+    }
+
     /// Content saved to a snapshot is recovered byte-for-byte on load.
     #[test]
     fn save_and_load_round_trip() {
@@ -186,7 +260,7 @@ mod tests {
         crate::set_test_data_dir(data_dir.path().to_path_buf());
 
         let content = b"hello, snapshot world\n";
-        save_durable(1, "roundtrip_hash", content).unwrap();
+        save_for_test(1, "roundtrip_hash", content);
         let loaded = load(1, "roundtrip_hash").unwrap();
         assert_eq!(loaded, content);
     }
@@ -198,9 +272,9 @@ mod tests {
         crate::set_test_data_dir(data_dir.path().to_path_buf());
 
         let content = b"duplicate content to save twice";
-        save_durable(1, "dedup_hash", content).unwrap();
+        save_for_test(1, "dedup_hash", content);
         // Second call must succeed — path.exists() guard skips the write.
-        save_durable(1, "dedup_hash", content).unwrap();
+        save_for_test(1, "dedup_hash", content);
         let loaded = load(1, "dedup_hash").unwrap();
         assert_eq!(loaded, content);
     }
@@ -245,12 +319,12 @@ mod tests {
         crate::set_test_data_dir(data_dir.path().to_path_buf());
 
         assert_eq!(count(42).unwrap(), 0, "no snapshots yet");
-        save_durable(42, "hash_a", b"content a").unwrap();
+        save_for_test(42, "hash_a", b"content a");
         assert_eq!(count(42).unwrap(), 1);
-        save_durable(42, "hash_b", b"content b").unwrap();
+        save_for_test(42, "hash_b", b"content b");
         assert_eq!(count(42).unwrap(), 2);
         // Saving the same hash again must not increase the count (deduplication).
-        save_durable(42, "hash_a", b"content a").unwrap();
+        save_for_test(42, "hash_a", b"content a");
         assert_eq!(count(42).unwrap(), 2);
     }
 
@@ -263,7 +337,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         crate::set_test_data_dir(data_dir.path().to_path_buf());
 
-        save_durable(7, "realhash", b"real snapshot").unwrap();
+        save_for_test(7, "realhash", b"real snapshot");
         assert_eq!(count(7).unwrap(), 1);
 
         // Simulate a temp file left behind by an interrupted/killed write.
@@ -276,5 +350,67 @@ mod tests {
             1,
             "a leaked .gz.tmp temp file must not be counted as a snapshot"
         );
+    }
+
+    #[test]
+    fn garbage_collection_waits_for_publishers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let publish_file = acquire_store_lock(data_dir.path(), libc::LOCK_SH).unwrap();
+        let base = data_dir.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let collector = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _gc_file = acquire_store_lock(&base, libc::LOCK_EX).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "exclusive garbage collection lock acquired while publisher was active"
+        );
+        drop(publish_file);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("collector did not acquire lock after publisher finished");
+        collector.join().unwrap();
+    }
+
+    #[test]
+    fn publishers_wait_before_writing_during_garbage_collection() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let gc_file = acquire_store_lock(data_dir.path(), libc::LOCK_EX).unwrap();
+        let base = data_dir.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let publisher = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _publish_file = acquire_store_lock(&base, libc::LOCK_SH).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "publisher entered the snapshot store during garbage collection"
+        );
+        drop(gc_file);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("publisher did not acquire lock after garbage collection finished");
+        publisher.join().unwrap();
     }
 }

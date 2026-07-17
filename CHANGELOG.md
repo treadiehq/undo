@@ -10,6 +10,27 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-07-17
+
+- Restore and Recovery filesystem operations are now capability-confined to the
+  watched project, rejecting path traversal, unsafe symlink targets, and TOCTOU
+  attempts before reads, writes, deletes, or backups.
+- Snapshot publication and retention pruning now coordinate through a
+  crash-safe shared/exclusive store lock, preventing concurrent prune from
+  deleting a newly written snapshot before its database reference commits.
+- Run, checkpoint, and intent event boundaries now use immediate transactions,
+  preventing concurrent daemon commits from being omitted or misattributed.
+- Recovery groups preserve top-level path context, so similarly named
+  directories such as `app/auth` and `lib/auth` cannot merge into one selection.
+- Diff and restore previews compare raw bytes and reversibly escape invalid
+  UTF-8, preventing distinct file contents from being reported as unchanged.
+- The daemon panic hook no longer waits on a logger mutex that may already be
+  held by the panicking thread.
+- `undo sessions --json` now behaves exactly like `undo runs --json`, and
+  `undo timeline --since ... --limit ...` now honors its event limit.
+- Intent recovery is idempotent when a file has already been manually restored
+  to its pre-intent state.
+
 ## [0.2.0] — 2026-07-14
 
 - Added Run-first recovery with stable `r_...` IDs, actor/agent/command metadata,
@@ -187,7 +208,9 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.1.17...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/treadiehq/undo/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/treadiehq/undo/compare/v0.1.17...v0.2.0
 [0.1.17]: https://github.com/treadiehq/undo/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/treadiehq/undo/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/treadiehq/undo/compare/v0.1.14...v0.1.15

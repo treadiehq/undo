@@ -1,14 +1,13 @@
 use crate::db::Database;
 use crate::duration;
 use crate::models::{FileEvent, Session, WatchedProject};
+use crate::restore_fs::{CappedRead, ProjectPath, RestoreFs};
 use crate::snapshots;
 use crate::{BOLD, GREEN, RED, RESET, YELLOW, find_project};
 use anyhow::Result;
 use chrono::Utc;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn cmd_restore(
     path: Option<&str>,
@@ -177,7 +176,7 @@ fn restore_deleted(path_str: &str, preview: bool) -> Result<()> {
         kind: RestoreKind::DeletedFallback,
     };
     let entry = RestorePlanEntry {
-        path: abs_path_str.clone(),
+        path: ProjectPath::from_absolute(Path::new(&project.root_path), &abs_path)?,
         rel_path: crate::relative_path(&abs_path_str, &project.root_path).to_string(),
         action: RestoreAction::Write { source },
         expected_current: None,
@@ -210,7 +209,7 @@ pub(crate) struct RestorePlan {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RestorePlanEntry {
-    pub(crate) path: String,
+    pub(crate) path: ProjectPath,
     pub(crate) rel_path: String,
     pub(crate) action: RestoreAction,
     pub(crate) expected_current: Option<ExpectedState>,
@@ -280,10 +279,11 @@ fn plan_single_file_restore(
     let Some(source) = source else {
         return Ok(Vec::new());
     };
+    let target = ProjectPath::from_absolute(Path::new(&project.root_path), abs_path)?;
 
     Ok(vec![RestorePlanEntry {
-        rel_path: crate::relative_path(&abs_path_str, &project.root_path).to_string(),
-        path: abs_path_str,
+        rel_path: target.display(),
+        path: target,
         action: RestoreAction::Write { source },
         expected_current: None,
     }])
@@ -297,32 +297,37 @@ fn plan_directory_restore(
 ) -> Result<Vec<RestorePlanEntry>> {
     let scope = abs_scope.to_string_lossy().to_string();
     let events = db.get_events_since(project.id, target_time)?;
-    let mut paths = std::collections::BTreeSet::new();
+    let fs = RestoreFs::open(project)?;
+    let mut paths = std::collections::BTreeMap::new();
 
     for event in events {
         if path_in_scope(&event.path, &scope) {
-            paths.insert(event.path);
+            let target = ProjectPath::from_stored(project, &event.path)?;
+            fs.validate(&target)?;
+            paths.insert(event.path, target);
         }
         if let Some(old_path) = event.old_path
             && path_in_scope(&old_path, &scope)
         {
-            paths.insert(old_path);
+            let target = ProjectPath::from_stored(project, &old_path)?;
+            fs.validate(&target)?;
+            paths.insert(old_path, target);
         }
     }
 
     let mut entries = Vec::new();
-    for path in paths {
-        let rel_path = crate::relative_path(&path, &project.root_path).to_string();
-        if let Some(source) = resolve_exact_source_at_time(db, project.id, &path, target_time)? {
+    for (db_path, target) in paths {
+        let rel_path = target.display();
+        if let Some(source) = resolve_exact_source_at_time(db, project.id, &db_path, target_time)? {
             entries.push(RestorePlanEntry {
-                path,
+                path: target,
                 rel_path,
                 action: RestoreAction::Write { source },
                 expected_current: None,
             });
-        } else if Path::new(&path).exists() {
+        } else if fs.exists(&target)? {
             entries.push(RestorePlanEntry {
-                path,
+                path: target,
                 rel_path,
                 action: RestoreAction::DeleteCreatedAfterTarget,
                 expected_current: None,
@@ -340,27 +345,26 @@ pub(crate) fn plan_paths_restore_at_session_start(
     paths: &[String],
     session: &Session,
 ) -> Result<RestorePlan> {
+    let fs = RestoreFs::open(project)?;
     let mut entries = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for path_str in paths {
-        let raw_path = cwd.join(path_str);
-        reject_raw_symlink(&raw_path, path_str)?;
-        let abs_path = crate::safe_resolve_path(cwd, path_str, &project.root_path)?;
-        let abs_path_str = abs_path.to_string_lossy().to_string();
-        if !seen.insert(abs_path_str.clone()) {
+        let (db_path, target) = target_from_input(project, cwd, path_str)?;
+        fs.validate(&target)?;
+        if !seen.insert(target.clone()) {
             continue;
         }
-        let rel_path = crate::relative_path(&abs_path_str, &project.root_path).to_string();
-        if let Some(source) = resolve_exact_source_at_session_start(db, session, &abs_path_str)? {
+        let rel_path = target.display();
+        if let Some(source) = resolve_exact_source_at_session_start(db, session, &db_path)? {
             entries.push(RestorePlanEntry {
-                path: abs_path_str,
+                path: target,
                 rel_path,
                 action: RestoreAction::Write { source },
                 expected_current: None,
             });
-        } else if abs_path.exists() {
+        } else if fs.exists(&target)? {
             entries.push(RestorePlanEntry {
-                path: abs_path_str,
+                path: target,
                 rel_path,
                 action: RestoreAction::DeleteCreatedAfterTarget,
                 expected_current: None,
@@ -379,26 +383,25 @@ pub(crate) fn plan_paths_restore_at_event_id(
     paths: &[String],
     event_id: i64,
 ) -> Result<RestorePlan> {
+    let fs = RestoreFs::open(project)?;
     let mut entries = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for path_str in paths {
-        let raw_path = cwd.join(path_str);
-        reject_raw_symlink(&raw_path, path_str)?;
-        let abs_path = crate::safe_resolve_path(cwd, path_str, &project.root_path)?;
-        let abs_path_str = abs_path.to_string_lossy().to_string();
-        if !seen.insert(abs_path_str.clone()) {
+        let (db_path, target) = target_from_input(project, cwd, path_str)?;
+        fs.validate(&target)?;
+        if !seen.insert(target.clone()) {
             continue;
         }
-        let rel_path = crate::relative_path(&abs_path_str, &project.root_path).to_string();
-        match resolve_state_at_event_id(db, project.id, &abs_path_str, event_id)? {
+        let rel_path = target.display();
+        match resolve_state_at_event_id(db, project.id, &db_path, event_id)? {
             BoundaryState::Present(source) => entries.push(RestorePlanEntry {
-                path: abs_path_str,
+                path: target,
                 rel_path,
                 action: RestoreAction::Write { source },
                 expected_current: None,
             }),
-            BoundaryState::Absent if abs_path.exists() => entries.push(RestorePlanEntry {
-                path: abs_path_str,
+            BoundaryState::Absent if fs.exists(&target)? => entries.push(RestorePlanEntry {
+                path: target,
                 rel_path,
                 action: RestoreAction::DeleteCreatedAfterTarget,
                 expected_current: None,
@@ -455,11 +458,30 @@ fn path_in_scope(path: &str, scope: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+fn target_from_input(
+    project: &WatchedProject,
+    cwd: &Path,
+    path_str: &str,
+) -> Result<(String, ProjectPath)> {
+    let path = Path::new(path_str);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let target = ProjectPath::from_absolute(Path::new(&project.root_path), &absolute)?;
+    Ok((absolute.to_string_lossy().to_string(), target))
+}
+
 pub(crate) fn print_restore_plan(
     project: &WatchedProject,
     plan: &RestorePlan,
     label: &str,
 ) -> Result<()> {
+    let fs = RestoreFs::open(project)?;
+    for entry in &plan.entries {
+        fs.validate(&entry.path)?;
+    }
     let writes = plan
         .entries
         .iter()
@@ -500,14 +522,14 @@ pub(crate) fn print_restore_plan(
                     entry.rel_path,
                     duration::format_elapsed(age)
                 );
-                print_entry_preview(project, entry, source)?;
+                print_entry_preview(&fs, project, entry, source)?;
             }
             RestoreAction::DeleteCreatedAfterTarget => {
                 println!(
                     "{}Would delete{} {} because it was created after the target time.",
                     RED, RESET, entry.rel_path
                 );
-                print_delete_preview(entry)?;
+                print_delete_preview(&fs, entry)?;
             }
         }
         println!();
@@ -517,33 +539,38 @@ pub(crate) fn print_restore_plan(
 }
 
 fn print_entry_preview(
+    fs: &RestoreFs,
     project: &WatchedProject,
     entry: &RestorePlanEntry,
     source: &RestoreSource,
 ) -> Result<()> {
     let restored = snapshots::load(project.id, &source.hash)?;
-    let path = Path::new(&entry.path);
-    if !path.exists() {
-        println!("  File does not exist now; restore would recreate it.");
-        return Ok(());
-    }
-    let Some(current) = crate::diff::read_capped(path, snapshots::MAX_SNAPSHOT_SIZE)? else {
-        println!("  Current file is too large to preview.");
-        return Ok(());
+    let current = match fs.read_capped(&entry.path, snapshots::MAX_SNAPSHOT_SIZE)? {
+        CappedRead::Missing => {
+            println!("  File does not exist now; restore would recreate it.");
+            return Ok(());
+        }
+        CappedRead::TooLarge => {
+            println!("  Current file is too large to preview.");
+            return Ok(());
+        }
+        CappedRead::Content(current) => current,
     };
     crate::diff::print_bytes_diff(&current, &restored, &entry.rel_path, "current", "restored")?;
     Ok(())
 }
 
-fn print_delete_preview(entry: &RestorePlanEntry) -> Result<()> {
-    let path = Path::new(&entry.path);
-    if !path.exists() {
-        println!("  File is already absent.");
-        return Ok(());
-    }
-    let Some(current) = crate::diff::read_capped(path, snapshots::MAX_SNAPSHOT_SIZE)? else {
-        println!("  Current file is too large to preview.");
-        return Ok(());
+fn print_delete_preview(fs: &RestoreFs, entry: &RestorePlanEntry) -> Result<()> {
+    let current = match fs.read_capped(&entry.path, snapshots::MAX_SNAPSHOT_SIZE)? {
+        CappedRead::Missing => {
+            println!("  File is already absent.");
+            return Ok(());
+        }
+        CappedRead::TooLarge => {
+            println!("  Current file is too large to preview.");
+            return Ok(());
+        }
+        CappedRead::Content(current) => current,
     };
     crate::diff::print_bytes_diff(&current, b"", &entry.rel_path, "current", "deleted")?;
     Ok(())
@@ -560,11 +587,26 @@ pub(crate) fn apply_restore_plan(
             plan.entries.len(),
         );
     }
+    let fs = RestoreFs::open(project)?;
+    apply_restore_plan_with_fs(project, plan, &fs)
+}
 
+pub(crate) fn apply_restore_plan_with_fs(
+    project: &WatchedProject,
+    plan: &RestorePlan,
+    fs: &RestoreFs,
+) -> Result<()> {
+    // Fail before the first mutation if any planned target is currently unsafe
+    // or no longer matches a persisted recovery's expected state.
     for entry in &plan.entries {
+        fs.validate(&entry.path)?;
+        ensure_expected_state(fs, entry)?;
+    }
+    for entry in &plan.entries {
+        ensure_expected_state(fs, entry)?;
         match &entry.action {
-            RestoreAction::Write { source } => apply_write(project, entry, source)?,
-            RestoreAction::DeleteCreatedAfterTarget => apply_delete(entry)?,
+            RestoreAction::Write { source } => apply_write(fs, project, entry, source)?,
+            RestoreAction::DeleteCreatedAfterTarget => apply_delete(fs, entry)?,
         }
     }
 
@@ -572,19 +614,12 @@ pub(crate) fn apply_restore_plan(
 }
 
 fn apply_write(
+    fs: &RestoreFs,
     project: &WatchedProject,
     entry: &RestorePlanEntry,
     source: &RestoreSource,
 ) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let abs_path = Path::new(&entry.path);
-    reject_raw_symlink(abs_path, &entry.rel_path)?;
     let content = snapshots::load(project.id, &source.hash)?;
-    let existing_mode = abs_path
-        .metadata()
-        .ok()
-        .map(|metadata| metadata.permissions().mode());
 
     match source.kind {
         RestoreKind::Exact => {}
@@ -604,17 +639,7 @@ fn apply_write(
         }
     }
 
-    let backup_path = if abs_path.exists() {
-        Some(create_restore_backup(abs_path)?)
-    } else {
-        None
-    };
-
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    write_restore_atomically(abs_path, &content, existing_mode)?;
+    let backup_path = fs.write(&entry.path, &content)?;
 
     let elapsed = Utc::now().timestamp() - source.timestamp;
     let ago = duration::format_elapsed(elapsed);
@@ -630,14 +655,10 @@ fn apply_write(
     Ok(())
 }
 
-fn apply_delete(entry: &RestorePlanEntry) -> Result<()> {
-    let abs_path = Path::new(&entry.path);
-    reject_raw_symlink(abs_path, &entry.rel_path)?;
-    if !abs_path.exists() {
+fn apply_delete(fs: &RestoreFs, entry: &RestorePlanEntry) -> Result<()> {
+    let Some(backup_path) = fs.delete(&entry.path)? else {
         return Ok(());
-    }
-    let backup_path = create_restore_backup(abs_path)?;
-    std::fs::remove_file(abs_path)?;
+    };
     println!(
         "{}Deleted{} {} and saved a backup to {}.",
         YELLOW,
@@ -645,6 +666,27 @@ fn apply_delete(entry: &RestorePlanEntry) -> Result<()> {
         entry.rel_path,
         backup_path.display()
     );
+    Ok(())
+}
+
+fn ensure_expected_state(fs: &RestoreFs, entry: &RestorePlanEntry) -> Result<()> {
+    let Some(expected) = &entry.expected_current else {
+        return Ok(());
+    };
+    let current = fs.read_capped(&entry.path, snapshots::MAX_SNAPSHOT_SIZE)?;
+    let (exists, hash) = match current {
+        CappedRead::Missing => (false, None),
+        CappedRead::TooLarge => {
+            anyhow::bail!("{} exceeds Undo's snapshot limit", entry.rel_path)
+        }
+        CappedRead::Content(content) => (true, Some(snapshots::hash_bytes(&content))),
+    };
+    if exists != expected.exists || hash != expected.hash {
+        anyhow::bail!(
+            "Restore stopped because {} changed after the recovery plan was created.",
+            entry.rel_path
+        );
+    }
     Ok(())
 }
 
@@ -810,130 +852,6 @@ fn resolve_exact_source_at_session_start(
     }
 }
 
-fn backup_timestamp_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-fn backup_path_hash(path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-
-    let digest = Sha256::digest(path.as_os_str().as_bytes());
-    crate::to_hex(&digest[..8])
-}
-
-fn backup_path_for(
-    abs_path: &Path,
-    backups_dir: &Path,
-    timestamp_nanos: u128,
-    attempt: usize,
-) -> PathBuf {
-    let filename = abs_path
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let path_hash = backup_path_hash(abs_path);
-    let retry_suffix = if attempt == 0 {
-        String::new()
-    } else {
-        format!(".{}", attempt)
-    };
-    backups_dir.join(format!(
-        "{}_{}_{}{}.bak",
-        filename, path_hash, timestamp_nanos, retry_suffix
-    ))
-}
-
-fn create_restore_backup(abs_path: &Path) -> Result<PathBuf> {
-    create_restore_backup_at(abs_path, backup_timestamp_nanos())
-}
-
-fn create_restore_backup_at(abs_path: &Path, timestamp_nanos: u128) -> Result<PathBuf> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let backups_dir = crate::backtrack_dir()?.join("backups");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .create(&backups_dir)?;
-    // Restrict backups dir to owner-only.
-    let _ = std::fs::set_permissions(&backups_dir, std::fs::Permissions::from_mode(0o700));
-
-    for attempt in 0..1000 {
-        let backup_path = backup_path_for(abs_path, &backups_dir, timestamp_nanos, attempt);
-        let open_result = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&backup_path);
-
-        let mut backup = match open_result {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        };
-
-        let mut current = std::fs::File::open(abs_path)?;
-        std::io::copy(&mut current, &mut backup)?;
-        backup.sync_all()?;
-        let _ = std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o600));
-        return Ok(backup_path);
-    }
-
-    anyhow::bail!(
-        "could not create a unique restore backup for {}",
-        abs_path.display()
-    );
-}
-
-/// Unique sibling path for the restore temp file — always distinct from `target`,
-/// including when `target` uses `.undo_tmp` or similar as its extension.
-fn restore_atomic_temp_path(target: &Path) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut s = target.as_os_str().to_os_string();
-    s.push(format!(".undo.partial.{}_{}", std::process::id(), nanos));
-    PathBuf::from(s)
-}
-
-/// Same pattern as `snapshots::save_in`: `create_new` temp, full write, `rename` into place.
-fn write_restore_atomically(target: &Path, content: &[u8], mode: Option<u32>) -> Result<()> {
-    let tmp_path = restore_atomic_temp_path(target);
-    let _ = std::fs::remove_file(&tmp_path);
-
-    let write_result = (|| -> std::io::Result<()> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
-        file.write_all(content)?;
-        if let Some(mode) = mode {
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
-        file.sync_all()?;
-        std::fs::rename(&tmp_path, target)?;
-        // Persist the rename itself: fsync the parent directory so the restored
-        // file's dirent survives power loss, matching the durable snapshot write.
-        // Best-effort — some filesystems reject directory fsync, and a restore that
-        // otherwise succeeded should not fail on it.
-        if let Some(parent) = target.parent() {
-            let _ = crate::snapshots::fsync_dir(parent);
-        }
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-
-    write_result.map_err(|e| e.into())
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -987,11 +905,12 @@ mod tests {
     }
 
     use super::{
-        RestoreAction, RestoreKind, backup_path_for, create_restore_backup_at, path_in_scope,
-        plan_paths_restore_at_session_start, plan_restore, plan_restore_at_event_id,
-        resolve_exact_source_at_time, resolve_restore_source, resolve_restore_time,
+        RestoreAction, RestoreKind, path_in_scope, plan_paths_restore_at_session_start,
+        plan_restore, plan_restore_at_event_id, resolve_exact_source_at_time,
+        resolve_restore_source, resolve_restore_time,
     };
     use crate::db::Database;
+    use crate::restore_fs::ProjectPath;
 
     fn mem_db() -> (Database, i64) {
         let db = Database::open_in_memory().unwrap();
@@ -1007,59 +926,6 @@ mod tests {
 
         assert_eq!(target, 1_713_200_000);
         assert_eq!(label, "Unix timestamp 1713200000");
-    }
-
-    /// Same-basename files in different directories must not collapse to the
-    /// same backup name when restored in the same timestamp window.
-    #[test]
-    fn backup_path_includes_full_path_fingerprint() {
-        let dir = tempfile::tempdir().unwrap();
-        let backups = dir.path().join("backups");
-        let first = dir.path().join("pkg-a/config.json");
-        let second = dir.path().join("pkg-b/config.json");
-
-        let first_backup = backup_path_for(&first, &backups, 123, 0);
-        let second_backup = backup_path_for(&second, &backups, 123, 0);
-
-        assert_ne!(
-            first_backup, second_backup,
-            "same basename and timestamp must still produce distinct backups"
-        );
-        assert!(
-            first_backup
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("config.json_"),
-            "backup name should remain recognizable"
-        );
-    }
-
-    /// Even if the exact computed name already exists, creating a backup must
-    /// allocate a fresh path instead of overwriting the earlier safety copy.
-    #[test]
-    fn create_restore_backup_never_overwrites_existing_backup() {
-        let data_dir = tempfile::tempdir().unwrap();
-        crate::set_test_data_dir(data_dir.path().to_path_buf());
-
-        let tree = tempfile::tempdir().unwrap();
-        let file = tree.path().join("pkg/config.json");
-        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "first state").unwrap();
-
-        let first_backup = create_restore_backup_at(&file, 123).unwrap();
-        std::fs::write(&file, "second state").unwrap();
-        let second_backup = create_restore_backup_at(&file, 123).unwrap();
-
-        assert_ne!(first_backup, second_backup);
-        assert_eq!(
-            std::fs::read_to_string(first_backup).unwrap(),
-            "first state"
-        );
-        assert_eq!(
-            std::fs::read_to_string(second_backup).unwrap(),
-            "second state"
-        );
     }
 
     /// A file deleted after its creating event aged out of retention must still
@@ -1266,7 +1132,8 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
         let target = b"#!/bin/sh\necho restored\n";
         let hash = crate::snapshots::hash_bytes(target);
-        crate::snapshots::save_durable(1, &hash, target).unwrap();
+        let publish_guard = crate::snapshots::acquire_publish_guard().unwrap();
+        crate::snapshots::save_durable(&publish_guard, 1, &hash, target).unwrap();
         let project = crate::models::WatchedProject {
             id: 1,
             root_path: root.to_string_lossy().to_string(),
@@ -1274,7 +1141,7 @@ mod tests {
         };
         let plan = super::RestorePlan {
             entries: vec![super::RestorePlanEntry {
-                path: file.to_string_lossy().to_string(),
+                path: ProjectPath::from_absolute(&root, &file).unwrap(),
                 rel_path: "tool.sh".to_string(),
                 action: RestoreAction::Write {
                     source: super::RestoreSource {
@@ -1337,6 +1204,87 @@ mod tests {
         assert!(path_in_scope("/proj/src/main.rs", "/proj/src"));
         assert!(path_in_scope("/proj/src", "/proj/src"));
         assert!(!path_in_scope("/proj/src-old/main.rs", "/proj/src"));
+    }
+
+    #[test]
+    fn directory_plan_rejects_database_path_through_outside_parent_symlink() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("sentinel.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        symlink(outside.path(), root.join("linked")).unwrap();
+        let event_path = root
+            .join("linked/sentinel.txt")
+            .to_string_lossy()
+            .to_string();
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        db.insert_event(
+            project.id,
+            &event_path,
+            "MODIFIED",
+            Some("after"),
+            Some("before"),
+            None,
+            None,
+            Some(1),
+        )
+        .unwrap();
+
+        let target = chrono::Utc::now().timestamp().saturating_sub(60);
+        assert!(plan_restore(&db, &project, &root, ".", target, true).is_err());
+        assert_eq!(std::fs::read_to_string(outside_file).unwrap(), "outside");
+    }
+
+    #[test]
+    fn directory_plan_rejects_parent_components_in_database_paths() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let event_path = format!("{}/scope/../../outside.txt", root.display());
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        db.insert_event(
+            project.id,
+            &event_path,
+            "CREATED",
+            Some("after"),
+            None,
+            None,
+            None,
+            Some(1),
+        )
+        .unwrap();
+
+        let target = chrono::Utc::now().timestamp().saturating_sub(60);
+        assert!(plan_restore(&db, &project, &root, ".", target, true).is_err());
+    }
+
+    #[test]
+    fn directory_plan_validates_rename_old_path_from_database() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), root.join("linked")).unwrap();
+        let old_path = root.join("linked/old.rs").to_string_lossy().to_string();
+        let new_path = root.join("new.rs").to_string_lossy().to_string();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        db.insert_event(
+            project.id,
+            &new_path,
+            "RENAMED",
+            Some("after"),
+            Some("before"),
+            None,
+            Some(&old_path),
+            Some(1),
+        )
+        .unwrap();
+
+        let target = chrono::Utc::now().timestamp().saturating_sub(60);
+        assert!(plan_restore(&db, &project, &root, ".", target, true).is_err());
     }
 
     /// Checkpoint-style restore planning should write the exact source available
@@ -1500,12 +1448,12 @@ mod tests {
         let old_entry = plan
             .entries
             .iter()
-            .find(|entry| entry.path == old_str)
+            .find(|entry| entry.path.absolute(&project) == old_path)
             .expect("the rename source should be restored");
         let new_entry = plan
             .entries
             .iter()
-            .find(|entry| entry.path == new_str)
+            .find(|entry| entry.path.absolute(&project) == new_path)
             .expect("the rename destination should be removed");
 
         match &old_entry.action {
@@ -1560,12 +1508,12 @@ mod tests {
         let old_entry = plan
             .entries
             .iter()
-            .find(|entry| entry.path == old_str)
+            .find(|entry| entry.path.absolute(&project) == old_path)
             .expect("the session should restore the rename source");
         let new_entry = plan
             .entries
             .iter()
-            .find(|entry| entry.path == new_str)
+            .find(|entry| entry.path.absolute(&project) == new_path)
             .expect("the session should remove the rename destination");
         match &old_entry.action {
             RestoreAction::Write { source } => assert_eq!(source.hash, "source_hash"),
@@ -1686,6 +1634,11 @@ mod tests {
 
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].rel_path, "src/auth/login.rs");
-        assert!(!plan.entries.iter().any(|entry| entry.path == billing_str));
+        assert!(
+            !plan
+                .entries
+                .iter()
+                .any(|entry| entry.path.absolute(&project) == billing)
+        );
     }
 }

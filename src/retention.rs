@@ -177,6 +177,12 @@ pub fn prune(
     config: &RetentionConfig,
     dry_run: bool,
 ) -> Result<PruneStats> {
+    // Snapshot publishers hold the shared side of this lock until their
+    // database references commit. Taking it exclusively before deleting old
+    // events closes both race directions: an in-flight publisher finishes
+    // first, while a new publisher waits before creating a visible snapshot.
+    let _gc_guard = crate::snapshots::acquire_gc_guard()?;
+
     let mut stats = PruneStats {
         events_deleted: 0,
         snapshots_deleted: 0,
@@ -771,6 +777,98 @@ mod tests {
             total_disk_usage().unwrap() <= cfg.max_size_bytes(),
             "reaping stale temps should bring the global store back under the cap"
         );
+    }
+
+    #[test]
+    fn prune_waits_for_snapshot_reference_to_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let data_path = data_dir.path().to_path_buf();
+        crate::set_test_data_dir(data_path.clone());
+        let db = Database::open().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+        let project_id = project.id;
+        let content = b"new content that must survive concurrent prune".to_vec();
+        let hash = crate::snapshots::hash_bytes(&content);
+        let expected_path = crate::snapshots::snapshot_path(project_id, &hash).unwrap();
+
+        let (published_tx, published_rx) = mpsc::channel();
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let publisher_data_path = data_path.clone();
+        let publisher_hash = hash.clone();
+        let publisher = std::thread::spawn(move || {
+            crate::set_test_data_dir(publisher_data_path);
+            let db = Database::open().unwrap();
+            let guard = crate::snapshots::acquire_publish_guard().unwrap();
+            let snapshot =
+                crate::snapshots::save_durable(&guard, project_id, &publisher_hash, &content)
+                    .unwrap();
+            published_tx.send(()).unwrap();
+            commit_rx.recv().unwrap();
+            db.transaction(|db| {
+                db.insert_event(
+                    project_id,
+                    "/proj/new.rs",
+                    "CREATED",
+                    Some(&publisher_hash),
+                    None,
+                    Some(&snapshot),
+                    None,
+                    Some(content.len() as i64),
+                )?;
+                db.upsert_file_state(
+                    project_id,
+                    "/proj/new.rs",
+                    &publisher_hash,
+                    true,
+                    content.len() as i64,
+                    None,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        published_rx.recv().unwrap();
+        assert!(
+            expected_path.exists(),
+            "publisher must expose the snapshot before committing its reference"
+        );
+
+        let (prune_started_tx, prune_started_rx) = mpsc::channel();
+        let (prune_finished_tx, prune_finished_rx) = mpsc::channel();
+        let pruner_data_path = data_path.clone();
+        let pruner = std::thread::spawn(move || {
+            crate::set_test_data_dir(pruner_data_path);
+            let db = Database::open().unwrap();
+            prune_started_tx.send(()).unwrap();
+            let result = prune(&db, project_id, &RetentionConfig::default(), false);
+            prune_finished_tx.send(result).unwrap();
+        });
+
+        prune_started_rx.recv().unwrap();
+        assert!(
+            prune_finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "prune must wait while a published snapshot has no committed reference"
+        );
+
+        commit_tx.send(()).unwrap();
+        publisher.join().unwrap();
+        prune_finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("prune did not finish after the publisher committed")
+            .unwrap();
+        pruner.join().unwrap();
+
+        assert!(
+            expected_path.exists(),
+            "prune deleted a snapshot whose reference committed concurrently"
+        );
+        assert!(db.get_live_hashes(project_id).unwrap().contains(&hash));
     }
 
     /// Backdate a file's mtime by `secs_ago` seconds via `utimes(2)` so the

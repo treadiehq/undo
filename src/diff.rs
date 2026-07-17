@@ -1,5 +1,7 @@
 use anyhow::Result;
 use similar::{ChangeTag, TextDiff};
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::Path;
 
@@ -12,6 +14,41 @@ use crate::{BOLD, DIM, GREEN, RED, RESET, find_project};
 /// first 8 KiB (same approach used by git and most editors).
 pub(crate) fn is_binary(data: &[u8]) -> bool {
     data.iter().take(8192).any(|&b| b == 0)
+}
+
+/// Render a pair of byte strings for an exact text diff. Valid UTF-8 remains
+/// unchanged. If either side is invalid UTF-8, both sides use an injective byte
+/// representation so distinct bytes can never collapse to the same U+FFFD text.
+pub(crate) fn render_bytes_for_diff<'a>(
+    old: &'a [u8],
+    new: &'a [u8],
+) -> (Cow<'a, str>, Cow<'a, str>) {
+    match (std::str::from_utf8(old), std::str::from_utf8(new)) {
+        (Ok(old), Ok(new)) => (Cow::Borrowed(old), Cow::Borrowed(new)),
+        _ => (Cow::Owned(escape_bytes(old)), Cow::Owned(escape_bytes(new))),
+    }
+}
+
+fn render_bytes(data: &[u8]) -> Cow<'_, str> {
+    std::str::from_utf8(data)
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|_| Cow::Owned(escape_bytes(data)))
+}
+
+fn escape_bytes(data: &[u8]) -> String {
+    let mut rendered = String::with_capacity(data.len());
+    for &byte in data {
+        match byte {
+            b'\n' => rendered.push('\n'),
+            b' '..=b'~' if byte != b'\\' => rendered.push(char::from(byte)),
+            b'\\' => rendered.push_str("\\\\"),
+            b'\t' => rendered.push_str("\\t"),
+            b'\r' => rendered.push_str("\\r"),
+            _ => write!(&mut rendered, "\\x{byte:02x}")
+                .expect("writing escaped bytes to a string cannot fail"),
+        }
+    }
+    rendered
 }
 
 /// Read at most `limit` bytes from `path`. Returns `None` if the file is
@@ -64,8 +101,6 @@ pub fn cmd_diff(
         return Ok(());
     }
 
-    let snapshot_text = String::from_utf8_lossy(&snapshot_content);
-
     if !abs_path.exists() {
         if event.event_type == "DELETED" {
             println!(
@@ -77,6 +112,7 @@ pub fn cmd_diff(
 
         println!("The current file is missing. Showing the selected saved version.");
         println!();
+        let snapshot_text = render_bytes(&snapshot_content);
         for line in snapshot_text.lines() {
             println!(" {}", line);
         }
@@ -99,13 +135,12 @@ pub fn cmd_diff(
         return Ok(());
     }
 
-    let current_text = String::from_utf8_lossy(&current_content);
-
-    if snapshot_text == current_text {
+    if snapshot_content == current_content {
         println!("The current file matches the selected saved version.");
         return Ok(());
     }
 
+    let (snapshot_text, current_text) = render_bytes_for_diff(&snapshot_content, &current_content);
     let rel = crate::relative_path(&abs_path_str, &project.root_path);
     if summary || stat {
         print_diff_stats(&snapshot_text, &current_text, rel);
@@ -216,12 +251,11 @@ pub(crate) fn print_bytes_diff(
         println!("{}: binary file — text comparison not available.", path);
         return Ok(());
     }
-    let old_text = String::from_utf8_lossy(old);
-    let new_text = String::from_utf8_lossy(new);
-    if old_text == new_text {
+    if old == new {
         println!("{}: no content changes.", path);
         return Ok(());
     }
+    let (old_text, new_text) = render_bytes_for_diff(old, new);
     print_unified_diff_with_labels(&old_text, &new_text, path, old_label, new_label);
     Ok(())
 }
@@ -269,6 +303,38 @@ mod tests {
         let mut data = vec![b'a'; 8193];
         data[8192] = 0;
         assert!(!is_binary(&data));
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_render_as_distinct_lossless_text() {
+        let old = b"\xe9l\xe8ve";
+        let new = b"\xe9l\xe9ve";
+        assert_ne!(old, new);
+
+        let (old_text, new_text) = render_bytes_for_diff(old, new);
+
+        assert_eq!(old_text, "\\xe9l\\xe8ve");
+        assert_eq!(new_text, "\\xe9l\\xe9ve");
+        assert_ne!(old_text, new_text);
+    }
+
+    #[test]
+    fn escaped_invalid_bytes_do_not_collide_with_literal_escape_text() {
+        let invalid = b"\xff";
+        let literal = b"\\xff";
+
+        let (invalid_text, literal_text) = render_bytes_for_diff(invalid, literal);
+
+        assert_eq!(invalid_text, "\\xff");
+        assert_eq!(literal_text, "\\\\xff");
+        assert_ne!(invalid_text, literal_text);
+    }
+
+    #[test]
+    fn valid_utf8_diff_rendering_is_unchanged() {
+        let (old, new) = render_bytes_for_diff("élève".as_bytes(), "élève!".as_bytes());
+        assert_eq!(old, "élève");
+        assert_eq!(new, "élève!");
     }
 
     /// A file under the byte limit is read in full and returned as Some.

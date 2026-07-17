@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Read;
@@ -95,15 +94,8 @@ fn process_event(event: &AgentEvent) -> Result<(Option<i64>, Value)> {
             let (db, project, _) = runs::prepare_project_boundary()?;
             let run = required_active_run(&db, project.id, event.run_id.as_deref())?;
             let name = required_checkpoint_name(event)?;
-            let event_id = db.max_event_id(project.id)?;
-            let (checkpoint, created) = db.create_checkpoint_at(
-                project.id,
-                Some(run.id),
-                name,
-                Utc::now().timestamp(),
-                event_id,
-                event.intent.as_deref(),
-            )?;
+            let (checkpoint, created) =
+                db.create_checkpoint_now(project.id, Some(run.id), name, event.intent.as_deref())?;
             Ok((
                 Some(run.id),
                 json!({
@@ -119,12 +111,7 @@ fn process_event(event: &AgentEvent) -> Result<(Option<i64>, Value)> {
             let (db, project, _) = runs::prepare_project_boundary()?;
             let run = required_active_run(&db, project.id, event.run_id.as_deref())?;
             let label = required_intent(event)?;
-            let intent = db.start_run_intent(
-                run.id,
-                label,
-                db.max_event_id(project.id)?,
-                Utc::now().timestamp(),
-            )?;
+            let intent = db.start_run_intent(run.id, label)?;
             Ok((
                 Some(run.id),
                 json!({
@@ -139,12 +126,7 @@ fn process_event(event: &AgentEvent) -> Result<(Option<i64>, Value)> {
         "intent_completed" => {
             let (db, project, _) = runs::prepare_project_boundary()?;
             let run = required_active_run(&db, project.id, event.run_id.as_deref())?;
-            let intent = db.complete_run_intent(
-                run.id,
-                event.intent.as_deref(),
-                db.max_event_id(project.id)?,
-                Utc::now().timestamp(),
-            )?;
+            let intent = db.complete_run_intent(run.id, event.intent.as_deref())?;
             Ok((
                 Some(run.id),
                 json!({

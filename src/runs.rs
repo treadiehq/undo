@@ -67,14 +67,6 @@ pub fn cmd_run_stop(reference: Option<&str>, status: &str, output: Output) -> Re
             .get_active_session(project.id)?
             .ok_or_else(|| anyhow::anyhow!("No active Run."))?,
     };
-    if let Some(intent) = db.get_active_run_intent(run.id)? {
-        db.complete_run_intent(
-            run.id,
-            Some(&intent.label),
-            db.max_event_id(project.id)?,
-            Utc::now().timestamp(),
-        )?;
-    }
     let run = db.complete_run(run.id, status)?;
     print_completed(&run, output);
     Ok(run)

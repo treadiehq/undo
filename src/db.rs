@@ -338,17 +338,32 @@ impl Database {
     /// condition, so we catch it loudly in debug builds instead of letting it
     /// surface as an opaque SQL error in production.
     pub fn transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        self.transaction_with("BEGIN", f)
+    }
+
+    /// Run `f` after acquiring SQLite's write-reservation lock. Use this for
+    /// event boundaries: the lock makes the boundary's timestamp, maximum event
+    /// ID, and persisted row one atomic point relative to daemon event commits.
+    pub fn immediate_transaction<R>(&self, f: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        self.transaction_with("BEGIN IMMEDIATE", f)
+    }
+
+    fn transaction_with<R>(
+        &self,
+        begin_statement: &str,
+        f: impl FnOnce(&Self) -> Result<R>,
+    ) -> Result<R> {
         #[cfg(debug_assertions)]
         IN_TRANSACTION.with(|flag| {
             assert!(
                 !flag.get(),
-                "db.transaction() is not reentrant — a nested call would emit BEGIN within BEGIN"
+                "database transactions are not reentrant — a nested call would emit BEGIN within BEGIN"
             );
             flag.set(true);
         });
 
         let result = (|| {
-            self.conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch(begin_statement)?;
             match f(self) {
                 Ok(value) => {
                     self.conn.execute_batch("COMMIT")?;
@@ -512,6 +527,29 @@ impl Database {
         events
             .collect::<Result<Vec<_>, _>>()
             .context("failed to query events")
+    }
+
+    pub fn get_events_since_limited(
+        &self,
+        project_id: i64,
+        since_timestamp: i64,
+        limit: usize,
+    ) -> Result<Vec<FileEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, timestamp, path, event_type,
+                    current_hash, previous_hash, snapshot_path, old_path, file_size
+             FROM file_events
+             WHERE project_id = ?1 AND timestamp >= ?2
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?3",
+        )?;
+        let events = stmt.query_map(
+            params![project_id, since_timestamp, limit as i64],
+            row_to_event,
+        )?;
+        events
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query limited events")
     }
 
     pub fn get_latest_event(&self, project_id: i64, path: &str) -> Result<Option<FileEvent>> {
@@ -968,41 +1006,43 @@ impl Database {
         intent: Option<&str>,
         external_id: Option<&str>,
     ) -> Result<Session> {
-        let now = Utc::now().timestamp();
-        if let Some(external_id) = external_id
-            && let Some(existing) = self.get_run_by_external_id(project_id, external_id)?
-        {
-            return Ok(existing);
-        }
-        if let Some(active) = self.get_active_session(project_id)? {
-            anyhow::bail!(
-                "Run {} ('{}') is already active. Complete it before starting another.",
-                active.public_id(),
-                active.name,
-            );
-        }
-        let start_event_id = self.max_event_id(project_id)?;
-        self.conn.execute(
-            "INSERT INTO sessions
-                (project_id, name, kind, actor, agent, command, intent, external_id,
-                 status, started_at, start_event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11)",
-            params![
-                project_id,
-                name,
-                kind,
-                actor,
-                agent,
-                command,
-                intent,
-                external_id,
-                now,
-                start_event_id,
-                now
-            ],
-        )?;
-        self.get_session_by_id(self.conn.last_insert_rowid())?
-            .ok_or_else(|| anyhow::anyhow!("failed to read Run after creating it"))
+        self.immediate_transaction(|db| {
+            let now = Utc::now().timestamp();
+            if let Some(external_id) = external_id
+                && let Some(existing) = db.get_run_by_external_id(project_id, external_id)?
+            {
+                return Ok(existing);
+            }
+            if let Some(active) = db.get_active_session(project_id)? {
+                anyhow::bail!(
+                    "Run {} ('{}') is already active. Complete it before starting another.",
+                    active.public_id(),
+                    active.name,
+                );
+            }
+            let start_event_id = db.max_event_id(project_id)?;
+            db.conn.execute(
+                "INSERT INTO sessions
+                    (project_id, name, kind, actor, agent, command, intent, external_id,
+                     status, started_at, start_event_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11)",
+                params![
+                    project_id,
+                    name,
+                    kind,
+                    actor,
+                    agent,
+                    command,
+                    intent,
+                    external_id,
+                    now,
+                    start_event_id,
+                    now
+                ],
+            )?;
+            db.get_session_by_id(db.conn.last_insert_rowid())?
+                .ok_or_else(|| anyhow::anyhow!("failed to read Run after creating it"))
+        })
     }
 
     pub fn stop_active_session(&self, project_id: i64) -> Result<Option<Session>> {
@@ -1013,18 +1053,21 @@ impl Database {
     }
 
     pub fn complete_run(&self, run_id: i64, status: &str) -> Result<Session> {
-        let session = self.get_session_by_id(run_id)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Run r_{} not found. Use `undo run list` to see available Runs.",
-                run_id
-            )
-        })?;
-        if session.ended_at.is_some() {
-            return Ok(session);
-        }
-        let ended_at = Utc::now().timestamp();
-        let end_event_id = self.max_event_id(session.project_id)?;
-        self.transaction(|db| {
+        self.immediate_transaction(|db| {
+            let session = db.get_session_by_id(run_id)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Run r_{} not found. Use `undo run list` to see available Runs.",
+                    run_id
+                )
+            })?;
+            if session.ended_at.is_some() {
+                return Ok(session);
+            }
+            let ended_at = Utc::now().timestamp();
+            let end_event_id = db.max_event_id(session.project_id)?;
+            if let Some(intent) = db.get_active_run_intent(session.id)? {
+                db.complete_run_intent_at(session.id, Some(&intent.label), end_event_id, ended_at)?;
+            }
             db.conn.execute(
                 "UPDATE sessions
                  SET ended_at = ?1, end_event_id = ?2, status = ?3
@@ -1039,10 +1082,9 @@ impl Database {
                 session.start_event_id,
                 end_event_id,
             )?;
-            Ok(())
-        })?;
-        self.get_session_by_id(session.id)
-            .and_then(|run| run.ok_or_else(|| anyhow::anyhow!("failed to read completed Run")))
+            db.get_session_by_id(session.id)?
+                .ok_or_else(|| anyhow::anyhow!("failed to read completed Run"))
+        })
     }
 
     pub fn list_sessions(&self, project_id: i64) -> Result<Vec<Session>> {
@@ -1234,13 +1276,29 @@ impl Database {
     // ── checkpoint operations ───────────────────────────────────────
 
     pub fn create_checkpoint(&self, project_id: i64, name: &str, timestamp: i64) -> Result<()> {
-        let run_id = self.get_active_session(project_id)?.map(|run| run.id);
-        let event_id = self.max_event_id(project_id)?;
-        self.create_checkpoint_at(project_id, run_id, name, timestamp, event_id, None)?;
-        Ok(())
+        self.immediate_transaction(|db| {
+            let run_id = db.get_active_session(project_id)?.map(|run| run.id);
+            let event_id = db.max_event_id(project_id)?;
+            db.create_checkpoint_at(project_id, run_id, name, timestamp, event_id, None)?;
+            Ok(())
+        })
     }
 
-    pub fn create_checkpoint_at(
+    pub fn create_checkpoint_now(
+        &self,
+        project_id: i64,
+        run_id: Option<i64>,
+        name: &str,
+        intent: Option<&str>,
+    ) -> Result<(Checkpoint, bool)> {
+        self.immediate_transaction(|db| {
+            let timestamp = Utc::now().timestamp();
+            let event_id = db.max_event_id(project_id)?;
+            db.create_checkpoint_at(project_id, run_id, name, timestamp, event_id, intent)
+        })
+    }
+
+    fn create_checkpoint_at(
         &self,
         project_id: i64,
         run_id: Option<i64>,
@@ -1376,7 +1434,20 @@ impl Database {
 
     // ── Run intent operations ───────────────────────────────────────
 
-    pub fn start_run_intent(
+    pub fn start_run_intent(&self, run_id: i64, label: &str) -> Result<RunIntent> {
+        self.immediate_transaction(|db| {
+            let run = db
+                .get_session_by_id(run_id)?
+                .ok_or_else(|| anyhow::anyhow!("Run r_{} not found.", run_id))?;
+            if run.ended_at.is_some() {
+                anyhow::bail!("Run {} is already completed.", run.public_id());
+            }
+            let event_id = db.max_event_id(run.project_id)?;
+            db.start_run_intent_at(run_id, label, event_id, Utc::now().timestamp())
+        })
+    }
+
+    fn start_run_intent_at(
         &self,
         run_id: i64,
         label: &str,
@@ -1402,7 +1473,20 @@ impl Database {
             .ok_or_else(|| anyhow::anyhow!("failed to read intent after creating it"))
     }
 
-    pub fn complete_run_intent(
+    pub fn complete_run_intent(&self, run_id: i64, label: Option<&str>) -> Result<RunIntent> {
+        self.immediate_transaction(|db| {
+            let run = db
+                .get_session_by_id(run_id)?
+                .ok_or_else(|| anyhow::anyhow!("Run r_{} not found.", run_id))?;
+            if run.ended_at.is_some() {
+                anyhow::bail!("Run {} is already completed.", run.public_id());
+            }
+            let event_id = db.max_event_id(run.project_id)?;
+            db.complete_run_intent_at(run_id, label, event_id, Utc::now().timestamp())
+        })
+    }
+
+    fn complete_run_intent_at(
         &self,
         run_id: i64,
         label: Option<&str>,
@@ -1986,6 +2070,27 @@ mod tests {
         assert_eq!(db.count_events(p.id).unwrap(), 2);
     }
 
+    #[test]
+    fn get_events_since_limited_returns_newest_events_within_window() {
+        let db = db();
+        let p = project(&db);
+        for (path, timestamp) in [
+            ("/home/user/project/outside-window.rs", 99),
+            ("/home/user/project/first.rs", 100),
+            ("/home/user/project/second.rs", 101),
+            ("/home/user/project/third.rs", 102),
+        ] {
+            db.insert_event_at(p.id, path, "MODIFIED", timestamp)
+                .unwrap();
+        }
+
+        let events = db.get_events_since_limited(p.id, 100, 2).unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].path, "/home/user/project/third.rs");
+        assert_eq!(events[1].path, "/home/user/project/second.rs");
+    }
+
     /// Same-second events must resolve deterministically to the newest inserted
     /// row, otherwise preview and restore can disagree during rapid edits.
     #[test]
@@ -2207,28 +2312,78 @@ mod tests {
         let db = db();
         let p = project(&db);
         let run = db.start_session(p.id, "work", "manual").unwrap();
-        db.start_run_intent(run.id, "first task", 0, 10).unwrap();
+        db.start_run_intent_at(run.id, "first task", 0, 10).unwrap();
 
         let already_active = db
-            .start_run_intent(run.id, "second task", 0, 11)
+            .start_run_intent_at(run.id, "second task", 0, 11)
             .unwrap_err()
             .to_string();
         assert!(already_active.contains("already has an active intent"));
         assert!(already_active.contains("Complete it before starting another"));
 
         let wrong_intent = db
-            .complete_run_intent(run.id, Some("second task"), 0, 12)
+            .complete_run_intent_at(run.id, Some("second task"), 0, 12)
             .unwrap_err()
             .to_string();
         assert!(wrong_intent.contains("active intent 'first task'"));
         assert!(wrong_intent.contains("omit 'intent'"));
 
-        db.complete_run_intent(run.id, None, 0, 13).unwrap();
+        db.complete_run_intent_at(run.id, None, 0, 13).unwrap();
         let no_active = db
-            .complete_run_intent(run.id, None, 0, 14)
+            .complete_run_intent_at(run.id, None, 0, 14)
             .unwrap_err()
             .to_string();
         assert!(no_active.contains("Send intent_started before intent_completed"));
+    }
+
+    #[test]
+    fn run_completion_closes_active_intent_at_the_same_boundary() {
+        let db = db();
+        let p = project(&db);
+        let run = db.start_session(p.id, "intent-boundary", "manual").unwrap();
+        db.start_run_intent(run.id, "edit auth").unwrap();
+        db.insert_event(
+            p.id,
+            "/home/user/project/src/auth.rs",
+            "MODIFIED",
+            Some("new_hash"),
+            Some("old_hash"),
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+
+        let completed = db.complete_run(run.id, "completed").unwrap();
+        let intents = db.list_run_intents(run.id).unwrap();
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].end_event_id, completed.end_event_id);
+        assert_eq!(intents[0].ended_at, completed.ended_at);
+    }
+
+    #[test]
+    fn checkpoint_now_captures_the_latest_committed_event() {
+        let db = db();
+        let p = project(&db);
+        db.insert_event(
+            p.id,
+            "/home/user/project/src/checkpoint.rs",
+            "MODIFIED",
+            Some("new_hash"),
+            None,
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+
+        let (checkpoint, created) = db
+            .create_checkpoint_now(p.id, None, "latest", None)
+            .unwrap();
+
+        assert!(created);
+        assert_eq!(checkpoint.event_id, Some(db.max_event_id(p.id).unwrap()));
     }
 
     #[test]
@@ -2347,6 +2502,138 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(paths, vec!["/home/user/project/src/agent.rs"]);
+    }
+
+    #[test]
+    fn run_completion_waits_for_an_inflight_event_commit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let db = Database::open().unwrap();
+        let p = project(&db);
+        let run = db.start_session(p.id, "concurrent-stop", "manual").unwrap();
+        let writer_db = Database::open().unwrap();
+        let stopper_db = Database::open().unwrap();
+        let project_id = p.id;
+
+        let (inserted_tx, inserted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_db
+                .immediate_transaction(|db| {
+                    db.insert_event(
+                        project_id,
+                        "/home/user/project/src/concurrent.rs",
+                        "MODIFIED",
+                        Some("new_hash"),
+                        Some("old_hash"),
+                        None,
+                        None,
+                        Some(10),
+                    )?;
+                    inserted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+
+        inserted_rx.recv().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let run_id = run.id;
+        let stopper = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(stopper_db.complete_run(run_id, "completed"))
+                .unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "Run completion must wait for the active event writer"
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let completed = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Run completion did not resume after the event committed")
+            .unwrap();
+        stopper.join().unwrap();
+
+        let committed_event_id = db.max_event_id(project_id).unwrap();
+        assert_eq!(completed.end_event_id, Some(committed_event_id));
+        let events = db.get_session_events(&completed).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "/home/user/project/src/concurrent.rs");
+    }
+
+    #[test]
+    fn run_start_waits_for_an_inflight_baseline_event() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let db = Database::open().unwrap();
+        let p = project(&db);
+        let writer_db = Database::open().unwrap();
+        let starter_db = Database::open().unwrap();
+        let project_id = p.id;
+
+        let (inserted_tx, inserted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_db
+                .immediate_transaction(|db| {
+                    db.insert_event(
+                        project_id,
+                        "/home/user/project/src/baseline.rs",
+                        "MODIFIED",
+                        Some("baseline_hash"),
+                        None,
+                        None,
+                        None,
+                        Some(10),
+                    )?;
+                    inserted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+
+        inserted_rx.recv().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let starter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(starter_db.start_session(project_id, "concurrent-start", "manual"))
+                .unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "Run start must wait for the active event writer"
+        );
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let started = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Run start did not resume after the event committed")
+            .unwrap();
+        starter.join().unwrap();
+
+        assert_eq!(started.start_event_id, db.max_event_id(project_id).unwrap());
     }
 
     // ── file_state ───────────────────────────────────────────────────

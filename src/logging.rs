@@ -138,9 +138,29 @@ pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
-        to_file(Level::Error, &format!("PANIC: {}\n{}", info, backtrace));
+        let message = format!("PANIC: {}\n{}", info, backtrace);
+        if !try_to_file(Level::Error, &message) {
+            // A panic may have occurred while this thread held LOGGER. Never wait
+            // for that lock from the panic hook because unwinding cannot release
+            // the guard until the hook returns.
+            let _ = writeln!(std::io::stderr().lock(), "{}", message);
+        }
         previous(info);
     }));
+}
+
+fn try_to_file(level: Level, msg: &str) -> bool {
+    LOGGER
+        .get()
+        .is_some_and(|handle| try_write_line(handle, level, msg))
+}
+
+fn try_write_line(handle: &Mutex<Logger>, level: Level, msg: &str) -> bool {
+    let Ok(mut logger) = handle.try_lock() else {
+        return false;
+    };
+    logger.write_line(level, msg);
+    true
 }
 
 fn to_file(level: Level, msg: &str) {
@@ -244,6 +264,26 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("first") && contents.contains("second"));
         assert_eq!(contents.lines().count(), 2);
+    }
+
+    /// Panic-path logging must return immediately when a log write already owns
+    /// the mutex; blocking here would deadlock before unwinding can drop the guard.
+    #[test]
+    fn panic_log_write_skips_locked_logger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let handle =
+            Mutex::new(Logger::open(path.clone(), MAX_LOG_BYTES).expect("open test logger"));
+        let guard = handle.lock().unwrap();
+
+        assert!(!try_write_line(
+            &handle,
+            Level::Error,
+            "panic while logging"
+        ));
+
+        drop(guard);
+        assert!(std::fs::read_to_string(path).unwrap().is_empty());
     }
 
     /// Once the active log passes the cap it is rotated to `<name>.1` and a fresh

@@ -160,6 +160,7 @@ pub enum Command {
     },
 
     /// List recorded work
+    #[command(visible_alias = "sessions")]
     Runs {
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -187,9 +188,6 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
-
-    /// Compatibility alias for `undo runs`
-    Sessions,
 
     /// Preview or apply recovery for a Run or group of file changes
     Recover(RecoverArgs),
@@ -525,6 +523,16 @@ mod tests {
                 command: SessionCommand::Show { name },
             } => assert_eq!(name, "agent-auth-work"),
             _ => panic!("expected session show command"),
+        }
+    }
+
+    #[test]
+    fn sessions_alias_accepts_runs_json_flag() {
+        let cli = Cli::try_parse_from(["undo", "sessions", "--json"]).unwrap();
+
+        match cli.command {
+            Command::Runs { json } => assert!(json),
+            _ => panic!("expected sessions alias to parse as runs"),
         }
     }
 

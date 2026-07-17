@@ -238,6 +238,7 @@ fn scan_worker_count() -> usize {
 fn scan_one(
     path_str: &str,
     existing: &HashMap<&str, &FileState>,
+    publish_guard: &snapshots::PublishGuard,
     project_id: i64,
     base: &Path,
 ) -> Result<Option<ScanWrite>> {
@@ -268,7 +269,7 @@ fn scan_one(
             }))
         }
         Some(state) => {
-            let snapshot = snapshots::save_in(base, project_id, &hash, &content)?;
+            let snapshot = snapshots::save_in(publish_guard, base, project_id, &hash, &content)?;
             Ok(Some(ScanWrite::Modified {
                 path: path_str.to_string(),
                 prev_hash: state.latest_hash.clone(),
@@ -279,7 +280,7 @@ fn scan_one(
             }))
         }
         None => {
-            let snapshot = snapshots::save_in(base, project_id, &hash, &content)?;
+            let snapshot = snapshots::save_in(publish_guard, base, project_id, &hash, &content)?;
             Ok(Some(ScanWrite::Created {
                 path: path_str.to_string(),
                 hash,
@@ -307,6 +308,7 @@ fn report_scan_failure(path: &str, e: &anyhow::Error) {
 fn scan_pipeline(
     paths: &[String],
     existing: &HashMap<&str, &FileState>,
+    publish_guard: &snapshots::PublishGuard,
     project_id: i64,
     base: &Path,
 ) -> Vec<ScanWrite> {
@@ -314,13 +316,15 @@ fn scan_pipeline(
     if workers <= 1 || paths.len() < 64 {
         return paths
             .iter()
-            .filter_map(|p| match scan_one(p, existing, project_id, base) {
-                Ok(write) => write,
-                Err(e) => {
-                    report_scan_failure(p, &e);
-                    None
-                }
-            })
+            .filter_map(
+                |p| match scan_one(p, existing, publish_guard, project_id, base) {
+                    Ok(write) => write,
+                    Err(e) => {
+                        report_scan_failure(p, &e);
+                        None
+                    }
+                },
+            )
             .collect();
     }
 
@@ -334,7 +338,7 @@ fn scan_pipeline(
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(path) = paths.get(i) else { break };
-                    match scan_one(path, existing, project_id, base) {
+                    match scan_one(path, existing, publish_guard, project_id, base) {
                         Ok(Some(write)) => {
                             let _ = tx.send(write);
                         }
@@ -397,7 +401,8 @@ fn initial_scan_with_limit(
 
     // Read + hash + snapshot in parallel; the database is untouched until now.
     let base = crate::backtrack_dir()?;
-    let writes = scan_pipeline(&paths, &existing, project.id, &base);
+    let publish_guard = snapshots::acquire_publish_guard()?;
+    let writes = scan_pipeline(&paths, &existing, &publish_guard, project.id, &base);
     let change_count = writes
         .iter()
         .filter(|w| !matches!(w, ScanWrite::Unchanged { .. }))
@@ -874,7 +879,13 @@ fn handle_create(
 
     // Durable: a live-path snapshot may be the only copy of this content, so it
     // must survive power loss before the event that references it commits (#41).
-    let snap = Some(snapshots::save_durable(project.id, &hash, &content)?);
+    let publish_guard = snapshots::acquire_publish_guard()?;
+    let snap = Some(snapshots::save_durable(
+        &publish_guard,
+        project.id,
+        &hash,
+        &content,
+    )?);
 
     // macOS FSEvents can report overwrites as CREATE events.
     // If the file is already tracked and alive, record MODIFIED instead.
@@ -969,7 +980,13 @@ fn handle_modify(
             }
 
             // Durable snapshot before the committing event (#41).
-            let snap = Some(snapshots::save_durable(project.id, &hash, &content)?);
+            let publish_guard = snapshots::acquire_publish_guard()?;
+            let snap = Some(snapshots::save_durable(
+                &publish_guard,
+                project.id,
+                &hash,
+                &content,
+            )?);
 
             db.transaction(|db| {
                 db.insert_event(
@@ -1087,7 +1104,13 @@ fn handle_rename(
         .and_then(|s| if s.exists_now { s.latest_hash } else { None });
 
     // Durable snapshot before the committing event (#41).
-    let snap = Some(snapshots::save_durable(project.id, &hash, &content)?);
+    let publish_guard = snapshots::acquire_publish_guard()?;
+    let snap = Some(snapshots::save_durable(
+        &publish_guard,
+        project.id,
+        &hash,
+        &content,
+    )?);
 
     // The RENAMED event, the old path's deletion, and the new path's state all
     // commit together so a crash can't split the rename across two autocommits (#41).
