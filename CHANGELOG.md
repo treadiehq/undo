@@ -10,6 +10,14 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-07-20
+
+- Recorder auto-start now detects an early daemon exit and surfaces its actual
+  logged startup error instead of waiting for the ten-second timeout.
+- Restore writes and deletes now use atomic no-clobber, exchange, and quarantine
+  operations so concurrently created or replaced files are never discarded
+  without preserving their exact contents.
+
 ## [0.2.2] — 2026-07-17
 
 - Fixed existing-file restore and delete operations failing on Linux with
@@ -213,7 +221,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/treadiehq/undo/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/treadiehq/undo/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/treadiehq/undo/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/treadiehq/undo/compare/v0.1.17...v0.2.0

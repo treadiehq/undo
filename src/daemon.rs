@@ -31,8 +31,11 @@ pub fn ensure_recording(root: &Path) -> Result<bool> {
         return Ok(false);
     }
 
+    let bt_dir = backtrack_dir()?;
+    let log_path = crate::logging::log_path(&bt_dir);
+    let log_cursor = startup_log_cursor(&log_path);
     let executable = std::env::current_exe()?;
-    std::process::Command::new(executable)
+    let mut child = std::process::Command::new(executable)
         .arg("start")
         .current_dir(root)
         .stdin(std::process::Stdio::null())
@@ -41,25 +44,132 @@ pub fn ensure_recording(root: &Path) -> Result<bool> {
         .spawn()
         .context("failed to start Undo recorder")?;
 
-    let bt_dir = backtrack_dir()?;
     let pid_path = pid_file_for_root(&bt_dir, root);
+    wait_for_recorder_start(&mut child, &pid_path, &log_path, log_cursor)?;
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Default)]
+struct StartupLogCursor {
+    offset: u64,
+    identity: Option<(u64, u64)>,
+}
+
+fn startup_log_cursor(log_path: &Path) -> StartupLogCursor {
+    std::fs::metadata(log_path)
+        .map(|metadata| StartupLogCursor {
+            offset: metadata.len(),
+            identity: Some((metadata.dev(), metadata.ino())),
+        })
+        .unwrap_or_default()
+}
+
+fn wait_for_recorder_start(
+    child: &mut std::process::Child,
+    pid_path: &Path,
+    log_path: &Path,
+    log_cursor: StartupLogCursor,
+) -> Result<()> {
     for _ in 0..200 {
-        if pid_path.exists() && is_daemon_alive(&pid_path) {
-            let ready = std::fs::read_to_string(&pid_path)
+        if pid_path.exists() && is_daemon_alive(pid_path) {
+            let ready = std::fs::read_to_string(pid_path)
                 .ok()
                 .and_then(|contents| contents.lines().nth(2).map(str::to_string))
                 .is_some_and(|state| state == "ready");
             if ready {
-                return Ok(true);
+                return Ok(());
             }
         }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to check Undo recorder startup")?
+        {
+            if let Some(error) = startup_error_from_log(log_path, child.id(), log_cursor) {
+                anyhow::bail!("{}", error);
+            }
+            anyhow::bail!(
+                "Undo recorder exited during startup ({}).\nCheck the diagnostic log at: {}",
+                status,
+                log_path.display()
+            );
+        }
+
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     anyhow::bail!(
         "Undo did not start recording within 10 seconds.\nCheck the diagnostic log at: {}",
-        bt_dir.join("undo.log").display()
+        log_path.display()
     )
+}
+
+fn startup_error_from_log(log_path: &Path, pid: u32, cursor: StartupLogCursor) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(log_path).ok()?;
+    let metadata = file.metadata().ok()?;
+    // Rotation replaces the active log with a new inode. Read the replacement
+    // from byte zero even if concurrent daemons have already grown it beyond
+    // the old file's offset.
+    let unchanged = cursor.identity == Some((metadata.dev(), metadata.ino()));
+    let offset = if unchanged && metadata.len() >= cursor.offset {
+        cursor.offset
+    } else {
+        0
+    };
+    file.seek(SeekFrom::Start(offset)).ok()?;
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    latest_process_error(&String::from_utf8_lossy(&bytes), pid)
+}
+
+fn latest_process_error(contents: &str, pid: u32) -> Option<String> {
+    let marker = format!(" [{}] ERROR ", pid);
+    let mut latest = None;
+    let mut lines = contents.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let Some(marker_start) = line.find(&marker) else {
+            continue;
+        };
+
+        let mut message = line[marker_start + marker.len()..].to_string();
+        while lines
+            .peek()
+            .is_some_and(|line| !is_structured_log_line(line))
+        {
+            message.push('\n');
+            message.push_str(lines.next().expect("peeked log continuation"));
+        }
+        latest = Some(message);
+    }
+
+    latest.filter(|message| !message.trim().is_empty())
+}
+
+fn is_structured_log_line(line: &str) -> bool {
+    let Some((timestamp, entry)) = line.split_once(" [") else {
+        return false;
+    };
+    let Some((pid, message)) = entry.split_once("] ") else {
+        return false;
+    };
+    let timestamp = timestamp.as_bytes();
+
+    timestamp.len() == 23
+        && timestamp[4] == b'-'
+        && timestamp[7] == b'-'
+        && timestamp[10] == b'T'
+        && timestamp[13] == b':'
+        && timestamp[16] == b':'
+        && timestamp[19] == b'.'
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && ["INFO ", "WARN ", "ERROR "]
+            .iter()
+            .any(|level| message.starts_with(level))
 }
 
 /// Migrate the old singleton `~/.undo/pid` to the new per-project layout.
@@ -793,5 +903,108 @@ mod tests {
 
         let path = pid_file_for_root(bt, Path::new("/some/project"));
         assert!(is_daemon_alive(&path), "locked PID file should be alive");
+    }
+
+    #[test]
+    fn startup_wait_surfaces_the_childs_logged_error_without_timing_out() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("undo.log");
+        let pid_path = dir.path().join("recorder.pid");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.05; exit 17"])
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let mut log = std::fs::File::create(&log_path).unwrap();
+        writeln!(log, "2026-07-20T20:24:00.000 [999] ERROR unrelated failure").unwrap();
+        writeln!(
+            log,
+            "2026-07-20T20:24:00.001 [{}] ERROR Undo did not start: test rejection.\n\
+             Use the reported reason.",
+            child_pid
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let error = wait_for_recorder_start(
+            &mut child,
+            &pid_path,
+            &log_path,
+            StartupLogCursor::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "early exit should not wait for the ten-second timeout"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Undo did not start: test rejection.\nUse the reported reason."
+        );
+    }
+
+    #[test]
+    fn startup_error_reader_resets_its_boundary_after_log_rotation() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("undo.log");
+        std::fs::write(&log_path, vec![b'x'; 256]).unwrap();
+        let cursor = startup_log_cursor(&log_path);
+
+        std::fs::rename(&log_path, dir.path().join("undo.log.1")).unwrap();
+        let mut replacement = std::fs::File::create(&log_path).unwrap();
+        writeln!(
+            replacement,
+            "2026-07-20T20:24:00.001 [42] ERROR current startup failure"
+        )
+        .unwrap();
+        writeln!(
+            replacement,
+            "2026-07-20T20:24:00.002 [999] INFO {}",
+            "x".repeat(300)
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup_error_from_log(&log_path, 42, cursor).as_deref(),
+            Some("current startup failure")
+        );
+    }
+
+    #[test]
+    fn recorder_readiness_wins_over_an_already_exited_child() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("undo.log");
+        let pid_path = dir.path().join("recorder.pid");
+        let mut pid_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&pid_path)
+            .unwrap();
+        assert!(try_lock_exclusive(&pid_file));
+        write!(pid_file, "123\n/project\nready").unwrap();
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+
+        wait_for_recorder_start(
+            &mut child,
+            &pid_path,
+            &log_path,
+            StartupLogCursor::default(),
+        )
+        .expect("ready recorder state should be checked before child exit");
     }
 }

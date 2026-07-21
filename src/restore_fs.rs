@@ -3,8 +3,10 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, MetadataExt, OpenOptions, OpenOptionsExt, Permissions, PermissionsExt};
 use sha2::{Digest, Sha256};
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::models::WatchedProject;
@@ -184,33 +186,98 @@ impl RestoreFs {
             .open_parent(target, true)?
             .expect("creating the parent always yields a directory capability");
         let existing = open_existing_file(&parent, &name, target)?;
-        let (backup_path, mode, identity) = if let Some(mut current) = existing {
-            let metadata = current.metadata()?;
-            let mode = metadata.mode();
-            let identity = Some((metadata.dev(), metadata.ino()));
-            let backup = self.back_up(target, &mut current)?;
-            (Some(backup), mode, identity)
+        let (backup_store, mode) = if let Some(current) = existing {
+            let mode = current.metadata()?.mode();
+            (Some(self.open_backup_store()?), mode)
         } else {
-            (None, 0o600, None)
+            (None, 0o600)
         };
 
         let (temp_name, mut temp) = create_temp_file(&parent, &name)?;
-        let write_result = (|| -> Result<()> {
+        let mut temp_contains_new_content = true;
+        let write_result = (|| -> Result<Option<PathBuf>> {
             temp.write_all(content)?;
             temp.set_permissions(Permissions::from_mode(mode))?;
             temp.sync_all()?;
-            ensure_leaf_unchanged(&parent, &name, target, identity)?;
-            parent.rename(&temp_name, &parent, &name)?;
+            let staged = temp.metadata()?;
+            let staged_identity = (staged.dev(), staged.ino());
+
+            run_before_leaf_mutation_hook();
+
+            let backup_path = if let Some(backup_store) = backup_store {
+                atomic_exchange(&parent, &temp_name, &name).with_context(|| {
+                    format!(
+                        "atomically replace restore target '{}'",
+                        target.relative().display()
+                    )
+                })?;
+                // The exact directory entry displaced by the exchange is now
+                // retained at temp_name. Never remove it on an error until a
+                // durable backup has been completed.
+                temp_contains_new_content = false;
+
+                let metadata = parent.symlink_metadata(&temp_name)?;
+                if !metadata.is_file() {
+                    if atomic_exchange(&parent, &temp_name, &name).is_ok() {
+                        temp_contains_new_content =
+                            parent.symlink_metadata(&temp_name).is_ok_and(|metadata| {
+                                metadata.is_file()
+                                    && metadata.dev() == staged_identity.0
+                                    && metadata.ino() == staged_identity.1
+                            });
+                    }
+                    anyhow::bail!(
+                        "restore target '{}' changed to a non-file before it could be updated",
+                        target.relative().display()
+                    );
+                }
+
+                let mut displaced =
+                    open_existing_file(&parent, &temp_name, target)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "the displaced restore target disappeared from '{}'",
+                            target.parent().join(&temp_name).display()
+                        )
+                    })?;
+                let displaced_mode = displaced.metadata()?.mode();
+                let backup = backup_store.save(target, &mut displaced).with_context(|| {
+                    format!(
+                        "the displaced file is preserved at '{}'",
+                        target.parent().join(&temp_name).display()
+                    )
+                })?;
+
+                // Preserve the mode of the file actually replaced, rather than
+                // the one observed before a possible concurrent replacement.
+                temp.set_permissions(Permissions::from_mode(displaced_mode))?;
+                temp.sync_all()?;
+                parent.remove_file(&temp_name)?;
+                Some(backup)
+            } else {
+                match parent.hard_link(&temp_name, &parent, &name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        anyhow::bail!(
+                            "restore target '{}' changed before this file could be created",
+                            target.relative().display()
+                        )
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                parent.remove_file(&temp_name)?;
+                temp_contains_new_content = false;
+                None
+            };
+
             // The mutation has already succeeded if this best-effort durability
             // sync is unsupported by the filesystem.
             let _ = sync_dir(&parent);
-            Ok(())
+            Ok(backup_path)
         })();
-        if write_result.is_err() {
+        if write_result.is_err() && temp_contains_new_content {
             let _ = parent.remove_file(&temp_name);
         }
-        write_result?;
-        Ok(backup_path)
+        write_result
     }
 
     /// Delete one project file after preserving its exact opened contents.
@@ -221,14 +288,36 @@ impl RestoreFs {
         let Some(mut current) = open_existing_file(&parent, &name, target)? else {
             return Ok(None);
         };
-        let opened = current.metadata()?;
-        let backup = self.back_up(target, &mut current)?;
+        // Validate the private backup capability before changing the project
+        // namespace. The exact file moved below is what will be copied.
+        let backup_store = self.open_backup_store()?;
+        drop(current);
 
-        // Detect the common leaf-swap race. A change after this check cannot
-        // escape the retained parent capability; remove_file never follows the
-        // final component.
-        ensure_leaf_unchanged(&parent, &name, target, Some((opened.dev(), opened.ino())))?;
-        parent.remove_file(&name)?;
+        run_before_leaf_mutation_hook();
+
+        let quarantine_name = move_to_quarantine(&parent, &name, target)?;
+        let metadata = parent.symlink_metadata(&quarantine_name)?;
+        if !metadata.is_file() {
+            let _ = atomic_rename_noreplace(&parent, &quarantine_name, &name);
+            anyhow::bail!(
+                "restore target '{}' changed to a non-file before it could be deleted",
+                target.relative().display()
+            );
+        }
+
+        current = open_existing_file(&parent, &quarantine_name, target)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the quarantined restore target disappeared from '{}'",
+                target.parent().join(&quarantine_name).display()
+            )
+        })?;
+        let backup = backup_store.save(target, &mut current).with_context(|| {
+            format!(
+                "the file selected for deletion is preserved at '{}'",
+                target.parent().join(&quarantine_name).display()
+            )
+        })?;
+        parent.remove_file(&quarantine_name)?;
         let _ = sync_dir(&parent);
         Ok(Some(backup))
     }
@@ -264,7 +353,7 @@ impl RestoreFs {
         Ok(Some((parent, target.file_name().to_os_string())))
     }
 
-    fn back_up(&self, target: &ProjectPath, current: &mut cap_std::fs::File) -> Result<PathBuf> {
+    fn open_backup_store(&self) -> Result<BackupStore> {
         let data_path = crate::backtrack_dir_path()?;
         if data_path
             .symlink_metadata()
@@ -283,6 +372,22 @@ impl RestoreFs {
         data.create_dir_all("backups")?;
         data.set_permissions("backups", Permissions::from_mode(0o700))?;
         let backups = data.open_dir("backups")?;
+        Ok(BackupStore {
+            backups,
+            data_root: canonical_data_root,
+            project_root: self.project_root.clone(),
+        })
+    }
+}
+
+struct BackupStore {
+    backups: Dir,
+    data_root: PathBuf,
+    project_root: PathBuf,
+}
+
+impl BackupStore {
+    fn save(&self, target: &ProjectPath, current: &mut cap_std::fs::File) -> Result<PathBuf> {
         let timestamp = timestamp_nanos();
         for attempt in 0..1000 {
             let name = backup_name(&self.project_root, target, timestamp, attempt);
@@ -292,7 +397,7 @@ impl RestoreFs {
                 .create_new(true)
                 .mode(0o600)
                 .follow(FollowSymlinks::No);
-            let mut backup = match backups.open_with(&name, &options) {
+            let mut backup = match self.backups.open_with(&name, &options) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
@@ -300,8 +405,8 @@ impl RestoreFs {
             std::io::copy(current, &mut backup)?;
             backup.set_permissions(Permissions::from_mode(0o600))?;
             backup.sync_all()?;
-            sync_dir(&backups)?;
-            return Ok(canonical_data_root.join("backups").join(name));
+            sync_dir(&self.backups)?;
+            return Ok(self.data_root.join("backups").join(name));
         }
         anyhow::bail!(
             "could not create a unique restore backup for {}",
@@ -377,37 +482,109 @@ fn open_existing_file(
     }
 }
 
-fn ensure_leaf_unchanged(
-    parent: &Dir,
-    name: &OsStr,
-    target: &ProjectPath,
-    expected: Option<(u64, u64)>,
-) -> Result<()> {
-    match (expected, parent.symlink_metadata(name)) {
-        (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        (Some((device, inode)), Ok(metadata))
-            if metadata.is_file() && metadata.dev() == device && metadata.ino() == inode =>
-        {
-            Ok(())
+fn move_to_quarantine(parent: &Dir, name: &OsStr, target: &ProjectPath) -> Result<OsString> {
+    let timestamp = timestamp_nanos();
+    for attempt in 0..1000 {
+        let quarantine = temporary_name(name, "displaced", timestamp, attempt);
+        match atomic_rename_noreplace(parent, name, &quarantine) {
+            Ok(()) => return Ok(quarantine),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "restore target '{}' changed before it could be deleted",
+                    target.relative().display()
+                )
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "atomically isolate restore target '{}'",
+                        target.relative().display()
+                    )
+                });
+            }
         }
-        (_, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-        _ => anyhow::bail!(
-            "restore target '{}' changed before this file could be updated",
-            target.relative().display()
-        ),
+    }
+    anyhow::bail!(
+        "could not reserve a quarantine path for restore target '{}'",
+        target.relative().display()
+    )
+}
+
+fn atomic_exchange(parent: &Dir, first: &OsStr, second: &OsStr) -> std::io::Result<()> {
+    atomic_rename(parent, first, second, AtomicRename::Exchange)
+}
+
+fn atomic_rename_noreplace(parent: &Dir, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+    atomic_rename(parent, from, to, AtomicRename::NoReplace)
+}
+
+enum AtomicRename {
+    Exchange,
+    NoReplace,
+}
+
+fn atomic_rename(
+    parent: &Dir,
+    from: &OsStr,
+    to: &OsStr,
+    operation: AtomicRename,
+) -> std::io::Result<()> {
+    let from = CString::new(from.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        let flags = match operation {
+            AtomicRename::Exchange => libc::RENAME_EXCHANGE,
+            AtomicRename::NoReplace => libc::RENAME_NOREPLACE,
+        };
+        libc::renameat2(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            flags,
+        )
+    };
+
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        let flags = match operation {
+            AtomicRename::Exchange => libc::RENAME_SWAP,
+            AtomicRename::NoReplace => libc::RENAME_EXCL,
+        };
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+            flags,
+        )
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = {
+        let _ = (parent, operation);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "race-safe restore requires Linux renameat2 or macOS renameatx_np",
+        ));
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
 fn create_temp_file(parent: &Dir, target_name: &OsStr) -> Result<(OsString, cap_std::fs::File)> {
     let timestamp = timestamp_nanos();
     for attempt in 0..1000 {
-        let mut name = target_name.to_os_string();
-        name.push(format!(
-            ".undo.partial.{}_{}.{}",
-            std::process::id(),
-            timestamp,
-            attempt
-        ));
+        let name = temporary_name(target_name, "partial", timestamp, attempt);
         let mut options = OpenOptions::new();
         options
             .write(true)
@@ -421,6 +598,43 @@ fn create_temp_file(parent: &Dir, target_name: &OsStr) -> Result<(OsString, cap_
         }
     }
     anyhow::bail!("could not create a unique restore temporary file")
+}
+
+fn temporary_name(target_name: &OsStr, role: &str, timestamp: u128, attempt: usize) -> OsString {
+    let mut name = target_name.to_os_string();
+    name.push(format!(
+        ".undo.{}.{}_{}.{}",
+        role,
+        std::process::id(),
+        timestamp,
+        attempt
+    ));
+    name
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LEAF_MUTATION_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_before_leaf_mutation_hook() {
+    BEFORE_LEAF_MUTATION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_leaf_mutation_hook() {}
+
+#[cfg(test)]
+fn set_before_leaf_mutation_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_LEAF_MUTATION_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
 }
 
 fn timestamp_nanos() -> u128 {
@@ -666,6 +880,80 @@ mod tests {
     }
 
     #[test]
+    fn missing_write_never_replaces_a_file_created_during_publication() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("created-concurrently.txt");
+        let project = project(&root);
+        let fs = RestoreFs::open(&project).unwrap();
+        let target = ProjectPath::from_relative(Path::new("created-concurrently.txt")).unwrap();
+
+        let raced_file = file.clone();
+        set_before_leaf_mutation_hook(move || {
+            std::fs::write(raced_file, "concurrent contents").unwrap();
+        });
+
+        let error = fs.write(&target, b"restored contents").unwrap_err();
+
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "concurrent contents"
+        );
+    }
+
+    #[test]
+    fn existing_write_backs_up_the_file_actually_displaced_by_the_exchange() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("raced-write.txt");
+        std::fs::write(&file, "original contents").unwrap();
+        let project = project(&root);
+        let fs = RestoreFs::open(&project).unwrap();
+        let target = ProjectPath::from_relative(Path::new("raced-write.txt")).unwrap();
+
+        let raced_file = file.clone();
+        set_before_leaf_mutation_hook(move || {
+            std::fs::remove_file(&raced_file).unwrap();
+            std::fs::write(raced_file, "concurrent contents").unwrap();
+        });
+
+        let backup = fs.write(&target, b"restored contents").unwrap().unwrap();
+
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "restored contents");
+        assert_eq!(
+            std::fs::read_to_string(backup).unwrap(),
+            "concurrent contents"
+        );
+    }
+
+    #[test]
+    fn existing_write_restores_a_non_file_raced_into_the_target() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("raced-directory");
+        std::fs::write(&file, "original contents").unwrap();
+        let project = project(&root);
+        let fs = RestoreFs::open(&project).unwrap();
+        let target = ProjectPath::from_relative(Path::new("raced-directory")).unwrap();
+
+        let raced_file = file.clone();
+        set_before_leaf_mutation_hook(move || {
+            std::fs::remove_file(&raced_file).unwrap();
+            std::fs::create_dir(raced_file).unwrap();
+        });
+
+        let error = fs.write(&target, b"restored contents").unwrap_err();
+
+        assert!(error.to_string().contains("non-file"));
+        assert!(file.is_dir());
+    }
+
+    #[test]
     fn temporary_file_creation_never_removes_an_existing_candidate() {
         let tree = tempfile::tempdir().unwrap();
         let root = tree.path().canonicalize().unwrap();
@@ -706,5 +994,56 @@ mod tests {
 
         assert!(!file.exists());
         assert_eq!(std::fs::read_to_string(backup).unwrap(), "preserve me");
+    }
+
+    #[test]
+    fn delete_backs_up_the_file_actually_moved_to_quarantine() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("raced-delete.txt");
+        std::fs::write(&file, "original contents").unwrap();
+        let project = project(&root);
+        let fs = RestoreFs::open(&project).unwrap();
+        let target = ProjectPath::from_relative(Path::new("raced-delete.txt")).unwrap();
+
+        let raced_file = file.clone();
+        set_before_leaf_mutation_hook(move || {
+            std::fs::remove_file(&raced_file).unwrap();
+            std::fs::write(raced_file, "concurrent contents").unwrap();
+        });
+
+        let backup = fs.delete(&target).unwrap().unwrap();
+
+        assert!(!file.exists());
+        assert_eq!(
+            std::fs::read_to_string(backup).unwrap(),
+            "concurrent contents"
+        );
+    }
+
+    #[test]
+    fn delete_restores_a_non_file_raced_into_the_target() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("raced-delete-directory");
+        std::fs::write(&file, "original contents").unwrap();
+        let project = project(&root);
+        let fs = RestoreFs::open(&project).unwrap();
+        let target = ProjectPath::from_relative(Path::new("raced-delete-directory")).unwrap();
+
+        let raced_file = file.clone();
+        set_before_leaf_mutation_hook(move || {
+            std::fs::remove_file(&raced_file).unwrap();
+            std::fs::create_dir(raced_file).unwrap();
+        });
+
+        let error = fs.delete(&target).unwrap_err();
+
+        assert!(error.to_string().contains("non-file"));
+        assert!(file.is_dir());
     }
 }
