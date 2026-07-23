@@ -190,8 +190,9 @@ Panic mode is an emergency heuristic. Prefer a Run or checkpoint when available.
 
 Undo checks a persisted Recovery as a complete plan and backs up existing files
 before replacing or deleting them. Each individual write is published through a
-temporary sibling file and rename, so a target is not left partially written.
-Backups use collision-safe names under `~/.undo/backups/`.
+temporary sibling file and atomic filesystem operation, so a target is not left
+partially written. Backups use collision-safe names under
+`~/.undo/backups/<project_id>/`.
 
 The multi-file mutation itself runs one entry at a time; it is not a single
 transaction. An I/O failure after earlier entries succeed can leave a partially

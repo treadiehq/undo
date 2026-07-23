@@ -42,7 +42,7 @@ Cleanup runs at recorder startup, hourly while recording, and through
 2. leaked snapshot temp files older than one hour;
 3. snapshots no longer referenced by retained events, live file state, or an
    unexpired planned Recovery;
-4. backups older than the retention cutoff.
+4. the current project's backups older than its retention cutoff.
 
 If the store remains over the size cap, Undo removes oldest unreferenced
 snapshots across projects. It does not delete snapshots still referenced by live
@@ -141,7 +141,9 @@ Undo stores data under `~/.undo/`:
 - `snapshots/<project_id>/<sha256>.gz` — compressed, content-addressed file
   versions.
 - `pids/<project-hash>.pid` — recorder liveness and project root.
-- `backups/` — pre-mutation safety copies.
+- `backups/<project_id>/` — project-scoped pre-mutation safety copies. Legacy
+  flat backup files remain untouched because their project ownership cannot be
+  reconstructed safely.
 - `config.toml` — optional global retention configuration.
 - `undo.log` and `undo.log.1` — recorder logs, rotated at 5 MB.
 

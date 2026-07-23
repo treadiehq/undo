@@ -10,6 +10,17 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-07-23
+
+- Failed `undo run <command>` launches now reliably complete the Run as failed
+  instead of potentially leaving an orphaned active Run.
+- Restore backups are now stored and pruned per project, preventing one
+  project's retention policy from deleting another project's safety copies.
+  Legacy flat backups with unknown ownership are preserved.
+- Log rotation now pre-creates and atomically exchanges its replacement file,
+  keeping the active daemon log path available through partial rotation
+  failures.
+
 ## [0.2.3] — 2026-07-20
 
 - Recorder auto-start now detects an early daemon exit and surfaces its actual
@@ -221,7 +232,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/treadiehq/undo/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/treadiehq/undo/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/treadiehq/undo/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/treadiehq/undo/compare/v0.2.0...v0.2.1

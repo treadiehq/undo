@@ -24,7 +24,30 @@ pub struct StartRunOptions<'a> {
     pub external_id: Option<&'a str>,
 }
 
+struct StartedRun {
+    db: Database,
+    project: WatchedProject,
+    cwd: std::path::PathBuf,
+    run: Session,
+}
+
+impl StartedRun {
+    fn complete(&self, status: &str, output: Output, sync_files: bool) -> Result<Session> {
+        if sync_files {
+            crate::daemon::ensure_recording(&self.cwd)?;
+            sync_project(&self.db, &self.project, &self.cwd)?;
+        }
+        let run = self.db.complete_run(self.run.id, status)?;
+        print_completed(&run, output);
+        Ok(run)
+    }
+}
+
 pub fn cmd_run_start(options: StartRunOptions<'_>, output: Output) -> Result<Session> {
+    Ok(start_run(options, output)?.run)
+}
+
+fn start_run(options: StartRunOptions<'_>, output: Output) -> Result<StartedRun> {
     let (db, project, cwd) = prepare_project_boundary()?;
     let actor = options.actor.unwrap_or(if options.agent.is_some() {
         "agent"
@@ -49,7 +72,12 @@ pub fn cmd_run_start(options: StartRunOptions<'_>, output: Output) -> Result<Ses
         options.external_id,
     )?;
     print_started(&run, output, &cwd)?;
-    Ok(run)
+    Ok(StartedRun {
+        db,
+        project,
+        cwd,
+        run,
+    })
 }
 
 pub fn cmd_run_stop(reference: Option<&str>, status: &str, output: Output) -> Result<Session> {
@@ -283,7 +311,7 @@ pub fn cmd_run_command(
         .map(str::to_string)
         .or_else(|| infer_agent(executable));
     let command_display = command.join(" ");
-    let run = cmd_run_start(
+    let started = start_run(
         StartRunOptions {
             name,
             actor: Some(if inferred_agent.is_some() {
@@ -307,12 +335,26 @@ pub fn cmd_run_command(
         Ok(status) if status.success() => ("completed", status.code().unwrap_or(0)),
         Ok(status) => ("failed", status.code().unwrap_or(1)),
         Err(error) => {
-            let _ = cmd_run_stop(Some(&run.public_id()), "failed", Output::Text);
-            return Err(error);
+            return complete_failed_launch(&started, error);
         }
     };
-    cmd_run_stop(Some(&run.public_id()), run_status, Output::Text)?;
+    started.complete(run_status, Output::Text, true)?;
     Ok(exit_code)
+}
+
+fn complete_failed_launch(started: &StartedRun, launch_error: anyhow::Error) -> Result<i32> {
+    if let Err(cleanup_error) = started.complete("failed", Output::Text, false) {
+        let run_id = started.run.public_id();
+        anyhow::bail!(
+            "{}\nUndo also could not mark Run {} as failed: {}\n\
+             Complete it manually with: undo run stop {} --status failed",
+            launch_error,
+            run_id,
+            cleanup_error,
+            run_id
+        );
+    }
+    Err(launch_error)
 }
 
 pub fn cmd_run_shorthand(mut command: Vec<String>) -> Result<i32> {
@@ -548,6 +590,53 @@ mod tests {
         ];
         normalize_shorthand_command(&mut command);
         assert_eq!(command, vec!["cargo", "test", "--", "--nocapture"]);
+    }
+
+    #[test]
+    fn failed_launch_completion_clears_the_active_run() {
+        let db = Database::open_in_memory().unwrap();
+        let cwd = std::path::PathBuf::from("/project");
+        let project = db.get_or_create_project(&cwd).unwrap();
+        let run = db
+            .start_run(
+                project.id,
+                "missing-command",
+                "run",
+                "tool",
+                None,
+                Some("definitely-not-an-executable"),
+                None,
+                None,
+            )
+            .unwrap();
+        let run_id = run.id;
+        let started = StartedRun {
+            db,
+            project,
+            cwd,
+            run,
+        };
+
+        let error = complete_failed_launch(
+            &started,
+            anyhow::anyhow!("failed to launch 'definitely-not-an-executable'"),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to launch 'definitely-not-an-executable'"
+        );
+        assert!(
+            started
+                .db
+                .get_active_session(started.project.id)
+                .unwrap()
+                .is_none()
+        );
+        let completed = started.db.get_session_by_id(run_id).unwrap().unwrap();
+        assert_eq!(completed.status, "failed");
+        assert!(completed.ended_at.is_some());
     }
 
     #[test]

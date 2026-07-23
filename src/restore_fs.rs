@@ -83,6 +83,7 @@ impl ProjectPath {
 /// Capability-scoped access to a watched project and Undo's private data store.
 pub(crate) struct RestoreFs {
     project: Dir,
+    project_id: i64,
     project_root: PathBuf,
 }
 
@@ -102,6 +103,7 @@ impl RestoreFs {
             .with_context(|| format!("open project root '{}'", project_root.display()))?;
         Ok(Self {
             project: project_dir,
+            project_id: project.id,
             project_root,
         })
     }
@@ -371,10 +373,15 @@ impl RestoreFs {
         })?;
         data.create_dir_all("backups")?;
         data.set_permissions("backups", Permissions::from_mode(0o700))?;
-        let backups = data.open_dir("backups")?;
+        let backups_root = data.open_dir("backups")?;
+        let project_dir = self.project_id.to_string();
+        backups_root.create_dir_all(&project_dir)?;
+        backups_root.set_permissions(&project_dir, Permissions::from_mode(0o700))?;
+        let backups = backups_root.open_dir(&project_dir)?;
+        sync_dir(&backups_root)?;
         Ok(BackupStore {
             backups,
-            data_root: canonical_data_root,
+            backup_root: canonical_data_root.join("backups").join(project_dir),
             project_root: self.project_root.clone(),
         })
     }
@@ -382,7 +389,7 @@ impl RestoreFs {
 
 struct BackupStore {
     backups: Dir,
-    data_root: PathBuf,
+    backup_root: PathBuf,
     project_root: PathBuf,
 }
 
@@ -406,7 +413,7 @@ impl BackupStore {
             backup.set_permissions(Permissions::from_mode(0o600))?;
             backup.sync_all()?;
             sync_dir(&self.backups)?;
-            return Ok(self.data_root.join("backups").join(name));
+            return Ok(self.backup_root.join(name));
         }
         anyhow::bail!(
             "could not create a unique restore backup for {}",

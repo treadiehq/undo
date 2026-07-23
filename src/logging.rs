@@ -7,13 +7,15 @@
 //!
 //! Multiple daemons (one per watched project) share a single log file. Writes use
 //! `O_APPEND` and every line carries a `[pid]` prefix so concurrent daemons stay
-//! attributable. Size-based rotation is best-effort: with several daemons writing
-//! at once the rename can race, which at worst drops a rotation cycle — acceptable
-//! for a debug log and far simpler than per-project files.
+//! attributable. Size-based rotation keeps the active path continuously present;
+//! concurrent daemons can still supersede each other's `.1` archive, which is
+//! acceptable for a best-effort debug log.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Rotate once the active log passes this size, keeping one prior file.
@@ -21,6 +23,8 @@ const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Log file name inside the data directory.
 const LOG_FILE_NAME: &str = "undo.log";
+
+static ROTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 pub enum Level {
@@ -62,17 +66,37 @@ impl Logger {
         })
     }
 
-    /// Rename the active log to `<name>.1` and reopen a fresh file once the cap
-    /// is exceeded. Best-effort: a failed rename leaves the current file in place.
+    /// Atomically exchange the active log with a pre-created replacement once
+    /// the cap is exceeded, then archive the displaced file as `<name>.1`.
+    /// Creating the replacement first means a failure such as inode exhaustion
+    /// leaves the active path and current file handle unchanged.
     fn rotate_if_needed(&mut self) {
+        self.rotate_if_needed_with(stage_rotation_file);
+    }
+
+    fn rotate_if_needed_with<F>(&mut self, stage: F)
+    where
+        F: FnOnce(&Path) -> std::io::Result<(PathBuf, File)>,
+    {
         let len = self.file.metadata().map(|m| m.len()).unwrap_or(0);
         if len < self.max_bytes {
             return;
         }
-        if std::fs::rename(&self.path, &self.rotated).is_ok()
-            && let Ok(file) = open_append_0600(&self.path)
-        {
-            self.file = file;
+
+        let Ok((staged_path, staged_file)) = stage(&self.path) else {
+            return;
+        };
+        if atomic_exchange(&staged_path, &self.path).is_err() {
+            let _ = std::fs::remove_file(staged_path);
+            return;
+        }
+
+        // The staged descriptor now names the active path. Install it before
+        // archiving the displaced log so any archive failure still leaves
+        // subsequent writes going to a valid `undo.log`.
+        self.file = staged_file;
+        if std::fs::rename(&staged_path, &self.rotated).is_err() {
+            let _ = std::fs::remove_file(staged_path);
         }
     }
 
@@ -111,6 +135,84 @@ fn open_append_0600(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     Ok(file)
+}
+
+fn stage_rotation_file(path: &Path) -> std::io::Result<(PathBuf, File)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(LOG_FILE_NAME));
+    let sequence = ROTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    for attempt in 0..1000 {
+        let mut staged_name = file_name.to_os_string();
+        staged_name.push(format!(
+            ".rotate.{}.{}.{}",
+            std::process::id(),
+            sequence,
+            attempt
+        ));
+        let staged_path = path.with_file_name(staged_name);
+        match OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .mode(0o600)
+            .open(&staged_path)
+        {
+            Ok(file) => return Ok((staged_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique log rotation file",
+    ))
+}
+
+fn atomic_exchange(first: &Path, second: &Path) -> std::io::Result<()> {
+    let first = std::ffi::CString::new(first.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let second = std::ffi::CString::new(second.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = {
+        let _ = (first, second);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic log rotation requires Linux renameat2 or macOS renameatx_np",
+        ));
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 static LOGGER: OnceLock<Mutex<Logger>> = OnceLock::new();
@@ -311,5 +413,89 @@ mod tests {
         );
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the reopened log must remain owner-only");
+    }
+
+    #[test]
+    fn replacement_creation_failure_keeps_active_log_and_later_rotation_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let rotated = dir.path().join("undo.log.1");
+        let mut logger = Logger::open(path.clone(), 1).unwrap();
+        writeln!(logger.file, "content over the cap").unwrap();
+        logger.file.flush().unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        logger.rotate_if_needed_with(|_| Err(std::io::Error::from_raw_os_error(libc::ENOSPC)));
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "a failed replacement creation must not move the active log"
+        );
+        assert!(
+            !rotated.exists(),
+            "rotation must not start before its replacement is ready"
+        );
+
+        writeln!(logger.file, "write after failed rotation").unwrap();
+        logger.file.flush().unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("write after failed rotation"),
+            "the retained handle must still write through the active path"
+        );
+
+        logger.rotate_if_needed();
+        writeln!(logger.file, "write after recovery").unwrap();
+        logger.file.flush().unwrap();
+        assert!(
+            path.exists(),
+            "a later rotation must recreate the active log"
+        );
+        assert!(
+            rotated.exists(),
+            "a later rotation must archive the old log"
+        );
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("write after recovery"),
+            "later writes must use the recovered active log"
+        );
+    }
+
+    #[test]
+    fn archive_failure_does_not_remove_active_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let rotated = dir.path().join("undo.log.1");
+        let mut logger = Logger::open(path.clone(), 1).unwrap();
+        writeln!(logger.file, "content over the cap").unwrap();
+        logger.file.flush().unwrap();
+        std::fs::create_dir(&rotated).unwrap();
+
+        logger.write_line(Level::Error, "write after archive failure");
+
+        assert!(
+            path.exists(),
+            "the active path must survive failure after the atomic exchange"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("write after archive failure"),
+            "the logger must install the active replacement before archiving"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".rotate.")
+            }),
+            "a failed archive must not leak its displaced temporary file"
+        );
     }
 }

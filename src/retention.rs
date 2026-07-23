@@ -230,12 +230,11 @@ pub fn prune(
         }
     }
 
-    // 3. Delete old backups
-    let backups_dir = bt_dir.join("backups");
+    // 3. Delete old backups owned by this project. Legacy backups live
+    // directly under `backups/` and predate ownership metadata, so they must
+    // remain untouched rather than risk deleting another project's safety copy.
+    let backups_dir = bt_dir.join("backups").join(project_id.to_string());
     if backups_dir.exists() {
-        let backup_cutoff = Utc::now()
-            .timestamp()
-            .saturating_sub(config.retention_seconds());
         for entry in std::fs::read_dir(&backups_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -252,7 +251,7 @@ pub fn prune(
                 Some(t) => t,
                 None => continue, // can't determine age — leave the backup alone
             };
-            if mtime < backup_cutoff {
+            if mtime < cutoff {
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 if !dry_run {
                     let _ = std::fs::remove_file(&path);
@@ -776,6 +775,85 @@ mod tests {
         assert!(
             total_disk_usage().unwrap() <= cfg.max_size_bytes(),
             "reaping stale temps should bring the global store back under the cap"
+        );
+    }
+
+    #[test]
+    fn prune_only_deletes_backups_owned_by_the_current_project() {
+        use crate::restore_fs::{ProjectPath, RestoreFs};
+
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let db = Database::open_in_memory().unwrap();
+
+        let tree_a = tempfile::tempdir().unwrap();
+        let root_a = tree_a.path().canonicalize().unwrap();
+        let file_a = root_a.join("config.txt");
+        std::fs::write(&file_a, "project a original").unwrap();
+        let project_a = db.get_or_create_project(&root_a).unwrap();
+        let fs_a = RestoreFs::open(&project_a).unwrap();
+        let target_a = ProjectPath::from_relative(Path::new("config.txt")).unwrap();
+        let backup_a = fs_a
+            .write(&target_a, b"project a restored")
+            .unwrap()
+            .unwrap();
+
+        let tree_b = tempfile::tempdir().unwrap();
+        let root_b = tree_b.path().canonicalize().unwrap();
+        let file_b = root_b.join("config.txt");
+        std::fs::write(&file_b, "project b original").unwrap();
+        let project_b = db.get_or_create_project(&root_b).unwrap();
+        let fs_b = RestoreFs::open(&project_b).unwrap();
+        let target_b = ProjectPath::from_relative(Path::new("config.txt")).unwrap();
+        let backup_b = fs_b
+            .write(&target_b, b"project b restored")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            backup_a.parent().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new(&project_a.id.to_string()))
+        );
+        assert_eq!(
+            backup_b.parent().and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new(&project_b.id.to_string()))
+        );
+
+        let eight_days = 8 * 24 * 60 * 60;
+        set_mtime_secs_ago(&backup_a, eight_days);
+        set_mtime_secs_ago(&backup_b, eight_days);
+
+        let stats = prune(&db, project_a.id, &RetentionConfig::default(), false).unwrap();
+
+        assert_eq!(stats.backups_deleted, 1);
+        assert!(
+            !backup_a.exists(),
+            "the current project's old backup should be pruned"
+        );
+        assert!(
+            backup_b.exists(),
+            "pruning one project must not delete another project's backup"
+        );
+    }
+
+    #[test]
+    fn prune_preserves_legacy_flat_backups_with_unknown_ownership() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/project")).unwrap();
+        let backups_root = crate::backtrack_dir().unwrap().join("backups");
+        std::fs::create_dir_all(&backups_root).unwrap();
+        let legacy = backups_root.join("legacy_deadbeef_123.bak");
+        std::fs::write(&legacy, "legacy backup").unwrap();
+        set_mtime_secs_ago(&legacy, 30 * 24 * 60 * 60);
+
+        let stats = prune(&db, project.id, &RetentionConfig::default(), false).unwrap();
+
+        assert_eq!(stats.backups_deleted, 0);
+        assert!(
+            legacy.exists(),
+            "legacy flat backups have no reliable project owner and must be retained"
         );
     }
 
