@@ -211,8 +211,10 @@ fn check_not_root() -> Result<()> {
 /// watching /, /etc, /usr, /var, etc.
 fn check_directory_ownership(path: &Path) -> Result<()> {
     let meta = std::fs::metadata(path)?;
-    let uid = meta.uid();
+    check_directory_owner(path, meta.uid())
+}
 
+fn check_directory_owner(path: &Path, uid: u32) -> Result<()> {
     if uid == 0 {
         anyhow::bail!(
             "Undo did not start: folder '{}' is owned by root.\n\
@@ -221,8 +223,7 @@ fn check_directory_ownership(path: &Path) -> Result<()> {
         );
     }
 
-    let system_uid_threshold = if cfg!(target_os = "macos") { 500 } else { 1000 };
-    if uid < system_uid_threshold {
+    if uid < system_uid_threshold() {
         anyhow::bail!(
             "Undo did not start: folder '{}' is owned by a system account (uid {}).\n\
              To bypass this ownership check, rerun with --force; it also bypasses file-count and overlap safety checks.",
@@ -232,6 +233,10 @@ fn check_directory_ownership(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn system_uid_threshold() -> u32 {
+    if cfg!(target_os = "macos") { 500 } else { 1000 }
 }
 
 /// Return all (pid, root_path) pairs from PID files whose daemons
@@ -670,11 +675,11 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Watching /usr or similar root-owned paths would silently snapshot system files;
-    /// the ownership check must block it.
+    /// A root-owned watch target must be rejected without depending on the
+    /// ownership mapping of the host running the test.
     #[test]
     fn rejects_root_owned_directory() {
-        let err = check_directory_ownership(Path::new("/usr")).unwrap_err();
+        let err = check_directory_owner(Path::new("/usr"), 0).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("owned by root") || msg.contains("system account"));
     }
@@ -686,16 +691,23 @@ mod tests {
         assert!(check_directory_ownership(&home).is_ok());
     }
 
-    /// /etc is root-owned; verifies the ownership check fires for another system path.
+    /// UIDs below the platform's normal-user threshold identify system accounts,
+    /// independent of how a CI runner maps ownership for host paths.
     #[test]
-    fn rejects_etc_directory() {
-        let err = check_directory_ownership(Path::new("/etc")).unwrap_err();
+    fn rejects_system_account_owned_directory() {
+        let system_uid = system_uid_threshold() - 1;
+        let err = check_directory_owner(Path::new("/system"), system_uid).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("root") || msg.contains("system account"),
+            msg.contains("system account") && msg.contains(&system_uid.to_string()),
             "expected ownership rejection, got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn accepts_normal_user_uid_at_platform_threshold() {
+        assert!(check_directory_owner(Path::new("/home/user"), system_uid_threshold()).is_ok());
     }
 
     /// Running undo as root is disallowed; verifies the check passes for a normal test process.
