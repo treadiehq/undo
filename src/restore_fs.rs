@@ -196,7 +196,10 @@ impl RestoreFs {
         };
 
         let (temp_name, mut temp) = create_temp_file(&parent, &name)?;
-        let mut temp_contains_new_content = true;
+        // This flag is solely a cleanup guard: it is true only while
+        // `temp_name` still names the exact staged file and is therefore safe
+        // to remove after an error.
+        let mut temp_is_staged_file = true;
         let write_result = (|| -> Result<Option<PathBuf>> {
             temp.write_all(content)?;
             temp.set_permissions(Permissions::from_mode(mode))?;
@@ -216,17 +219,23 @@ impl RestoreFs {
                 // The exact directory entry displaced by the exchange is now
                 // retained at temp_name. Never remove it on an error until a
                 // durable backup has been completed.
-                temp_contains_new_content = false;
+                temp_is_staged_file = false;
 
                 let metadata = parent.symlink_metadata(&temp_name)?;
                 if !metadata.is_file() {
-                    if atomic_exchange(&parent, &temp_name, &name).is_ok() {
-                        temp_contains_new_content =
-                            parent.symlink_metadata(&temp_name).is_ok_and(|metadata| {
-                                metadata.is_file()
-                                    && metadata.dev() == staged_identity.0
-                                    && metadata.ino() == staged_identity.1
-                            });
+                    let undo_result = atomic_undo_exchange(&parent, &temp_name, &name);
+                    temp_is_staged_file =
+                        entry_is_file_with_identity(&parent, &temp_name, staged_identity);
+                    if let Err(error) = undo_result {
+                        anyhow::bail!(
+                            "restore target '{}' changed to a non-file and Undo could not roll \
+                             back the replacement: {}. The target may already contain restored \
+                             content; inspect it and the displaced entry at '{}', if present, \
+                             before retrying",
+                            target.relative().display(),
+                            error,
+                            target.parent().join(&temp_name).display()
+                        );
                     }
                     anyhow::bail!(
                         "restore target '{}' changed to a non-file before it could be updated",
@@ -267,7 +276,7 @@ impl RestoreFs {
                     Err(error) => return Err(error.into()),
                 }
                 parent.remove_file(&temp_name)?;
-                temp_contains_new_content = false;
+                temp_is_staged_file = false;
                 None
             };
 
@@ -276,7 +285,7 @@ impl RestoreFs {
             let _ = sync_dir(&parent);
             Ok(backup_path)
         })();
-        if write_result.is_err() && temp_contains_new_content {
+        if write_result.is_err() && temp_is_staged_file {
             let _ = parent.remove_file(&temp_name);
         }
         write_result
@@ -518,8 +527,22 @@ fn move_to_quarantine(parent: &Dir, name: &OsStr, target: &ProjectPath) -> Resul
     )
 }
 
+fn entry_is_file_with_identity(parent: &Dir, name: &OsStr, identity: (u64, u64)) -> bool {
+    parent.symlink_metadata(name).is_ok_and(|metadata| {
+        metadata.is_file() && metadata.dev() == identity.0 && metadata.ino() == identity.1
+    })
+}
+
 fn atomic_exchange(parent: &Dir, first: &OsStr, second: &OsStr) -> std::io::Result<()> {
     atomic_rename(parent, first, second, AtomicRename::Exchange)
+}
+
+fn atomic_undo_exchange(parent: &Dir, first: &OsStr, second: &OsStr) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(error) = take_undo_exchange_error() {
+        return Err(error);
+    }
+    atomic_exchange(parent, first, second)
 }
 
 fn atomic_rename_noreplace(parent: &Dir, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
@@ -623,6 +646,8 @@ fn temporary_name(target_name: &OsStr, role: &str, timestamp: u128, attempt: usi
 thread_local! {
     static BEFORE_LEAF_MUTATION_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static UNDO_EXCHANGE_ERROR:
+        std::cell::RefCell<Option<std::io::Error>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -642,6 +667,18 @@ fn set_before_leaf_mutation_hook(hook: impl FnOnce() + 'static) {
     BEFORE_LEAF_MUTATION_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
     });
+}
+
+#[cfg(test)]
+fn set_undo_exchange_error(error: std::io::Error) {
+    UNDO_EXCHANGE_ERROR.with(|slot| {
+        *slot.borrow_mut() = Some(error);
+    });
+}
+
+#[cfg(test)]
+fn take_undo_exchange_error() -> Option<std::io::Error> {
+    UNDO_EXCHANGE_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
 fn timestamp_nanos() -> u128 {
@@ -958,6 +995,46 @@ mod tests {
 
         assert!(error.to_string().contains("non-file"));
         assert!(file.is_dir());
+    }
+
+    #[test]
+    fn existing_write_reports_partial_mutation_when_non_file_rollback_fails() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("raced-directory-rollback-failure");
+        std::fs::write(&file, "original contents").unwrap();
+        let project = project(&root);
+        let fs = RestoreFs::open(&project).unwrap();
+        let target =
+            ProjectPath::from_relative(Path::new("raced-directory-rollback-failure")).unwrap();
+
+        let raced_file = file.clone();
+        set_before_leaf_mutation_hook(move || {
+            std::fs::remove_file(&raced_file).unwrap();
+            std::fs::create_dir(raced_file).unwrap();
+            set_undo_exchange_error(std::io::Error::from_raw_os_error(libc::EIO));
+        });
+
+        let error = fs.write(&target, b"restored contents").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("could not roll back the replacement"));
+        assert!(message.contains("may already contain restored content"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "restored contents");
+        let displaced = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".undo.partial.")
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            })
+            .expect("the displaced non-file must be preserved for inspection");
+        assert!(message.contains(displaced.file_name().to_string_lossy().as_ref()));
     }
 
     #[test]

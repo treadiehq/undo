@@ -8,12 +8,14 @@
 //! Multiple daemons (one per watched project) share a single log file. Writes use
 //! `O_APPEND` and every line carries a `[pid]` prefix so concurrent daemons stay
 //! attributable. Size-based rotation keeps the active path continuously present;
-//! concurrent daemons can still supersede each other's `.1` archive, which is
-//! acceptable for a best-effort debug log.
+//! a sidecar advisory lock serializes descriptor refresh, rotation, and writes
+//! across daemon processes.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -51,17 +53,20 @@ pub struct Logger {
     path: PathBuf,
     rotated: PathBuf,
     file: File,
+    lock: File,
     max_bytes: u64,
 }
 
 impl Logger {
     pub fn open(path: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
         let file = open_append_0600(&path)?;
+        let lock = open_append_0600(&lock_path(&path))?;
         let rotated = rotated_path(&path);
         Ok(Self {
             path,
             rotated,
             file,
+            lock,
             max_bytes,
         })
     }
@@ -95,25 +100,102 @@ impl Logger {
         // archiving the displaced log so any archive failure still leaves
         // subsequent writes going to a valid `undo.log`.
         self.file = staged_file;
-        if std::fs::rename(&staged_path, &self.rotated).is_err() {
-            let _ = std::fs::remove_file(staged_path);
+        // If archiving fails, leave `staged_path` in place: after the exchange
+        // it contains the old log history, not a disposable temporary file.
+        let _ = std::fs::rename(&staged_path, &self.rotated);
+    }
+
+    fn refresh_active_file(&mut self) -> std::io::Result<()> {
+        let opened = self.file.metadata()?;
+        let active = match std::fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.file = open_append_0600(&self.path)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if opened.dev() != active.dev() || opened.ino() != active.ino() {
+            self.file = open_append_0600(&self.path)?;
         }
+        Ok(())
     }
 
     fn write_line(&mut self, level: Level, msg: &str) {
+        let _ = self.write_line_locked(level, msg, LockMode::Blocking);
+    }
+
+    fn try_write_line(&mut self, level: Level, msg: &str) -> bool {
+        self.write_line_locked(level, msg, LockMode::NonBlocking)
+    }
+
+    fn write_line_locked(&mut self, level: Level, msg: &str, mode: LockMode) -> bool {
+        let Ok(_guard) = AdvisoryLockGuard::acquire(self.lock.as_raw_fd(), mode) else {
+            return false;
+        };
+        if self.refresh_active_file().is_err() {
+            return false;
+        }
         self.rotate_if_needed();
         let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
         // One write per line; O_APPEND keeps concurrent daemons' lines intact.
-        let _ = writeln!(
+        if writeln!(
             self.file,
             "{} [{}] {} {}",
             ts,
             std::process::id(),
             level.as_str(),
             msg
-        );
-        let _ = self.file.flush();
+        )
+        .is_err()
+        {
+            return false;
+        }
+        self.file.flush().is_ok()
     }
+}
+
+#[derive(Clone, Copy)]
+enum LockMode {
+    Blocking,
+    NonBlocking,
+}
+
+struct AdvisoryLockGuard {
+    fd: RawFd,
+}
+
+impl AdvisoryLockGuard {
+    fn acquire(fd: RawFd, mode: LockMode) -> std::io::Result<Self> {
+        let operation = libc::LOCK_EX
+            | match mode {
+                LockMode::Blocking => 0,
+                LockMode::NonBlocking => libc::LOCK_NB,
+            };
+        loop {
+            if unsafe { libc::flock(fd, operation) } == 0 {
+                return Ok(Self { fd });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+impl Drop for AdvisoryLockGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.fd, libc::LOCK_UN) };
+    }
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| LOG_FILE_NAME.to_string());
+    path.with_file_name(format!("{name}.lock"))
 }
 
 fn rotated_path(path: &Path) -> PathBuf {
@@ -261,8 +343,7 @@ fn try_write_line(handle: &Mutex<Logger>, level: Level, msg: &str) -> bool {
     let Ok(mut logger) = handle.try_lock() else {
         return false;
     };
-    logger.write_line(level, msg);
-    true
+    logger.try_write_line(level, msg)
 }
 
 fn to_file(level: Level, msg: &str) {
@@ -334,6 +415,9 @@ mod tests {
         assert!(path.exists(), "log file must be created on open");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "log file must be owner-only");
+        let lock = lock_path(&path);
+        let lock_mode = std::fs::metadata(lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(lock_mode, 0o600, "log lock must be owner-only");
     }
 
     /// Each line carries the process id and level so concurrent daemons stay attributable.
@@ -388,6 +472,19 @@ mod tests {
         assert!(std::fs::read_to_string(path).unwrap().is_empty());
     }
 
+    #[test]
+    fn panic_log_write_skips_cross_process_lock_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let holder = Logger::open(path.clone(), MAX_LOG_BYTES).unwrap();
+        let mut contender = Logger::open(path.clone(), MAX_LOG_BYTES).unwrap();
+        let _guard =
+            AdvisoryLockGuard::acquire(holder.lock.as_raw_fd(), LockMode::Blocking).unwrap();
+
+        assert!(!contender.try_write_line(Level::Error, "panic in another daemon"));
+        assert!(std::fs::read_to_string(path).unwrap().is_empty());
+    }
+
     /// Once the active log passes the cap it is rotated to `<name>.1` and a fresh
     /// file takes over, so the log can never grow without bound.
     #[test]
@@ -413,6 +510,27 @@ mod tests {
         );
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the reopened log must remain owner-only");
+    }
+
+    #[test]
+    fn stale_logger_reopens_active_log_without_spurious_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOG_FILE_NAME);
+        let rotated = dir.path().join("undo.log.1");
+        let mut first = Logger::open(path.clone(), 512).unwrap();
+        let mut stale = Logger::open(path.clone(), 512).unwrap();
+        writeln!(first.file, "{}", "filler".repeat(100)).unwrap();
+        first.file.flush().unwrap();
+
+        first.write_line(Level::Info, "fresh entry from first logger");
+        stale.write_line(Level::Info, "fresh entry from stale logger");
+
+        let active = std::fs::read_to_string(&path).unwrap();
+        let archived = std::fs::read_to_string(&rotated).unwrap();
+        assert!(active.contains("fresh entry from first logger"));
+        assert!(active.contains("fresh entry from stale logger"));
+        assert!(!archived.contains("fresh entry from first logger"));
+        assert!(!archived.contains("fresh entry from stale logger"));
     }
 
     #[test]
@@ -466,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_failure_does_not_remove_active_log() {
+    fn archive_failure_preserves_displaced_log_and_active_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LOG_FILE_NAME);
         let rotated = dir.path().join("undo.log.1");
@@ -487,15 +605,16 @@ mod tests {
                 .contains("write after archive failure"),
             "the logger must install the active replacement before archiving"
         );
+        let displaced = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains(".rotate."))
+            .expect("the displaced log must remain under its staging name");
         assert!(
-            std::fs::read_dir(dir.path()).unwrap().all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".rotate.")
-            }),
-            "a failed archive must not leak its displaced temporary file"
+            std::fs::read_to_string(displaced.path())
+                .unwrap()
+                .contains("content over the cap"),
+            "an archive failure must preserve the old log history"
         );
     }
 }

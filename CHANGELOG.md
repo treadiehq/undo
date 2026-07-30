@@ -10,6 +10,16 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-07-30
+
+- Failed log archive renames now preserve displaced history instead of deleting
+  its only remaining copy.
+- Multiple project recorders now coordinate log refresh, rotation, and writes
+  through an owner-only advisory lock, preventing stale descriptors from
+  spuriously rotating the active log.
+- Restore rollback failures now preserve uncertain or displaced entries and
+  explicitly report when restored content may already be present at the target.
+
 ## [0.2.4] — 2026-07-23
 
 - Failed `undo run <command>` launches now reliably complete the Run as failed
@@ -232,7 +242,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/treadiehq/undo/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/treadiehq/undo/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/treadiehq/undo/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/treadiehq/undo/compare/v0.2.1...v0.2.2

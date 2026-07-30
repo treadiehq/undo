@@ -146,6 +146,8 @@ Undo stores data under `~/.undo/`:
   reconstructed safely.
 - `config.toml` — optional global retention configuration.
 - `undo.log` and `undo.log.1` — recorder logs, rotated at 5 MB.
+- `undo.log.lock` — owner-only advisory lock coordinating shared-log writes and
+  rotation across project recorders.
 
 The top-level and snapshot directories are owner-only (`0700`). Database files,
 snapshots, PID files, backups, and logs are restricted to the owner (`0600`)
