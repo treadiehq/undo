@@ -30,6 +30,19 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      # The web UI must be built before cargo so `include_dir!` embeds the
+      # real app instead of the build.rs placeholder page.
+      - name: Build web UI
+        run: |
+          cd ui
+          npm ci
+          npm run build
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 

@@ -8,7 +8,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 Entries below `v0.1.12` were reconstructed from release commit summaries; they
 describe the headline changes of each tag rather than an exhaustive list.
 
-## [Unreleased]
+## [0.2.6] — 2026-07-31
+
+- New `undo ui` command opens a local web interface: a timeline of agent Runs
+  and un-attributed edit groups with per-file diffs, checkbox-selective undo,
+  and one-click restores, all going through the same persisted
+  preview-then-apply Recovery plans as the CLI. The interface is embedded in
+  the binary and served from a loopback-only listener protected by a random
+  per-session token; see SECURITY.md for the model.
+- `undo ui r_421` deep-links straight to that Run's review, and every
+  completed `undo run` prints the shortcut, so reviewing an agent's work is
+  one command at the moment it finishes.
+- The web UI raises a panic alert when recent un-attributed changes deleted
+  multiple files, with a one-click preview of a restore to just before the
+  burst. Alerts retire automatically once a recovery is applied.
+- Un-attributed edit groups are now labeled by editing rhythm — "Rapid
+  changes" for tool-speed bursts, "Manual edits" for hand-paced work — and
+  carry the dominant directory (e.g. `src/auth`) when most files share one.
+- `undo recover` gains CLI parity with the web UI's selective undo:
+  `--path` (repeatable) limits a Run recovery to exact files, and
+  `--before-change <CHANGE_ID> --path <PATH>` restores files to their state
+  just before a recorded change id, covering edits that belong to no Run.
 
 ## [0.2.5] — 2026-07-30
 
@@ -242,7 +262,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/treadiehq/undo/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/treadiehq/undo/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/treadiehq/undo/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/treadiehq/undo/compare/v0.2.2...v0.2.3

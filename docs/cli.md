@@ -108,18 +108,27 @@ Apply the exact persisted `rec_...` plan shown by `undo ask`. Apply rejects
 expired, ambiguous, or hash-conflicted Recoveries and is a no-op after prior
 success.
 
-### `undo recover --run <RUN> [options]`
+### `undo recover [--run <RUN> | --before-change <CHANGE_ID>] [options]`
 
-Preview or apply a whole-Run or whole-group baseline recovery:
+Preview or apply a baseline recovery for a whole Run, one of its file groups,
+an exact set of files, or a set of files anchored at a recorded change id:
 
 ```bash
 undo recover --run r_421 --preview
 undo recover --run r_421 --group auth --preview
 undo recover --run r_421 --group auth --yes
+undo recover --run r_421 --path src/auth.rs --path src/session.rs --preview
+undo recover --before-change 1042 --path src/auth.rs --yes
 ```
 
-`--session` aliases `--run`. `--preview` writes nothing. Without `--preview`,
-`--yes` is required.
+- `--path <PATH>` (repeatable) limits a Run recovery to exact files —
+  "undo these files from the Run, keep the rest". The same selective undo the
+  web UI offers with checkboxes.
+- `--before-change <CHANGE_ID>` restores the `--path` files to their state
+  just before that recorded change (change ids are shown by
+  `undo run show`). Use it to undo un-attributed edits that belong to no Run.
+- `--session` aliases `--run`. `--preview` writes nothing. Without
+  `--preview`, `--yes` is required.
 
 ## Add precise boundaries from another tool
 
@@ -236,6 +245,39 @@ bursts and prints exact-timestamp recovery commands.
 
 `--restore-before-latest-burst --yes` creates and applies a Recovery for the
 latest detected burst. `--undo-burst` aliases the long restore flag.
+
+## Browse history in the local web UI
+
+### `undo ui [RUN] [options]`
+
+Open the local web interface: a timeline of recorded work grouped into agent
+Runs and un-attributed edit groups, with per-file diffs, selective undo
+("keep these, undo the rest"), and one-click restore. Every action goes
+through the same persisted preview-then-apply Recovery plans as `undo ask`
+and `undo apply`. When recent un-attributed changes deleted multiple files,
+the timeline shows an alert with a one-click preview of a restore to just
+before they happened.
+
+```bash
+undo ui
+undo ui r_421
+undo ui --port 6000 --no-open
+```
+
+- `RUN` opens the interface focused on that Run's review — the feed shows
+  just that Run, with the full timeline one click away. Every completed
+  `undo run` prints this shortcut.
+- `--port <PORT>` selects the listening port; default 5533. Without an
+  explicit port, Undo falls back to an OS-assigned port when 5533 is busy.
+- `--no-open` prints the URL without launching a browser.
+
+The server binds 127.0.0.1 only and prints a URL containing a random
+per-session access token; every API request must present it. Requests with a
+non-loopback `Host` header are rejected. History never leaves the machine.
+
+If the current folder is a watched project, `undo ui` starts its recorder if
+needed. Other watched projects are browsable from the project switcher; the UI
+shows whether each one is currently recording.
 
 ## Manage recording and storage
 

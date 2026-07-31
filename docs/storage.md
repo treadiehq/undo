@@ -3,13 +3,19 @@
 ## Know what stays local
 
 Undo is a local, single-user tool. It requires no account and has no cloud
-service or network listener. Filesystem history, Run metadata, Recoveries, and
-backups stay on the machine.
+service. Filesystem history, Run metadata, Recoveries, and backups stay on the
+machine.
 
-The two documented network exceptions are `undo update` and the installer.
-`undo update` queries GitHub Releases, downloads the platform archive and
-`SHA256SUMS`, verifies SHA-256, and installs the update. The installer also
-downloads from the network.
+The two documented outbound network exceptions are `undo update` and the
+installer. `undo update` queries GitHub Releases, downloads the platform
+archive and `SHA256SUMS`, verifies SHA-256, and installs the update. The
+installer also downloads from the network.
+
+The optional `undo ui` command serves the local web interface from a listener
+bound to 127.0.0.1 only, for as long as the command runs. Access requires the
+random per-session token printed with the URL. Nothing is reachable from other
+machines and no history leaves yours; see
+[SECURITY.md](../SECURITY.md) for the full model.
 
 ## Know what Undo can capture
 

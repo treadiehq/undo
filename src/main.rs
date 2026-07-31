@@ -26,6 +26,8 @@ mod sessions;
 mod snapshots;
 mod update;
 mod watcher;
+mod webui;
+mod webui_data;
 
 // ── ANSI colors ─────────────────────────────────────────────────────
 
@@ -375,9 +377,7 @@ fn main() {
             cli::SessionCommand::Stop => sessions::cmd_session_stop(),
             cli::SessionCommand::Show { name } => sessions::cmd_session_show(&name),
         },
-        cli::Command::Recover(args) => {
-            recover::cmd_recover(&args.run, args.group.as_deref(), args.preview, args.yes)
-        }
+        cli::Command::Recover(args) => recover::cmd_recover(&args),
         cli::Command::Ask(args) => match args.resolve() {
             Ok((run, query)) => ask::cmd_ask(query, run, args.apply, args.yes),
             Err(error) => Err(anyhow::anyhow!(error)),
@@ -386,6 +386,7 @@ fn main() {
         cli::Command::Stop { all } => daemon::cmd_stop(all),
         cli::Command::Prune { keep, dry_run } => cmd_prune(keep, dry_run),
         cli::Command::Update => update::cmd_update(),
+        cli::Command::Ui { run, port, no_open } => webui::cmd_ui(run.as_deref(), port, no_open),
     };
 
     if let Err(e) = result {

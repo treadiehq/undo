@@ -428,6 +428,24 @@ impl Database {
         Ok(project)
     }
 
+    pub fn get_project_by_id(&self, project_id: i64) -> Result<Option<WatchedProject>> {
+        self.conn
+            .query_row(
+                "SELECT id, root_path, created_at
+                 FROM watched_projects WHERE id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(WatchedProject {
+                        id: row.get(0)?,
+                        root_path: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to query project by id")
+    }
+
     pub fn find_project_for_path(&self, path: &Path) -> Result<Option<WatchedProject>> {
         let path_str = path.to_string_lossy().to_string();
         // ORDER BY LENGTH DESC ensures the most specific (longest) root_path
@@ -1271,6 +1289,20 @@ impl Database {
                 |row| row.get(0),
             )
             .context("failed to query max event id")
+    }
+
+    /// When the user most recently applied a recovery in this project.
+    /// The web UI uses it to retire panic alerts for bursts that were
+    /// already addressed.
+    pub fn latest_applied_recovery_at(&self, project_id: i64) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT MAX(applied_at) FROM recoveries
+                 WHERE project_id = ?1 AND status = 'applied'",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .context("failed to query latest applied recovery")
     }
 
     // ── checkpoint operations ───────────────────────────────────────

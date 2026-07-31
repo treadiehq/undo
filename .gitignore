@@ -2,3 +2,7 @@
 .DS_Store
 .cursor/
 video
+ui/node_modules
+ui/.nuxt
+ui/.output
+ui/dist

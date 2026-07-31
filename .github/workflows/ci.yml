@@ -34,3 +34,20 @@ jobs:
 
       - name: Test
         run: cargo test --all
+
+  webui:
+    name: web UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Build web UI
+        run: |
+          cd ui
+          npm ci
+          npm run build

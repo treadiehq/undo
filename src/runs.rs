@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::db::Database;
 use crate::models::{Session, WatchedProject};
-use crate::{BOLD, GREEN, RED, RESET, YELLOW, find_project, groups};
+use crate::{BOLD, DIM, GREEN, RED, RESET, YELLOW, find_project, groups};
 
 #[derive(Clone, Copy)]
 pub enum Output {
@@ -556,6 +556,14 @@ fn print_completed(run: &Session, output: Output) {
                 run.public_id()
             );
         }
+        // The moment a Run ends is when review matters; point at the focused
+        // browser view instead of making the user reconstruct it later.
+        println!(
+            "{}Review it in the browser: undo ui {}{}",
+            DIM,
+            run.public_id(),
+            RESET
+        );
     }
 }
 

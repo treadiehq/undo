@@ -39,20 +39,43 @@ pub fn create_run_recovery(
     confidence: &str,
     ambiguity: Option<&str>,
 ) -> Result<Recovery> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let db = Database::open()?;
+    let project = find_project(&db, &cwd)?;
+    let recovery = create_run_recovery_in(
+        &db, &project, &cwd, run, paths, request, kind, confidence, ambiguity,
+    )?;
+    print_recovery(&db, &project, &recovery)?;
+    Ok(recovery)
+}
+
+/// Plan and persist a Run recovery against an explicit database, project, and
+/// base directory. Unlike [`create_run_recovery`] this neither consults the
+/// process working directory nor prints, so callers such as the local web UI
+/// can serve any watched project.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_run_recovery_in(
+    db: &Database,
+    project: &WatchedProject,
+    base_dir: &std::path::Path,
+    run: &Session,
+    paths: &[String],
+    request: &str,
+    kind: &str,
+    confidence: &str,
+    ambiguity: Option<&str>,
+) -> Result<Recovery> {
     if run.is_active() {
         anyhow::bail!(
             "No recovery plan was created because Run {} is still active.\nFinish the Run, then try again.",
             run.public_id(),
         );
     }
-    let cwd = std::env::current_dir()?.canonicalize()?;
-    let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
-    ensure_run_project(run, &project)?;
-    let plan = restore::plan_paths_restore_at_session_start(&db, &project, &cwd, paths, run)?;
-    let recovery = persist_restore_plan(
-        &db,
-        &project,
+    ensure_run_project(run, project)?;
+    let plan = restore::plan_paths_restore_at_session_start(db, project, base_dir, paths, run)?;
+    persist_restore_plan(
+        db,
+        project,
         RecoverySpec {
             run_id: Some(run.id),
             request,
@@ -61,9 +84,7 @@ pub fn create_run_recovery(
             ambiguity,
         },
         &plan,
-    )?;
-    print_recovery(&db, &project, &recovery)?;
-    Ok(recovery)
+    )
 }
 
 pub fn create_timestamp_recovery(
@@ -75,10 +96,27 @@ pub fn create_timestamp_recovery(
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
-    let plan = restore::plan_restore(&db, &project, &cwd, path, target_timestamp, false)?;
-    let recovery = persist_restore_plan(
-        &db,
-        &project,
+    let recovery =
+        create_timestamp_recovery_in(&db, &project, &cwd, path, target_timestamp, request, kind)?;
+    print_recovery(&db, &project, &recovery)?;
+    Ok(recovery)
+}
+
+/// Timestamp-recovery twin of [`create_run_recovery_in`]: explicit context,
+/// no printing, usable from the web UI server.
+pub(crate) fn create_timestamp_recovery_in(
+    db: &Database,
+    project: &WatchedProject,
+    base_dir: &std::path::Path,
+    path: &str,
+    target_timestamp: i64,
+    request: &str,
+    kind: &str,
+) -> Result<Recovery> {
+    let plan = restore::plan_restore(db, project, base_dir, path, target_timestamp, false)?;
+    persist_restore_plan(
+        db,
+        project,
         RecoverySpec {
             run_id: None,
             request,
@@ -87,9 +125,57 @@ pub fn create_timestamp_recovery(
             ambiguity: None,
         },
         &plan,
+    )
+}
+
+pub fn create_event_boundary_recovery(
+    paths: &[String],
+    boundary_event_id: i64,
+    request: &str,
+    kind: &str,
+) -> Result<Recovery> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let db = Database::open()?;
+    let project = find_project(&db, &cwd)?;
+    let recovery = create_event_boundary_recovery_in(
+        &db,
+        &project,
+        &cwd,
+        paths,
+        boundary_event_id,
+        request,
+        kind,
     )?;
     print_recovery(&db, &project, &recovery)?;
     Ok(recovery)
+}
+
+/// Restore selected paths to their state at an exact recorded change boundary.
+/// Used by the web UI and `undo recover --before-change` to undo a group of
+/// un-attributed file changes ("restore these files to how they were just
+/// before change N").
+pub(crate) fn create_event_boundary_recovery_in(
+    db: &Database,
+    project: &WatchedProject,
+    base_dir: &std::path::Path,
+    paths: &[String],
+    event_id: i64,
+    request: &str,
+    kind: &str,
+) -> Result<Recovery> {
+    let plan = restore::plan_paths_restore_at_event_id(db, project, base_dir, paths, event_id)?;
+    persist_restore_plan(
+        db,
+        project,
+        RecoverySpec {
+            run_id: None,
+            request,
+            kind,
+            confidence: "exact-paths",
+            ambiguity: None,
+        },
+        &plan,
+    )
 }
 
 pub fn create_intent_recovery(
@@ -164,22 +250,60 @@ pub fn create_intent_recovery(
     Ok(recovery)
 }
 
+pub struct AppliedRecovery {
+    pub recovery: Recovery,
+    pub files_changed: usize,
+    pub already_applied: bool,
+}
+
 pub fn cmd_apply(reference: &str) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
     let project = find_project(&db, &cwd)?;
+    let outcome = apply_recovery_in(&db, &project, reference)?;
+    if outcome.already_applied {
+        println!(
+            "{}Saved recovery plan {} was already applied; no files changed.{}",
+            GREEN,
+            outcome.recovery.public_id(),
+            RESET
+        );
+        return Ok(());
+    }
+    let file_label = if outcome.files_changed == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    println!(
+        "{}Changed {} {} using saved recovery plan {}.{}",
+        GREEN,
+        outcome.files_changed,
+        file_label,
+        outcome.recovery.public_id(),
+        RESET
+    );
+    Ok(())
+}
+
+/// Apply a persisted recovery plan against an explicit database and project.
+/// Carries the same expiry, ambiguity, and expected-hash preflight guarantees
+/// as the CLI path; it only skips the printing.
+pub(crate) fn apply_recovery_in(
+    db: &Database,
+    project: &WatchedProject,
+    reference: &str,
+) -> Result<AppliedRecovery> {
     let recovery = db
         .get_recovery_by_ref(project.id, reference)?
         .ok_or_else(|| anyhow::anyhow!("Recovery '{}' not found", reference))?;
 
     if recovery.status == "applied" {
-        println!(
-            "{}Saved recovery plan {} was already applied; no files changed.{}",
-            GREEN,
-            recovery.public_id(),
-            RESET
-        );
-        return Ok(());
+        return Ok(AppliedRecovery {
+            recovery,
+            files_changed: 0,
+            already_applied: true,
+        });
     }
     if recovery.status != "planned" {
         anyhow::bail!(
@@ -203,8 +327,8 @@ pub fn cmd_apply(reference: &str) -> Result<()> {
     }
 
     let entries = db.get_recovery_entries(recovery.id)?;
-    let fs = RestoreFs::open(&project)?;
-    let conflicts = preflight_entries(&project, &fs, &entries)?;
+    let fs = RestoreFs::open(project)?;
+    let conflicts = preflight_entries(project, &fs, &entries)?;
     if !conflicts.is_empty() {
         let reason = conflicts.join("; ");
         db.mark_recovery_conflicted(recovery.id, &reason)?;
@@ -215,8 +339,8 @@ pub fn cmd_apply(reference: &str) -> Result<()> {
         );
     }
 
-    let plan = recovery_entries_to_plan(&project, &entries)?;
-    if let Err(error) = restore::apply_restore_plan_with_fs(&project, &plan, &fs) {
+    let plan = recovery_entries_to_plan(project, &entries)?;
+    if let Err(error) = restore::apply_restore_plan_with_fs(project, &plan, &fs) {
         let reason = format!("apply stopped: {error}");
         db.mark_recovery_conflicted(recovery.id, &reason)?;
         return Err(error).with_context(|| {
@@ -227,16 +351,11 @@ pub fn cmd_apply(reference: &str) -> Result<()> {
         });
     }
     db.mark_recovery_applied(recovery.id)?;
-    let file_label = if entries.len() == 1 { "file" } else { "files" };
-    println!(
-        "{}Changed {} {} using saved recovery plan {}.{}",
-        GREEN,
-        entries.len(),
-        file_label,
-        recovery.public_id(),
-        RESET
-    );
-    Ok(())
+    Ok(AppliedRecovery {
+        recovery,
+        files_changed: entries.len(),
+        already_applied: false,
+    })
 }
 
 pub fn print_recovery(db: &Database, project: &WatchedProject, recovery: &Recovery) -> Result<()> {

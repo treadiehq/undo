@@ -25,6 +25,24 @@ cargo build --release       # optimized build at target/release/undo
 cargo run -- status         # run a subcommand directly
 ```
 
+### Building the web UI (`undo ui`)
+
+The local web interface lives in `ui/` (Nuxt 4, Tailwind CSS 4, TypeScript)
+and is embedded into the binary at compile time from `ui/dist`:
+
+```bash
+cd ui
+npm install
+npm run build     # writes ui/dist
+cd ..
+cargo build       # embeds ui/dist into the binary
+```
+
+Building the UI requires Node.js 22.12+. Plain `cargo build` works without
+Node: `build.rs` generates a placeholder page when `ui/dist` is absent, so the
+Rust toolchain remains the only hard requirement. Release binaries are built
+with the real UI assets.
+
 ### Trying it out without touching your real history
 
 undo stores everything under `~/.undo/`, resolved from `$HOME`. To exercise a
@@ -88,8 +106,17 @@ All source lives in `src/`. Each module is focused:
 - `retention.rs` — config, pruning, stale temp-file reaping, and disk accounting.
 - `ignore.rs` — built-in and root `.gitignore`/`.undoignore` matching.
 - `integrity.rs` — shallow startup and deep on-demand snapshot verification.
+- `webui.rs` — the `undo ui` HTTP server: loopback-only listener, per-session
+  token and Host checks, JSON API routes, and embedded static assets.
+- `webui_data.rs` — read-side payload builders for the web UI: timeline items
+  (Runs plus gap-clustered un-attributed edits), per-file net diff statistics,
+  structured diff hunks, and recovery views.
 - `duration.rs`, `logging.rs`, `update.rs`, and `models.rs` — duration parsing,
   logs, self-update, and shared data records.
+
+The web UI app itself lives outside `src/` in `ui/` (Nuxt 4 + Tailwind CSS 4 +
+TypeScript, built as a static SPA into `ui/dist` and embedded by
+`include_dir!`).
 
 Documentation is organized under `docs/`:
 

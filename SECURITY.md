@@ -20,9 +20,11 @@ most recent version before reporting.
 ## Security model
 
 undo is a **local, single-user** tool. It runs as your normal user and stores
-everything under `~/.undo/`. It has no network server and opens the network only
-for `undo update` (release downloads from GitHub). Understanding what it does and
-does not protect helps set expectations:
+everything under `~/.undo/`. It opens the network only for `undo update`
+(release downloads from GitHub). The optional `undo ui` command starts a web
+interface on a loopback-only listener; nothing is ever served beyond
+127.0.0.1, and it runs only while you keep the command running. Understanding
+what it does and does not protect helps set expectations:
 
 ### What undo does to protect you
 
@@ -45,6 +47,12 @@ does not protect helps set expectations:
 - **Verified self-update.** `undo update` downloads the release artifact, verifies
   it against the release's published `SHA256SUMS`, and aborts if the checksum file
   is missing or the hash doesn't match. The binary is then replaced atomically.
+- **Loopback-only, token-gated web UI.** `undo ui` binds 127.0.0.1 exclusively
+  and generates a random 256-bit token per session, revealed only in the URL
+  printed to your terminal. Every API request must present the token, so web
+  pages you visit cannot read your history or trigger restores with drive-by
+  requests. Non-loopback `Host` headers are rejected to block DNS-rebinding,
+  and no CORS headers are emitted, keeping cross-origin responses opaque.
 - **Decompression bounds.** Snapshots are size-capped on load to avoid
   decompression-bomb blowups.
 

@@ -33,6 +33,18 @@ Undo also works with `codex`, `opencode`, or any command:
 undo run exec --agent "My Agent" -- my-agent --non-interactive
 ```
 
+## See everything in the local UI
+
+```bash
+undo ui          # the full timeline
+undo ui r_421    # jump straight to one Run's review
+```
+
+Opens a local web interface: your history as a timeline of agent Runs and
+manual edits, per-file diffs, checkbox-selective undo ("keep these, undo the
+rest"), and one-click restores, all through the same preview-then-apply
+recovery plans as the CLI.
+
 ## Recover other changes
 
 Undo can also restore recorded files by time, recover deleted files, and help

@@ -217,6 +217,18 @@ pub enum Command {
 
     /// Update undo to the latest release
     Update,
+
+    /// Open the local web interface for browsing and undoing changes
+    Ui {
+        /// Open focused on this Run's review, e.g. `undo ui r_421`
+        run: Option<String>,
+        /// Port to listen on (127.0.0.1 only); default 5533
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the URL without opening a browser
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -306,11 +318,23 @@ pub enum RunCommand {
 #[derive(Args)]
 pub struct RecoverArgs {
     /// Run id or legacy name to recover from
-    #[arg(long, visible_alias = "session")]
-    pub run: String,
+    #[arg(
+        long,
+        visible_alias = "session",
+        required_unless_present = "before_change",
+        conflicts_with = "before_change"
+    )]
+    pub run: Option<String>,
     /// Optional file-change group to recover instead of the whole Run
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["paths", "before_change"])]
     pub group: Option<String>,
+    /// Recover only this file; repeat the flag for several files
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
+    /// Restore the --path files to their state just before this change id
+    /// (change ids are shown by `undo run show`)
+    #[arg(long, value_name = "CHANGE_ID", requires = "paths")]
+    pub before_change: Option<i64>,
     /// Preview the recovery plan without changing files
     #[arg(long)]
     pub preview: bool,
@@ -551,13 +575,85 @@ mod tests {
 
         match cli.command {
             Command::Recover(args) => {
-                assert_eq!(args.run, "agent-auth-work");
+                assert_eq!(args.run.as_deref(), Some("agent-auth-work"));
                 assert_eq!(args.group.as_deref(), Some("auth"));
                 assert!(args.preview);
                 assert!(!args.yes);
             }
             _ => panic!("expected recover command"),
         }
+    }
+
+    /// `--path` narrows a Run recovery to exact files — the CLI twin of the
+    /// web UI's checkbox-selective undo.
+    #[test]
+    fn parses_recover_with_selected_paths() {
+        let cli = Cli::try_parse_from([
+            "undo",
+            "recover",
+            "--run",
+            "r_421",
+            "--path",
+            "src/auth.rs",
+            "--path",
+            "src/session.rs",
+            "--preview",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Recover(args) => {
+                assert_eq!(args.run.as_deref(), Some("r_421"));
+                assert_eq!(args.paths, vec!["src/auth.rs", "src/session.rs"]);
+                assert!(args.before_change.is_none());
+            }
+            _ => panic!("expected recover command"),
+        }
+    }
+
+    /// `--before-change` anchors a recovery on a recorded change id instead
+    /// of a Run; it requires --path and excludes --run/--group.
+    #[test]
+    fn parses_recover_before_change() {
+        let cli = Cli::try_parse_from([
+            "undo",
+            "recover",
+            "--before-change",
+            "1042",
+            "--path",
+            "src/auth.rs",
+            "--yes",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Recover(args) => {
+                assert_eq!(args.before_change, Some(1042));
+                assert_eq!(args.paths, vec!["src/auth.rs"]);
+                assert!(args.run.is_none());
+                assert!(args.yes);
+            }
+            _ => panic!("expected recover command"),
+        }
+
+        // Without --path there is nothing to anchor: rejected.
+        assert!(Cli::try_parse_from(["undo", "recover", "--before-change", "7"]).is_err());
+        // --run and --before-change are different anchors: rejected together.
+        assert!(
+            Cli::try_parse_from([
+                "undo",
+                "recover",
+                "--run",
+                "r_1",
+                "--before-change",
+                "7",
+                "--path",
+                "a"
+            ])
+            .is_err()
+        );
+        // One of the two anchors is required.
+        assert!(Cli::try_parse_from(["undo", "recover", "--preview"]).is_err());
     }
 
     #[test]
