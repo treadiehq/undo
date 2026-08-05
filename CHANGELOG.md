@@ -8,6 +8,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 Entries below `v0.1.12` were reconstructed from release commit summaries; they
 describe the headline changes of each tag rather than an exhaustive list.
 
+## [Unreleased]
+
+## [0.2.7] — 2026-08-05
+
+- Restore rollback errors are now treated as having an uncertain filesystem
+  outcome, preserving both namespace entries when an NFS server applies an
+  exchange but reports failure to the client.
+
 ## [0.2.6] — 2026-07-31
 
 - New `undo ui` command opens a local web interface: a timeline of agent Runs
@@ -262,7 +270,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/treadiehq/undo/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/treadiehq/undo/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/treadiehq/undo/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/treadiehq/undo/compare/v0.2.3...v0.2.4

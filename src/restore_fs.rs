@@ -224,9 +224,11 @@ impl RestoreFs {
                 let metadata = parent.symlink_metadata(&temp_name)?;
                 if !metadata.is_file() {
                     let undo_result = atomic_undo_exchange(&parent, &temp_name, &name);
-                    temp_is_staged_file =
-                        entry_is_file_with_identity(&parent, &temp_name, staged_identity);
                     if let Err(error) = undo_result {
+                        // Network filesystems can report an error after applying
+                        // a rename server-side. Treat every error outcome as
+                        // uncertain and preserve both namespace entries.
+                        temp_is_staged_file = false;
                         anyhow::bail!(
                             "restore target '{}' changed to a non-file and Undo could not roll \
                              back the replacement: {}. The target may already contain restored \
@@ -237,6 +239,8 @@ impl RestoreFs {
                             target.parent().join(&temp_name).display()
                         );
                     }
+                    temp_is_staged_file =
+                        entry_is_file_with_identity(&parent, &temp_name, staged_identity);
                     anyhow::bail!(
                         "restore target '{}' changed to a non-file before it could be updated",
                         target.relative().display()
@@ -539,8 +543,14 @@ fn atomic_exchange(parent: &Dir, first: &OsStr, second: &OsStr) -> std::io::Resu
 
 fn atomic_undo_exchange(parent: &Dir, first: &OsStr, second: &OsStr) -> std::io::Result<()> {
     #[cfg(test)]
-    if let Some(error) = take_undo_exchange_error() {
-        return Err(error);
+    if let Some(fault) = take_undo_exchange_fault() {
+        return match fault {
+            UndoExchangeFault::Before(error) => Err(error),
+            UndoExchangeFault::After(error) => {
+                atomic_exchange(parent, first, second)?;
+                Err(error)
+            }
+        };
     }
     atomic_exchange(parent, first, second)
 }
@@ -643,11 +653,17 @@ fn temporary_name(target_name: &OsStr, role: &str, timestamp: u128, attempt: usi
 }
 
 #[cfg(test)]
+enum UndoExchangeFault {
+    Before(std::io::Error),
+    After(std::io::Error),
+}
+
+#[cfg(test)]
 thread_local! {
     static BEFORE_LEAF_MUTATION_HOOK:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    static UNDO_EXCHANGE_ERROR:
-        std::cell::RefCell<Option<std::io::Error>> = const { std::cell::RefCell::new(None) };
+    static UNDO_EXCHANGE_FAULT:
+        std::cell::RefCell<Option<UndoExchangeFault>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -671,14 +687,21 @@ fn set_before_leaf_mutation_hook(hook: impl FnOnce() + 'static) {
 
 #[cfg(test)]
 fn set_undo_exchange_error(error: std::io::Error) {
-    UNDO_EXCHANGE_ERROR.with(|slot| {
-        *slot.borrow_mut() = Some(error);
+    UNDO_EXCHANGE_FAULT.with(|slot| {
+        *slot.borrow_mut() = Some(UndoExchangeFault::Before(error));
     });
 }
 
 #[cfg(test)]
-fn take_undo_exchange_error() -> Option<std::io::Error> {
-    UNDO_EXCHANGE_ERROR.with(|slot| slot.borrow_mut().take())
+fn set_undo_exchange_error_after_success(error: std::io::Error) {
+    UNDO_EXCHANGE_FAULT.with(|slot| {
+        *slot.borrow_mut() = Some(UndoExchangeFault::After(error));
+    });
+}
+
+#[cfg(test)]
+fn take_undo_exchange_fault() -> Option<UndoExchangeFault> {
+    UNDO_EXCHANGE_FAULT.with(|slot| slot.borrow_mut().take())
 }
 
 fn timestamp_nanos() -> u128 {
@@ -1035,6 +1058,48 @@ mod tests {
             })
             .expect("the displaced non-file must be preserved for inspection");
         assert!(message.contains(displaced.file_name().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn existing_write_preserves_staged_content_when_rollback_errors_after_exchange() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("nfs-ambiguous-rollback");
+        std::fs::write(&file, "original contents").unwrap();
+        let project = project(&root);
+        let fs = RestoreFs::open(&project).unwrap();
+        let target = ProjectPath::from_relative(Path::new("nfs-ambiguous-rollback")).unwrap();
+
+        let raced_file = file.clone();
+        set_before_leaf_mutation_hook(move || {
+            std::fs::remove_file(&raced_file).unwrap();
+            std::fs::create_dir(raced_file).unwrap();
+            set_undo_exchange_error_after_success(std::io::Error::from_raw_os_error(libc::EIO));
+        });
+
+        let error = fs.write(&target, b"restored contents").unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("could not roll back the replacement"));
+        assert!(file.is_dir(), "the server-side rollback should be visible");
+        let staged = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".undo.partial.")
+                    && entry.file_type().is_ok_and(|kind| kind.is_file())
+            })
+            .expect("an uncertain rollback must preserve the staged file");
+        assert_eq!(
+            std::fs::read_to_string(staged.path()).unwrap(),
+            "restored contents"
+        );
+        assert!(message.contains(staged.file_name().to_string_lossy().as_ref()));
     }
 
     #[test]
