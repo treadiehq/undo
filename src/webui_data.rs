@@ -102,7 +102,8 @@ pub struct TimelineItem {
     pub id: String,
     /// "run" or "edits".
     pub kind: String,
-    /// Display label: agent name, "Manual edits", or "Rapid changes".
+    /// Display label: agent name, "Unattributed edits", or
+    /// "Rapid unattributed changes".
     pub label: String,
     pub actor: String,
     pub agent: Option<String>,
@@ -321,9 +322,9 @@ fn edits_item(
         id: format!("g_{}", first.id),
         kind: "edits".to_string(),
         label: if pace == "machine" {
-            "Rapid changes".to_string()
+            "Rapid unattributed changes".to_string()
         } else {
-            "Manual edits".to_string()
+            "Unattributed edits".to_string()
         },
         actor: "unattributed".to_string(),
         agent: None,
@@ -366,7 +367,7 @@ fn classify_pace(events: &[FileEvent]) -> &'static str {
 
 /// Dominant directory of an item's files (up to two leading components),
 /// reported when at least 60% of the files live under it. Gives un-attributed
-/// groups a scannable identity: "Manual edits · src/auth".
+/// groups a scannable identity: "Unattributed edits · src/auth".
 fn scope_hint(files: &[FileChange]) -> Option<String> {
     if files.len() < 2 {
         return None;

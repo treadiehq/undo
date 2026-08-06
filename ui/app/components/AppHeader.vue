@@ -12,7 +12,7 @@ function choose(id: number) {
 
 <template>
   <header
-    class="flex h-14 shrink-0 items-center gap-4 border-b border-edge bg-bg/90 px-5 backdrop-blur"
+    class="relative z-50 flex h-14 shrink-0 items-center gap-4 border-b border-edge bg-bg/90 px-5 backdrop-blur"
   >
     <div class="flex items-center gap-1.5">
       <!-- <span

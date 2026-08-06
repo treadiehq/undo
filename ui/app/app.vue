@@ -53,7 +53,7 @@ onMounted(() => {
         <TimelineFeed />
         <DiffPanel />
       </main>
-      <TimeScrubber />
+      <!-- <TimeScrubber /> -->
     </template>
 
     <RecoveryModal />

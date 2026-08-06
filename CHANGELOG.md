@@ -8,7 +8,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 Entries below `v0.1.12` were reconstructed from release commit summaries; they
 describe the headline changes of each tag rather than an exhaustive list.
 
-## [Unreleased]
+## [0.2.8] — 2026-08-06
+
+- Web UI activity labels now say "Unattributed edits" or "Rapid unattributed
+  changes" instead of implying that unclaimed filesystem events were
+  definitely made by a person.
+- The project switcher now stays above timeline content, and the low-value
+  time scrubber is hidden while its design is reconsidered.
+- An opt-in `?diff=pierre` comparison mode renders file diffs with
+  `@pierre/diffs`, including syntax highlighting and inline word changes. The
+  existing lightweight renderer remains the default.
 
 ## [0.2.7] — 2026-08-05
 
@@ -270,7 +279,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/treadiehq/undo/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/treadiehq/undo/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/treadiehq/undo/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/treadiehq/undo/compare/v0.2.4...v0.2.5

@@ -41,9 +41,13 @@ undo ui r_421    # jump straight to one Run's review
 ```
 
 Opens a local web interface: your history as a timeline of agent Runs and
-manual edits, per-file diffs, checkbox-selective undo ("keep these, undo the
-rest"), and one-click restores, all through the same preview-then-apply
+unattributed edits, per-file diffs, checkbox-selective undo ("keep these, undo
+the rest"), and one-click restores, all through the same preview-then-apply
 recovery plans as the CLI.
+
+To compare the experimental syntax-highlighted Pierre diff renderer, append
+`&diff=pierre` to the tokenized URL printed by `undo ui`. The lightweight Undo
+renderer remains the default.
 
 ## Recover other changes
 
