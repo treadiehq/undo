@@ -3,7 +3,10 @@ import { computed } from 'vue'
 import type { TimelineItem } from '~/types'
 import { fmtClock, fmtDuration } from '~/utils/format'
 
-const props = defineProps<{ item: TimelineItem }>()
+const props = defineProps<{
+  item: TimelineItem
+  restoreImpact?: 'undo' | 'partial' | 'keep' | null
+}>()
 
 const { state, toggleExpanded, toggleFile, setSelection, previewUndo, openDiff } =
   useUndo()
@@ -13,9 +16,41 @@ const selection = computed(
   () => state.selections.get(props.item.id) ?? new Set<string>(),
 )
 const selectedCount = computed(() => selection.value.size)
-const allPaths = computed(() => props.item.files.map((file) => file.path))
+const allPaths = computed(() =>
+  props.item.files.filter((file) => file.recoverable).map((file) => file.path),
+)
 const isActive = computed(() => props.item.status === 'active')
 const destructive = computed(() => props.item.deleted_files >= 3)
+const blockedCount = computed(
+  () => props.item.files.filter((file) => !file.recoverable).length,
+)
+const impactChip = computed(() => {
+  switch (props.restoreImpact) {
+    case 'undo':
+      return {
+        text: 'Will undo',
+        class: 'border-accent/30 bg-accent/10 text-accent',
+        description:
+          'This activity happened after the restore point and is expected to be reverted.',
+      }
+    case 'partial':
+      return {
+        text: 'Partially undo',
+        class: 'border-warn/30 bg-warn/10 text-warn',
+        description:
+          'This activity crosses the restore point. Only its later changes are expected to be reverted.',
+      }
+    case 'keep':
+      return {
+        text: 'Will keep',
+        class: 'border-edge bg-well text-dim',
+        description:
+          'This activity finished before the restore point and is expected to remain.',
+      }
+    default:
+      return null
+  }
+})
 
 const statusChip = computed(() => {
   switch (props.item.status) {
@@ -25,33 +60,18 @@ const statusChip = computed(() => {
       return { text: 'Failed', class: 'border-del/30 bg-del/10 text-del' }
     case 'aborted':
       return { text: 'Aborted', class: 'border-warn/30 bg-warn/10 text-warn' }
+    case 'blocked':
+      return { text: 'Blocked', class: 'border-warn/30 bg-warn/10 text-warn' }
     default:
       return null
   }
 })
 
-function undoSelected() {
+function previewSelectedRestore() {
   void previewUndo({
     item: props.item,
     paths: [...selection.value],
-    description: `Undo ${selectedCount.value} selected file${selectedCount.value === 1 ? '' : 's'} from ${props.item.label}`,
-  })
-}
-
-function keepSelectedUndoRest() {
-  const rest = allPaths.value.filter((path) => !selection.value.has(path))
-  void previewUndo({
-    item: props.item,
-    paths: rest,
-    description: `Keep ${selectedCount.value} file${selectedCount.value === 1 ? '' : 's'}, undo the other ${rest.length} from ${props.item.label}`,
-  })
-}
-
-function undoEverything() {
-  void previewUndo({
-    item: props.item,
-    paths: allPaths.value,
-    description: `Undo everything from ${props.item.label} (${allPaths.value.length} files)`,
+    description: `Restore ${selectedCount.value} selected file${selectedCount.value === 1 ? '' : 's'} to before ${props.item.label}`,
   })
 }
 
@@ -67,7 +87,16 @@ function toggleSelectAll() {
   <article
     :id="`item-${props.item.id}`"
     class="rise-in overflow-hidden rounded-xl border bg-panel transition-colors"
-    :class="expanded ? 'border-edge-strong' : 'border-edge hover:border-edge-strong'"
+    :class="[
+      expanded ? 'border-edge-strong' : 'border-edge hover:border-edge-strong',
+      props.restoreImpact === 'undo'
+        ? 'ring-1 ring-inset ring-accent/60'
+        : props.restoreImpact === 'partial'
+          ? 'ring-1 ring-inset ring-warn/50'
+          : props.restoreImpact === 'keep'
+            ? 'opacity-55'
+            : '',
+    ]"
   >
     <!-- Card header -->
     <button
@@ -78,11 +107,19 @@ function toggleSelectAll() {
            tool-speed changes but cannot name the process behind them. -->
       <span
         class="grid size-8 shrink-0 place-items-center rounded-lg border border-edge bg-well"
-        :class="props.item.kind === 'run' ? 'text-accent' : 'text-mut'"
+        :class="
+          props.item.kind === 'collision'
+            ? 'text-warn'
+            : props.item.kind === 'run'
+              ? 'text-accent'
+              : 'text-mut'
+        "
       >
         <UiIcon
           :name="
-            props.item.kind === 'run'
+            props.item.kind === 'collision'
+              ? 'warning'
+              : props.item.kind === 'run'
               ? props.item.actor === 'tool'
                 ? 'terminal'
                 : 'bot'
@@ -107,17 +144,19 @@ function toggleSelectAll() {
             {{ props.item.scope_hint }}
           </span>
           <span
-            v-if="props.item.run_id"
-            class="shrink-0 rounded bg-well px-1.5 py-px font-mono text-[10px] text-dim"
-          >
-            {{ props.item.run_id }}
-          </span>
-          <span
             v-if="statusChip"
             class="shrink-0 rounded-full border px-2 py-px text-[10.5px] font-medium"
             :class="statusChip.class"
           >
             <span v-if="isActive" class="mr-1 inline-block size-1 animate-pulse rounded-full bg-accent align-middle" />{{ statusChip.text }}
+          </span>
+          <span
+            v-if="impactChip"
+            class="shrink-0 rounded-full border px-2 py-px text-[10.5px] font-medium"
+            :class="impactChip.class"
+            :title="impactChip.description"
+          >
+            {{ impactChip.text }}
           </span>
           <span
             v-if="destructive"
@@ -160,6 +199,7 @@ function toggleSelectAll() {
     <div v-if="expanded" class="border-t border-edge">
       <div class="flex items-center gap-3 px-4 pb-1 pt-2.5">
         <button
+          v-if="allPaths.length > 0"
           class="text-[11.5px] font-medium text-dim transition-colors hover:text-ink"
           @click="toggleSelectAll"
         >
@@ -168,8 +208,23 @@ function toggleSelectAll() {
         <span v-if="selectedCount > 0" class="text-[11.5px] text-mut">
           {{ selectedCount }} of {{ allPaths.length }} selected
         </span>
+        <span v-else-if="allPaths.length === 0" class="text-[11.5px] text-warn">
+          No whole-file recovery available
+        </span>
         <span v-if="props.item.stats_truncated" class="text-[11px] text-dim">
           line counts computed for the first 500 files
+        </span>
+      </div>
+
+      <div
+        v-if="blockedCount > 0"
+        class="mx-4 mb-2 flex items-start gap-2 rounded-lg border border-warn/20 bg-warn/8 px-3 py-2 text-[11.5px] leading-relaxed text-warn"
+      >
+        <UiIcon name="warning" :size="12" class="mt-0.5 shrink-0" />
+        <span>
+          {{ blockedCount }} file{{ blockedCount === 1 ? '' : 's' }} cannot be
+          restored as whole files because ownership is collision, interleaved,
+          or unattributed. Open a file to inspect the recorded diff.
         </span>
       </div>
 
@@ -208,39 +263,26 @@ function toggleSelectAll() {
       <div class="flex items-center gap-2 border-t border-edge bg-well/50 px-4 py-2.5">
         <template v-if="isActive">
           <span class="text-[12px] text-dim">
-            This Run is still active — undo becomes available when it finishes.
+            This Run is still active — restore previews become available when it finishes.
+          </span>
+        </template>
+        <template v-else-if="allPaths.length > 0">
+          <button
+            class="rounded-lg bg-ink px-3.5 py-1.5 text-[12.5px] font-semibold text-bg transition-opacity hover:opacity-85 disabled:opacity-40"
+            :disabled="selectedCount === 0 || state.recoveryBusy"
+            @click="previewSelectedRestore"
+          >
+            Preview restore for {{ selectedCount }} file{{ selectedCount === 1 ? '' : 's' }}
+          </button>
+          <span class="flex-1" />
+          <span class="text-[11px] text-dim">
+            Select files first; nothing changes until you apply the reviewed plan
           </span>
         </template>
         <template v-else>
-          <button
-            v-if="selectedCount > 0"
-            class="rounded-lg bg-ink px-3.5 py-1.5 text-[12.5px] font-semibold text-bg transition-opacity hover:opacity-85 disabled:opacity-40"
-            :disabled="state.recoveryBusy"
-            @click="undoSelected"
-          >
-            Undo {{ selectedCount }} selected
-          </button>
-          <button
-            v-if="selectedCount > 0 && selectedCount < allPaths.length"
-            class="rounded-lg border border-edge px-3.5 py-1.5 text-[12.5px] font-medium text-mut transition-colors hover:border-edge-strong hover:text-ink disabled:opacity-40"
-            :disabled="state.recoveryBusy"
-            @click="keepSelectedUndoRest"
-          >
-            Keep selected, undo the rest
-          </button>
-          <button
-            v-if="selectedCount === 0"
-            class="rounded-lg border border-edge px-3.5 py-1.5 text-[12.5px] font-medium text-mut transition-colors hover:border-del/40 hover:text-del disabled:opacity-40"
-            :disabled="state.recoveryBusy"
-            @click="undoEverything"
-          >
-            <span class="flex items-center gap-1.5">
-              <UiIcon name="undo" :size="12" />
-              Undo everything from this {{ props.item.kind === 'run' ? 'run' : 'group' }}
-            </span>
-          </button>
-          <span class="flex-1" />
-          <span class="text-[11px] text-dim">Nothing changes until you review a plan</span>
+          <span class="text-[12px] text-warn">
+            Recovery is disabled because no file has exclusive reported ownership.
+          </span>
         </template>
       </div>
     </div>

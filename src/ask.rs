@@ -463,6 +463,7 @@ mod tests {
             project_id: 1,
             name: "agent-auth-work".to_string(),
             kind: "manual".to_string(),
+            attribution_mode: "window".to_string(),
             actor: "agent".to_string(),
             agent: Some("Test Agent".to_string()),
             command: None,

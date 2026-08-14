@@ -41,7 +41,7 @@ pub fn cmd_ui(run: Option<&str>, port: Option<u16>, no_open: bool) -> Result<()>
     let current_project = db.find_project_for_path(&cwd)?;
     let current_project_id = match &current_project {
         Some(project) => {
-            let _ = crate::daemon::ensure_recording(&cwd);
+            let _ = crate::daemon::ensure_recording_for_path(Path::new(&project.root_path));
             Some(project.id)
         }
         None => None,
@@ -264,7 +264,13 @@ fn api_response(
         }
         (Method::Post, ["projects", id, "recoveries", reference, "apply"]) => {
             let project = require_project(&db, id)?;
-            let outcome = recoveries::apply_recovery_in(&db, &project, reference)?;
+            let spec = parse_apply_recovery_spec(&body)?;
+            let outcome = recoveries::apply_recovery_paths_in(
+                &db,
+                &project,
+                reference,
+                spec.paths.as_deref(),
+            )?;
             json!({
                 "applied": !outcome.already_applied,
                 "already_applied": outcome.already_applied,
@@ -280,6 +286,20 @@ fn api_response(
         }
     };
     Ok(json_response(200, &value))
+}
+
+#[derive(Default, Deserialize)]
+struct ApplyRecoverySpec {
+    /// Project-relative paths selected from the stored recovery preview.
+    /// Omitted paths preserve the original full-plan apply behavior.
+    paths: Option<Vec<String>>,
+}
+
+fn parse_apply_recovery_spec(body: &[u8]) -> Result<ApplyRecoverySpec> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(ApplyRecoverySpec::default());
+    }
+    serde_json::from_slice(body).context("invalid apply recovery request body")
 }
 
 #[derive(Deserialize)]
@@ -600,6 +620,22 @@ mod tests {
         assert_eq!(params.string("path").as_deref(), Some("src/app.rs"));
         assert_eq!(params.i64("since_secs"), Some(3600));
         assert_eq!(params.string("missing"), None);
+    }
+
+    #[test]
+    fn apply_payload_preserves_full_and_selected_plan_modes() {
+        assert!(parse_apply_recovery_spec(b"").unwrap().paths.is_none());
+        assert!(parse_apply_recovery_spec(br#"{}"#).unwrap().paths.is_none());
+        assert_eq!(
+            parse_apply_recovery_spec(br#"{"paths":["src/app.rs"]}"#)
+                .unwrap()
+                .paths,
+            Some(vec!["src/app.rs".to_string()])
+        );
+        assert_eq!(
+            parse_apply_recovery_spec(br#"{"paths":[]}"#).unwrap().paths,
+            Some(Vec::new())
+        );
     }
 
     #[test]

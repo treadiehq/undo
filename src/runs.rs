@@ -27,15 +27,15 @@ pub struct StartRunOptions<'a> {
 struct StartedRun {
     db: Database,
     project: WatchedProject,
-    cwd: std::path::PathBuf,
+    root: std::path::PathBuf,
     run: Session,
 }
 
 impl StartedRun {
     fn complete(&self, status: &str, output: Output, sync_files: bool) -> Result<Session> {
         if sync_files {
-            crate::daemon::ensure_recording(&self.cwd)?;
-            sync_project(&self.db, &self.project, &self.cwd)?;
+            crate::daemon::ensure_recording_for_path(&self.root)?;
+            sync_project(&self.db, &self.project, &self.root)?;
         }
         let run = self.db.complete_run(self.run.id, status)?;
         print_completed(&run, output);
@@ -47,8 +47,20 @@ pub fn cmd_run_start(options: StartRunOptions<'_>, output: Output) -> Result<Ses
     Ok(start_run(options, output)?.run)
 }
 
+pub fn cmd_reported_run_start(options: StartRunOptions<'_>, output: Output) -> Result<Session> {
+    Ok(start_run_with_mode(options, output, "reported")?.run)
+}
+
 fn start_run(options: StartRunOptions<'_>, output: Output) -> Result<StartedRun> {
-    let (db, project, cwd) = prepare_project_boundary()?;
+    start_run_with_mode(options, output, "window")
+}
+
+fn start_run_with_mode(
+    options: StartRunOptions<'_>,
+    output: Output,
+    attribution_mode: &str,
+) -> Result<StartedRun> {
+    let (db, project, root) = prepare_project_boundary()?;
     let actor = options.actor.unwrap_or(if options.agent.is_some() {
         "agent"
     } else {
@@ -61,21 +73,37 @@ fn start_run(options: StartRunOptions<'_>, output: Output) -> Result<StartedRun>
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| generated_run_name(options.agent.unwrap_or(actor)));
-    let run = db.start_run(
-        project.id,
-        &name,
-        "run",
-        actor,
-        options.agent,
-        options.command,
-        options.intent,
-        options.external_id,
-    )?;
-    print_started(&run, output, &cwd)?;
+    let run = if attribution_mode == "reported" {
+        let external_id = options
+            .external_id
+            .ok_or_else(|| anyhow::anyhow!("a reported Run requires a stable external Run ID"))?;
+        db.start_reported_run(
+            project.id,
+            &name,
+            "run",
+            actor,
+            options.agent,
+            options.command,
+            options.intent,
+            external_id,
+        )?
+    } else {
+        db.start_run(
+            project.id,
+            &name,
+            "run",
+            actor,
+            options.agent,
+            options.command,
+            options.intent,
+            options.external_id,
+        )?
+    };
+    print_started(&run, output, &root)?;
     Ok(StartedRun {
         db,
         project,
-        cwd,
+        root,
         run,
     })
 }
@@ -83,10 +111,10 @@ fn start_run(options: StartRunOptions<'_>, output: Output) -> Result<StartedRun>
 pub fn cmd_run_stop(reference: Option<&str>, status: &str, output: Output) -> Result<Session> {
     validate_completion_status(status)?;
     let cwd = std::env::current_dir()?.canonicalize()?;
-    crate::daemon::ensure_recording(&cwd)?;
+    let root = crate::daemon::ensure_recording_for_path(&cwd)?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
-    sync_project(&db, &project, &cwd)?;
+    let project = find_project(&db, &root)?;
+    sync_project(&db, &project, &root)?;
     let run = match reference {
         Some(reference) => db
             .get_run_by_ref(project.id, reference)?
@@ -370,11 +398,11 @@ fn normalize_shorthand_command(command: &mut Vec<String>) {
 
 pub fn prepare_project_boundary() -> Result<(Database, WatchedProject, std::path::PathBuf)> {
     let cwd = std::env::current_dir()?.canonicalize()?;
-    crate::daemon::ensure_recording(&cwd)?;
+    let root = crate::daemon::ensure_recording_for_path(&cwd)?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
-    sync_project(&db, &project, &cwd)?;
-    Ok((db, project, cwd))
+    let project = find_project(&db, &root)?;
+    sync_project(&db, &project, &root)?;
+    Ok((db, project, root))
 }
 
 pub fn sync_project(db: &Database, project: &WatchedProject, root: &Path) -> Result<()> {
@@ -621,7 +649,7 @@ mod tests {
         let started = StartedRun {
             db,
             project,
-            cwd,
+            root: cwd,
             run,
         };
 

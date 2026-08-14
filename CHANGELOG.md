@@ -8,6 +8,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 Entries below `v0.1.12` were reconstructed from release commit summaries; they
 describe the headline changes of each tag rather than an exhaustive list.
 
+## [0.2.9] — 2026-08-14
+
+- New `undo setup --agent claude|cursor|codex` commands safely install
+  user-level lifecycle hooks, start recording automatically, and report exact
+  agent change boundaries without requiring an `undo run` wrapper.
+- Reported Runs can now overlap in one project. Explicit path and event claims
+  provide agent attribution, while collisions and interleaved ownership are
+  surfaced and blocked from unsafe whole-file recovery.
+- The version 2 agent event protocol adds stable external Run and change IDs,
+  explicit claimed paths, concurrent Run support, and idempotent completion.
+- The local UI is now restore-first: an activity-aware restore timeline shows
+  the selected point's impact, concurrent Runs, ownership warnings, and
+  checkbox-selective preview and apply flows without exposing internal IDs.
+- Selective apply creates an immutable derived Recovery plan for the chosen
+  paths, preserving the original preview and its conflict checks.
+
 ## [0.2.8] — 2026-08-06
 
 - Web UI activity labels now say "Unattributed edits" or "Rapid unattributed
@@ -279,7 +295,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.8...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.9...HEAD
+[0.2.9]: https://github.com/treadiehq/undo/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/treadiehq/undo/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/treadiehq/undo/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/treadiehq/undo/compare/v0.2.5...v0.2.6

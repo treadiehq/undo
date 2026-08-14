@@ -157,6 +157,37 @@ pub fn initial_scan(
     initial_scan_with_limit(db, project, root, verbose, max_files, true)
 }
 
+/// Reconcile a small integration-reported path set without walking the whole
+/// project. This records physical state only; attribution is attached later by
+/// closing the reported boundary. Rename integrations must provide both names.
+pub fn reconcile_paths(
+    db: &Database,
+    project: &WatchedProject,
+    root: &Path,
+    paths: &[String],
+) -> Result<()> {
+    crate::ignore::init(root);
+    for path in paths {
+        let path = Path::new(path);
+        let metadata = symlink_metadata_timeout(path);
+        let is_dir = metadata.as_ref().is_some_and(|value| value.is_dir());
+        if should_ignore_with_type(path, root, is_dir) {
+            continue;
+        }
+        match metadata {
+            Some(value) if value.is_file() => {
+                handle_modify(db, project, path, value.len(), mtime_nanos(&value), false)?;
+            }
+            Some(value) if value.file_type().is_symlink() || value.is_dir() => {}
+            _ if root_is_accessible(root) => {
+                handle_delete(db, project, path, false)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile after the watched root became accessible again following a pause.
 ///
 /// `start_dev` is the root's device id captured when watching began. If it no

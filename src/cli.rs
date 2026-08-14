@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 fn parse_positive_usize(s: &str) -> Result<usize, String> {
     let n: usize = s.parse().map_err(|e| format!("{e}"))?;
@@ -24,8 +24,39 @@ pub struct Cli {
     pub verbose: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum Agent {
+    Claude,
+    Cursor,
+    Codex,
+}
+
+impl Agent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Codex => "codex",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Command {
+    /// Install global hooks for a coding agent
+    Setup {
+        /// Agent whose global hooks should invoke Undo
+        #[arg(long, value_enum)]
+        agent: Agent,
+    },
+
+    /// Handle one agent hook payload from stdin
+    #[command(name = "_hook", hide = true)]
+    Hook {
+        #[arg(long, value_enum)]
+        agent: Agent,
+    },
+
     /// Start recording file changes in the current folder
     Start {
         /// Bypass ownership, file-count, and overlap safety checks
@@ -402,6 +433,32 @@ mod tests {
                 assert!(deleted);
             }
             _ => panic!("expected timeline command"),
+        }
+    }
+
+    #[test]
+    fn setup_accepts_supported_agents_and_rejects_unknown_agents() {
+        for (name, expected) in [
+            ("claude", Agent::Claude),
+            ("cursor", Agent::Cursor),
+            ("codex", Agent::Codex),
+        ] {
+            let cli = Cli::try_parse_from(["undo", "setup", "--agent", name]).unwrap();
+            match cli.command {
+                Command::Setup { agent } => assert_eq!(agent, expected),
+                _ => panic!("expected setup command"),
+            }
+        }
+
+        assert!(Cli::try_parse_from(["undo", "setup", "--agent", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn parses_hidden_internal_hook_command() {
+        let cli = Cli::try_parse_from(["undo", "_hook", "--agent", "cursor"]).unwrap();
+        match cli.command {
+            Command::Hook { agent } => assert_eq!(agent, Agent::Cursor),
+            _ => panic!("expected internal hook command"),
         }
     }
 

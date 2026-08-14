@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { fmtClock } from '~/utils/format'
 
 const { state, currentProject, selectProject } = useUndo()
 const menuOpen = ref(false)
@@ -73,14 +74,18 @@ function choose(id: number) {
 
     <div class="flex-1" />
 
-    <!-- Active run indicator -->
-    <span
-      v-if="state.activeRunId"
-      class="flex items-center gap-2 rounded-full border border-accent/30 bg-accent/10 px-3 py-1 text-[12px] font-medium text-accent"
-    >
-      <UiIcon name="sparkle" :size="12" />
-      Run {{ state.activeRunId }} in progress
-    </span>
+    <!-- Active Run summaries. IDs stay internal as stable keys. -->
+    <div v-if="state.activeRuns.length > 0" class="flex items-center gap-2">
+      <span
+        v-for="run in state.activeRuns"
+        :key="run.id"
+        class="flex items-center gap-2 rounded-full border border-accent/30 bg-accent/10 px-3 py-1 text-[12px] font-medium text-accent"
+      >
+        <UiIcon name="sparkle" :size="12" />
+        <span>{{ run.label }}</span>
+        <span class="font-normal text-accent/75">Started {{ fmtClock(run.started_at) }}</span>
+      </span>
+    </div>
 
     <!-- Recording status -->
     <span

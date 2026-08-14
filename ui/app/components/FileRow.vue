@@ -42,15 +42,21 @@ function blocks(file: FileChange): Array<'add' | 'del' | 'none'> {
     :class="active ? 'bg-well ring-1 ring-edge-strong' : 'hover:bg-well/70'"
     @click="emit('open')"
   >
-    <!-- Checkbox: marks the file for undo -->
+    <!-- Checkbox: includes the file in a restore preview -->
     <button
       class="grid size-[15px] shrink-0 place-items-center rounded border transition-colors"
       :class="
-        selected
+        !props.file.recoverable
+          ? 'cursor-not-allowed border-edge bg-well text-transparent opacity-45'
+          : selected
           ? 'border-ink bg-ink text-bg'
           : 'border-edge-strong bg-transparent text-transparent group-hover:border-dim'
       "
-      :title="selected ? 'Deselect' : 'Select to undo'"
+      :disabled="!props.file.recoverable"
+      :title="
+        props.file.warning ??
+        (selected ? 'Remove from restore' : 'Select to restore')
+      "
       @click.stop="emit('toggle')"
     >
       <UiIcon name="check" :size="10" />
@@ -71,6 +77,14 @@ function blocks(file: FileChange): Array<'add' | 'del' | 'none'> {
       </template>
       <span class="text-dim">{{ splitPath(props.file.path).dir }}</span
       ><span class="text-ink">{{ splitPath(props.file.path).name }}</span>
+    </span>
+
+    <span
+      v-if="!props.file.recoverable"
+      class="shrink-0 rounded border border-warn/25 bg-warn/8 px-1.5 py-px text-[10px] text-warn"
+      :title="props.file.warning ?? undefined"
+    >
+      {{ props.file.ownership_status }}
     </span>
 
     <span

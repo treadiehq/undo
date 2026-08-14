@@ -63,6 +63,10 @@ pub struct Run {
     pub project_id: i64,
     pub name: String,
     pub kind: String,
+    /// `window` for legacy/manual/wrapper Runs; `reported` when an integration
+    /// explicitly claims exact file-change boundaries. Reported attribution is
+    /// an integration claim, not forensic process provenance.
+    pub attribution_mode: String,
     pub actor: String,
     pub agent: Option<String>,
     pub command: Option<String>,
@@ -84,10 +88,28 @@ impl Run {
     pub fn is_active(&self) -> bool {
         self.ended_at.is_none()
     }
+
+    pub fn is_reported(&self) -> bool {
+        self.attribution_mode == "reported"
+    }
 }
 
 /// Compatibility name for the pre-Run public API.
 pub type Session = Run;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RunBoundary {
+    pub id: i64,
+    pub run_id: i64,
+    pub external_change_id: String,
+    pub status: String,
+    pub start_event_id: i64,
+    pub end_event_id: Option<i64>,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RunIntent {

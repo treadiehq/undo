@@ -49,6 +49,45 @@ pub fn ensure_recording(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Ensure recording for a path without creating a duplicate nested recorder.
+/// Active recorder roots take precedence, followed by a project already known
+/// to the database; only an unknown path becomes a new recorder root.
+pub fn ensure_recording_for_path(path: &Path) -> Result<PathBuf> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve recording folder {}", path.display()))?;
+    let bt_dir = backtrack_dir()?;
+    migrate_old_pid_file(&bt_dir)?;
+
+    let active_roots = active_daemons(&bt_dir)
+        .into_iter()
+        .map(|(_, root)| root)
+        .collect::<Vec<_>>();
+    if let Some(root) = most_specific_parent(&path, active_roots.iter()) {
+        return Ok(root.to_path_buf());
+    }
+
+    let db = Database::open()?;
+    let root = db
+        .find_project_for_path(&path)?
+        .map(|project| PathBuf::from(project.root_path))
+        .unwrap_or(path);
+    let root = root.canonicalize().unwrap_or(root);
+    ensure_recording(&root)?;
+    Ok(root)
+}
+
+fn most_specific_parent<'a>(
+    path: &Path,
+    roots: impl IntoIterator<Item = &'a PathBuf>,
+) -> Option<&'a Path> {
+    roots
+        .into_iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .map(PathBuf::as_path)
+}
+
 #[derive(Clone, Copy, Default)]
 struct StartupLogCursor {
     offset: u64,
@@ -724,6 +763,54 @@ mod tests {
         let a = pid_file_for_root(bt_dir, Path::new("/home/user/project-a"));
         let b = pid_file_for_root(bt_dir, Path::new("/home/user/project-b"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn project_aware_root_prefers_watched_parent_over_nested_path() {
+        let watched = PathBuf::from("/home/user/project");
+        let sibling = PathBuf::from("/home/user/other");
+        let roots = [sibling, watched.clone()];
+        let selected =
+            most_specific_parent(Path::new("/home/user/project/packages/app"), roots.iter());
+        assert_eq!(selected, Some(watched.as_path()));
+    }
+
+    #[test]
+    fn ensure_recording_for_path_does_not_start_nested_recorder() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        std::fs::create_dir_all(data_dir.path().join("pids")).unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("packages").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        let project_root_string = project_root.to_string_lossy().into_owned();
+        let _lock = write_live_pid_file(data_dir.path(), &project_root_string);
+
+        let selected = ensure_recording_for_path(&nested).unwrap();
+        assert_eq!(selected, project_root);
+        assert!(
+            !pid_file_for_root(data_dir.path(), &nested.canonicalize().unwrap()).exists(),
+            "the nested path must not get its own recorder marker"
+        );
+    }
+
+    #[test]
+    fn project_aware_root_uses_most_specific_matching_recorder() {
+        let broad = PathBuf::from("/home/user");
+        let project = PathBuf::from("/home/user/project");
+        let roots = [broad, project.clone()];
+        let selected = most_specific_parent(Path::new("/home/user/project/src"), roots.iter());
+        assert_eq!(selected, Some(project.as_path()));
+    }
+
+    #[test]
+    fn project_aware_root_ignores_shared_prefix_and_unrelated_roots() {
+        let roots = [PathBuf::from("/home/user/project"), PathBuf::from("/other")];
+        assert!(
+            most_specific_parent(Path::new("/home/user/project-extra"), roots.iter()).is_none()
+        );
     }
 
     /// The same root must produce the same PID file path across multiple calls.

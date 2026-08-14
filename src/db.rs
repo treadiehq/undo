@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::models::{
-    Checkpoint, FileEvent, FileState, Recovery, RecoveryEntry, RunIntent, Session, WatchedProject,
+    Checkpoint, FileEvent, FileState, Recovery, RecoveryEntry, RunBoundary, RunIntent, Session,
+    WatchedProject,
 };
 
 pub struct Database {
@@ -29,9 +30,9 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     )?;
 
     let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if schema_version > 3 {
+    if schema_version > 4 {
         anyhow::bail!(
-            "Undo data uses schema version {}, but this binary supports through version 3. \
+            "Undo data uses schema version {}, but this binary supports through version 4. \
              Upgrade Undo before opening this history.",
             schema_version
         );
@@ -89,6 +90,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             project_id INTEGER NOT NULL,
             name       TEXT    NOT NULL,
             kind       TEXT    NOT NULL,
+            attribution_mode TEXT NOT NULL DEFAULT 'window',
             actor      TEXT    NOT NULL DEFAULT 'human',
             agent      TEXT,
             command    TEXT,
@@ -110,6 +112,28 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (session_id, event_id),
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
             FOREIGN KEY (event_id) REFERENCES file_events(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS run_boundaries (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id             INTEGER NOT NULL,
+            external_change_id TEXT    NOT NULL,
+            status             TEXT    NOT NULL DEFAULT 'open',
+            start_event_id     INTEGER NOT NULL,
+            end_event_id       INTEGER,
+            started_at         INTEGER NOT NULL,
+            ended_at           INTEGER,
+            created_at         INTEGER NOT NULL,
+            updated_at         INTEGER NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            UNIQUE(run_id, external_change_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS run_boundary_paths (
+            boundary_id INTEGER NOT NULL,
+            path        TEXT    NOT NULL,
+            PRIMARY KEY (boundary_id, path),
+            FOREIGN KEY (boundary_id) REFERENCES run_boundaries(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS run_intents (
@@ -156,6 +180,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             idempotency_key TEXT PRIMARY KEY,
             run_id          INTEGER,
             event_type      TEXT NOT NULL,
+            request_hash    TEXT NOT NULL DEFAULT '',
             response_json   TEXT NOT NULL,
             created_at      INTEGER NOT NULL,
             FOREIGN KEY (run_id) REFERENCES sessions(id)
@@ -171,10 +196,12 @@ fn apply_schema(conn: &Connection) -> Result<()> {
             ON checkpoints(project_id, timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_project_time
             ON sessions(project_id, started_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_active
-            ON sessions(project_id) WHERE ended_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_session_events_event
             ON session_events(event_id);
+        CREATE INDEX IF NOT EXISTS idx_run_boundaries_run
+            ON run_boundaries(run_id, start_event_id);
+        CREATE INDEX IF NOT EXISTS idx_run_boundary_paths_path
+            ON run_boundary_paths(path);
         CREATE INDEX IF NOT EXISTS idx_run_intents_run
             ON run_intents(run_id, start_event_id);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_run_intents_one_active
@@ -200,12 +227,25 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "sessions", "intent", "TEXT")?;
     add_column_if_missing(conn, "sessions", "external_id", "TEXT")?;
     add_column_if_missing(conn, "sessions", "status", "TEXT NOT NULL DEFAULT 'active'")?;
+    add_column_if_missing(
+        conn,
+        "sessions",
+        "attribution_mode",
+        "TEXT NOT NULL DEFAULT 'window'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "integration_events",
+        "request_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     add_column_if_missing(conn, "checkpoints", "run_id", "INTEGER")?;
     add_column_if_missing(conn, "checkpoints", "event_id", "INTEGER")?;
     add_column_if_missing(conn, "checkpoints", "intent", "TEXT")?;
     migrate_checkpoints_v3(conn)?;
     conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_external_id
+        "DROP INDEX IF EXISTS idx_sessions_one_active;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_external_id
             ON sessions(project_id, external_id) WHERE external_id IS NOT NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_legacy_name
             ON checkpoints(project_id, name) WHERE run_id IS NULL;
@@ -221,7 +261,7 @@ fn apply_schema(conn: &Connection) -> Result<()> {
          WHERE status IS NULL OR status = '' OR (status = 'active' AND ended_at IS NOT NULL)",
         [],
     )?;
-    conn.pragma_update(None, "user_version", 3)?;
+    conn.pragma_update(None, "user_version", 4)?;
 
     Ok(())
 }
@@ -833,6 +873,17 @@ impl Database {
             .context("failed to count events")
     }
 
+    pub fn event_time_bounds(&self, project_id: i64) -> Result<(Option<i64>, Option<i64>)> {
+        self.conn
+            .query_row(
+                "SELECT MIN(timestamp), MAX(timestamp)
+                 FROM file_events WHERE project_id = ?1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("failed to query event time bounds")
+    }
+
     pub fn get_deleted_events(&self, project_id: i64, limit: usize) -> Result<Vec<FileEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, timestamp, path, event_type,
@@ -1024,30 +1075,99 @@ impl Database {
         intent: Option<&str>,
         external_id: Option<&str>,
     ) -> Result<Session> {
+        self.start_run_with_attribution(
+            project_id,
+            name,
+            kind,
+            "window",
+            actor,
+            agent,
+            command,
+            intent,
+            external_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_reported_run(
+        &self,
+        project_id: i64,
+        name: &str,
+        kind: &str,
+        actor: &str,
+        agent: Option<&str>,
+        command: Option<&str>,
+        intent: Option<&str>,
+        external_id: &str,
+    ) -> Result<Session> {
+        self.start_run_with_attribution(
+            project_id,
+            name,
+            kind,
+            "reported",
+            actor,
+            agent,
+            command,
+            intent,
+            Some(external_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_run_with_attribution(
+        &self,
+        project_id: i64,
+        name: &str,
+        kind: &str,
+        attribution_mode: &str,
+        actor: &str,
+        agent: Option<&str>,
+        command: Option<&str>,
+        intent: Option<&str>,
+        external_id: Option<&str>,
+    ) -> Result<Session> {
         self.immediate_transaction(|db| {
             let now = Utc::now().timestamp();
             if let Some(external_id) = external_id
                 && let Some(existing) = db.get_run_by_external_id(project_id, external_id)?
             {
+                if existing.attribution_mode != attribution_mode {
+                    anyhow::bail!(
+                        "external Run ID '{}' already belongs to a {} Run",
+                        external_id,
+                        existing.attribution_mode
+                    );
+                }
                 return Ok(existing);
             }
-            if let Some(active) = db.get_active_session(project_id)? {
+            let active_runs = db.list_active_runs(project_id)?;
+            let conflict = if attribution_mode == "window" {
+                active_runs.first()
+            } else {
+                active_runs
+                    .iter()
+                    .find(|run| run.attribution_mode == "window")
+            };
+            if let Some(active) = conflict {
                 anyhow::bail!(
-                    "Run {} ('{}') is already active. Complete it before starting another.",
+                    "Run {} ('{}', {} attribution) is already active. Complete it before starting this {} Run.",
                     active.public_id(),
                     active.name,
+                    active.attribution_mode,
+                    attribution_mode,
                 );
             }
             let start_event_id = db.max_event_id(project_id)?;
             db.conn.execute(
                 "INSERT INTO sessions
-                    (project_id, name, kind, actor, agent, command, intent, external_id,
-                     status, started_at, start_event_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11)",
+                    (project_id, name, kind, attribution_mode, actor, agent, command, intent,
+                     external_id, status, started_at, start_event_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, ?11, ?12)",
                 params![
                     project_id,
                     name,
                     kind,
+                    attribution_mode,
                     actor,
                     agent,
                     command,
@@ -1086,20 +1206,25 @@ impl Database {
             if let Some(intent) = db.get_active_run_intent(session.id)? {
                 db.complete_run_intent_at(session.id, Some(&intent.label), end_event_id, ended_at)?;
             }
+            if session.is_reported() {
+                db.abort_open_boundaries_at(session.id, ended_at)?;
+            }
             db.conn.execute(
                 "UPDATE sessions
                  SET ended_at = ?1, end_event_id = ?2, status = ?3
                  WHERE id = ?4",
                 params![ended_at, end_event_id, status, session.id],
             )?;
-            db.link_session_events(
-                session.id,
-                session.project_id,
-                session.started_at,
-                ended_at,
-                session.start_event_id,
-                end_event_id,
-            )?;
+            if !session.is_reported() {
+                db.link_session_events(
+                    session.id,
+                    session.project_id,
+                    session.started_at,
+                    ended_at,
+                    session.start_event_id,
+                    end_event_id,
+                )?;
+            }
             db.get_session_by_id(session.id)?
                 .ok_or_else(|| anyhow::anyhow!("failed to read completed Run"))
         })
@@ -1107,7 +1232,7 @@ impl Database {
 
     pub fn list_sessions(&self, project_id: i64) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, kind, actor, agent, command, intent,
+            "SELECT id, project_id, name, kind, attribution_mode, actor, agent, command, intent,
                     external_id, status, started_at, ended_at,
                     start_event_id, end_event_id, created_at
              FROM sessions
@@ -1123,7 +1248,7 @@ impl Database {
     pub fn get_session_by_name(&self, project_id: i64, name: &str) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                "SELECT id, project_id, name, kind, attribution_mode, actor, agent, command, intent,
                         external_id, status, started_at, ended_at,
                         start_event_id, end_event_id, created_at
                  FROM sessions
@@ -1137,20 +1262,35 @@ impl Database {
     }
 
     pub fn get_active_session(&self, project_id: i64) -> Result<Option<Session>> {
-        self.conn
-            .query_row(
-                "SELECT id, project_id, name, kind, actor, agent, command, intent,
-                        external_id, status, started_at, ended_at,
-                        start_event_id, end_event_id, created_at
-                 FROM sessions
-                 WHERE project_id = ?1 AND ended_at IS NULL
-                 ORDER BY started_at DESC, id DESC
-                 LIMIT 1",
-                params![project_id],
-                row_to_session,
-            )
-            .optional()
-            .context("failed to query active session")
+        let active = self.list_active_runs(project_id)?;
+        match active.as_slice() {
+            [] => Ok(None),
+            [run] => Ok(Some(run.clone())),
+            runs => {
+                let ids = runs
+                    .iter()
+                    .map(Session::public_id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "multiple Runs are active ({ids}); specify a Run explicitly with --run <RUN> or run_id"
+                )
+            }
+        }
+    }
+
+    pub fn list_active_runs(&self, project_id: i64) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, name, kind, attribution_mode, actor, agent, command, intent,
+                    external_id, status, started_at, ended_at,
+                    start_event_id, end_event_id, created_at
+             FROM sessions
+             WHERE project_id = ?1 AND ended_at IS NULL
+             ORDER BY started_at DESC, id DESC",
+        )?;
+        let runs = stmt.query_map(params![project_id], row_to_session)?;
+        runs.collect::<Result<Vec<_>, _>>()
+            .context("failed to query active Runs")
     }
 
     pub fn get_session_events(&self, session: &Session) -> Result<Vec<FileEvent>> {
@@ -1160,7 +1300,7 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        if mapped_count > 0 {
+        if mapped_count > 0 || session.is_reported() {
             let mut stmt = self.conn.prepare(
                 "SELECT e.id, e.project_id, e.timestamp, e.path, e.event_type,
                         e.current_hash, e.previous_hash, e.snapshot_path, e.old_path, e.file_size
@@ -1209,7 +1349,7 @@ impl Database {
     pub fn get_session_by_id(&self, session_id: i64) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                "SELECT id, project_id, name, kind, attribution_mode, actor, agent, command, intent,
                         external_id, status, started_at, ended_at,
                         start_event_id, end_event_id, created_at
                  FROM sessions
@@ -1231,14 +1371,14 @@ impl Database {
         self.get_session_by_name(project_id, reference)
     }
 
-    fn get_run_by_external_id(
+    pub fn get_run_by_external_id(
         &self,
         project_id: i64,
         external_id: &str,
     ) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, kind, actor, agent, command, intent,
+                "SELECT id, project_id, name, kind, attribution_mode, actor, agent, command, intent,
                         external_id, status, started_at, ended_at,
                         start_event_id, end_event_id, created_at
                  FROM sessions
@@ -1249,6 +1389,348 @@ impl Database {
             )
             .optional()
             .context("failed to query Run by external id")
+    }
+
+    // ── Reported change boundaries and ownership claims ─────────────
+
+    /// Open an exact-path reported boundary at the current event fence.
+    /// These rows record integration claims; they are not forensic evidence
+    /// that a particular process authored a filesystem event.
+    pub fn open_run_boundary(
+        &self,
+        run_id: i64,
+        external_change_id: &str,
+        paths: &[String],
+    ) -> Result<RunBoundary> {
+        self.immediate_transaction(|db| {
+            let run = db
+                .get_session_by_id(run_id)?
+                .ok_or_else(|| anyhow::anyhow!("Run r_{run_id} not found"))?;
+            if !run.is_reported() {
+                anyhow::bail!(
+                    "Run {} uses window attribution and cannot accept explicit change claims",
+                    run.public_id()
+                );
+            }
+            if !run.is_active() {
+                anyhow::bail!("Run {} is already complete", run.public_id());
+            }
+            let requested = db.validated_boundary_paths(&run, paths)?;
+            if let Some(existing) =
+                db.get_run_boundary_by_external_id(run_id, external_change_id)?
+            {
+                db.ensure_boundary_paths(existing.id, &requested)?;
+                return Ok(existing);
+            }
+
+            let now = Utc::now().timestamp();
+            let start_event_id = db.max_event_id(run.project_id)?;
+            db.conn.execute(
+                "INSERT INTO run_boundaries
+                    (run_id, external_change_id, status, start_event_id,
+                     started_at, created_at, updated_at)
+                 VALUES (?1, ?2, 'open', ?3, ?4, ?4, ?4)",
+                params![run.id, external_change_id, start_event_id, now],
+            )?;
+            let boundary_id = db.conn.last_insert_rowid();
+            for path in requested {
+                db.conn.execute(
+                    "INSERT INTO run_boundary_paths (boundary_id, path) VALUES (?1, ?2)",
+                    params![boundary_id, path],
+                )?;
+            }
+            db.get_run_boundary_by_id(boundary_id)?
+                .ok_or_else(|| anyhow::anyhow!("failed to read reported change boundary"))
+        })
+    }
+
+    /// Close a boundary at the current event fence and claim only events whose
+    /// `path` or rename `old_path` exactly matches the opening path set.
+    pub fn close_run_boundary(
+        &self,
+        run_id: i64,
+        external_change_id: &str,
+        paths: &[String],
+    ) -> Result<RunBoundary> {
+        self.immediate_transaction(|db| {
+            let run = db
+                .get_session_by_id(run_id)?
+                .ok_or_else(|| anyhow::anyhow!("Run r_{run_id} not found"))?;
+            let boundary = db
+                .get_run_boundary_by_external_id(run_id, external_change_id)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "change '{}' was not opened for Run {}",
+                        external_change_id,
+                        run.public_id()
+                    )
+                })?;
+            let requested = db.validated_boundary_paths(&run, paths)?;
+            db.ensure_boundary_paths(boundary.id, &requested)?;
+            if boundary.status == "closed" {
+                return Ok(boundary);
+            }
+            if boundary.status == "aborted" {
+                anyhow::bail!(
+                    "change '{}' was aborted when Run {} completed",
+                    external_change_id,
+                    run.public_id()
+                );
+            }
+            if !run.is_active() {
+                anyhow::bail!("Run {} is already complete", run.public_id());
+            }
+
+            let now = Utc::now().timestamp();
+            let end_event_id = db.max_event_id(run.project_id)?;
+            db.conn.execute(
+                "UPDATE run_boundaries
+                 SET status = 'closed', end_event_id = ?1, ended_at = ?2, updated_at = ?2
+                 WHERE id = ?3 AND status = 'open'",
+                params![end_event_id, now, boundary.id],
+            )?;
+            db.conn.execute(
+                "INSERT OR IGNORE INTO session_events (session_id, event_id)
+                 SELECT ?1, e.id
+                 FROM file_events e
+                 JOIN run_boundary_paths bp
+                   ON bp.boundary_id = ?2
+                  AND (e.path = bp.path OR e.old_path = bp.path)
+                 WHERE e.project_id = ?3
+                   AND e.id > ?4
+                   AND e.id <= ?5",
+                params![
+                    run.id,
+                    boundary.id,
+                    run.project_id,
+                    boundary.start_event_id,
+                    end_event_id
+                ],
+            )?;
+            db.get_run_boundary_by_id(boundary.id)?
+                .ok_or_else(|| anyhow::anyhow!("failed to read closed change boundary"))
+        })
+    }
+
+    pub fn abort_run_boundary(&self, run_id: i64, external_change_id: &str) -> Result<RunBoundary> {
+        self.immediate_transaction(|db| {
+            let boundary = db
+                .get_run_boundary_by_external_id(run_id, external_change_id)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "change '{}' was not opened for Run r_{}",
+                        external_change_id,
+                        run_id
+                    )
+                })?;
+            if boundary.status == "open" {
+                db.conn.execute(
+                    "UPDATE run_boundaries
+                     SET status = 'aborted', ended_at = ?1, updated_at = ?1
+                     WHERE id = ?2",
+                    params![Utc::now().timestamp(), boundary.id],
+                )?;
+            }
+            db.get_run_boundary_by_id(boundary.id)?
+                .ok_or_else(|| anyhow::anyhow!("failed to read aborted change boundary"))
+        })
+    }
+
+    fn abort_open_boundaries_at(&self, run_id: i64, ended_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE run_boundaries
+             SET status = 'aborted', ended_at = ?1, updated_at = ?1
+             WHERE run_id = ?2 AND status = 'open'",
+            params![ended_at, run_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_run_boundary_by_external_id(
+        &self,
+        run_id: i64,
+        external_change_id: &str,
+    ) -> Result<Option<RunBoundary>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, external_change_id, status, start_event_id,
+                        end_event_id, started_at, ended_at, created_at, updated_at
+                 FROM run_boundaries
+                 WHERE run_id = ?1 AND external_change_id = ?2",
+                params![run_id, external_change_id],
+                row_to_run_boundary,
+            )
+            .optional()
+            .context("failed to query reported change boundary")
+    }
+
+    fn get_run_boundary_by_id(&self, boundary_id: i64) -> Result<Option<RunBoundary>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, external_change_id, status, start_event_id,
+                        end_event_id, started_at, ended_at, created_at, updated_at
+                 FROM run_boundaries WHERE id = ?1",
+                params![boundary_id],
+                row_to_run_boundary,
+            )
+            .optional()
+            .context("failed to query reported change boundary")
+    }
+
+    pub fn get_run_boundary_paths(&self, boundary_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path FROM run_boundary_paths
+             WHERE boundary_id = ?1 ORDER BY path",
+        )?;
+        let paths = stmt.query_map(params![boundary_id], |row| row.get::<_, String>(0))?;
+        paths
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query reported boundary paths")
+    }
+
+    fn ensure_boundary_paths(&self, boundary_id: i64, requested: &BTreeSet<String>) -> Result<()> {
+        let stored = self
+            .get_run_boundary_paths(boundary_id)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if &stored != requested {
+            anyhow::bail!("idempotent replay for this change used a different exact path set");
+        }
+        Ok(())
+    }
+
+    fn validated_boundary_paths(
+        &self,
+        run: &Session,
+        paths: &[String],
+    ) -> Result<BTreeSet<String>> {
+        let requested = paths.iter().cloned().collect::<BTreeSet<_>>();
+        if requested.is_empty() || requested.len() != paths.len() {
+            anyhow::bail!("a reported change requires a non-empty unique path set");
+        }
+        let project = self
+            .get_project_by_id(run.project_id)?
+            .ok_or_else(|| anyhow::anyhow!("project {} not found", run.project_id))?;
+        let root = Path::new(&project.root_path);
+        for path in &requested {
+            let path_value = Path::new(path);
+            if !path_value.is_absolute()
+                || path_value.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+                || !path_value.starts_with(root)
+            {
+                anyhow::bail!(
+                    "reported claim path '{}' must be a normalized absolute path inside {}",
+                    path,
+                    project.root_path
+                );
+            }
+        }
+        Ok(requested)
+    }
+
+    pub fn count_run_claimed_events(&self, run_id: i64) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(DISTINCT event_id) FROM session_events WHERE session_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .context("failed to count Run claims")
+    }
+
+    pub fn event_claim_count(&self, event_id: i64) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(DISTINCT session_id) FROM session_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .context("failed to count event claims")
+    }
+
+    pub fn get_event_claim_counts(
+        &self,
+        project_id: i64,
+        first_event_id: i64,
+        last_event_id: i64,
+    ) -> Result<HashMap<i64, usize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT se.event_id, COUNT(DISTINCT se.session_id)
+             FROM session_events se
+             JOIN file_events e ON e.id = se.event_id
+             WHERE e.project_id = ?1
+               AND e.id >= ?2
+               AND e.id <= ?3
+             GROUP BY se.event_id",
+        )?;
+        let rows = stmt.query_map(params![project_id, first_event_id, last_event_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .context("failed to query event claim counts")
+    }
+
+    /// Classify whether whole-file recovery is safe for one reported Run path.
+    /// "Exclusive" means exclusive integration claims, not process provenance.
+    pub fn classify_run_path_ownership(&self, run_id: i64, path: &str) -> Result<String> {
+        let run = self
+            .get_session_by_id(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("Run r_{run_id} not found"))?;
+        let claimed: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT e.id)
+             FROM file_events e
+             JOIN session_events mine
+               ON mine.event_id = e.id AND mine.session_id = ?1
+             WHERE e.project_id = ?2 AND (e.path = ?3 OR e.old_path = ?3)",
+            params![run.id, run.project_id, path],
+            |row| row.get(0),
+        )?;
+        if claimed == 0 {
+            return Ok("unattributed".to_string());
+        }
+        let collision: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM file_events e
+             JOIN session_events mine
+               ON mine.event_id = e.id AND mine.session_id = ?1
+             WHERE e.project_id = ?2
+               AND (e.path = ?3 OR e.old_path = ?3)
+               AND (SELECT COUNT(DISTINCT se.session_id)
+                    FROM session_events se WHERE se.event_id = e.id) > 1",
+            params![run.id, run.project_id, path],
+            |row| row.get(0),
+        )?;
+        if collision > 0 {
+            return Ok("collision".to_string());
+        }
+        let foreign_or_unattributed: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM file_events e
+             WHERE e.project_id = ?1
+               AND e.id > ?2
+               AND (e.path = ?3 OR e.old_path = ?3)
+               AND NOT (
+                    (SELECT COUNT(DISTINCT se.session_id)
+                     FROM session_events se WHERE se.event_id = e.id) = 1
+                    AND EXISTS (
+                        SELECT 1 FROM session_events mine
+                        WHERE mine.event_id = e.id AND mine.session_id = ?4
+                    )
+               )",
+            params![run.project_id, run.start_event_id, path, run.id],
+            |row| row.get(0),
+        )?;
+        Ok(if foreign_or_unattributed > 0 {
+            "interleaved"
+        } else {
+            "exclusive"
+        }
+        .to_string())
     }
 
     fn link_session_events(
@@ -1741,32 +2223,53 @@ impl Database {
 
     // ── Integration idempotency ─────────────────────────────────────
 
-    pub fn get_integration_response(&self, key: &str) -> Result<Option<String>> {
-        self.conn
+    pub fn get_integration_response(
+        &self,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<Option<String>> {
+        let existing = self
+            .conn
             .query_row(
-                "SELECT response_json FROM integration_events WHERE idempotency_key = ?1",
+                "SELECT request_hash, response_json
+                 FROM integration_events WHERE idempotency_key = ?1",
                 params![key],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
-            .context("failed to query integration event")
+            .context("failed to query integration event")?;
+        let Some((stored_hash, response)) = existing else {
+            return Ok(None);
+        };
+        // Rows written before schema v4 have no recoverable request body, so
+        // retain their historical replay behavior. Every v4 write is bound to
+        // its canonical request hash and rejects key reuse with another body.
+        if !stored_hash.is_empty() && stored_hash != request_hash {
+            anyhow::bail!(
+                "idempotency key '{}' was already used with a different payload",
+                key
+            );
+        }
+        Ok(Some(response))
     }
 
     pub fn record_integration_response(
         &self,
         key: &str,
+        request_hash: &str,
         run_id: Option<i64>,
         event_type: &str,
         response_json: &str,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO integration_events
-                (idempotency_key, run_id, event_type, response_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (idempotency_key, run_id, event_type, request_hash, response_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 key,
                 run_id,
                 event_type,
+                request_hash,
                 response_json,
                 Utc::now().timestamp()
             ],
@@ -1813,17 +2316,33 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         project_id: row.get(1)?,
         name: row.get(2)?,
         kind: row.get(3)?,
-        actor: row.get(4)?,
-        agent: row.get(5)?,
-        command: row.get(6)?,
-        intent: row.get(7)?,
-        external_id: row.get(8)?,
-        status: row.get(9)?,
-        started_at: row.get(10)?,
-        ended_at: row.get(11)?,
-        start_event_id: row.get(12)?,
-        end_event_id: row.get(13)?,
-        created_at: row.get(14)?,
+        attribution_mode: row.get(4)?,
+        actor: row.get(5)?,
+        agent: row.get(6)?,
+        command: row.get(7)?,
+        intent: row.get(8)?,
+        external_id: row.get(9)?,
+        status: row.get(10)?,
+        started_at: row.get(11)?,
+        ended_at: row.get(12)?,
+        start_event_id: row.get(13)?,
+        end_event_id: row.get(14)?,
+        created_at: row.get(15)?,
+    })
+}
+
+fn row_to_run_boundary(row: &rusqlite::Row) -> rusqlite::Result<RunBoundary> {
+    Ok(RunBoundary {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        external_change_id: row.get(2)?,
+        status: row.get(3)?,
+        start_event_id: row.get(4)?,
+        end_event_id: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -2466,6 +2985,280 @@ mod tests {
         assert!(err.to_string().contains("already active"), "{}", err);
     }
 
+    #[test]
+    fn two_reported_runs_can_be_active_and_singleton_lookup_is_ambiguous() {
+        let db = db();
+        let p = project(&db);
+        let first = db
+            .start_reported_run(
+                p.id,
+                "first",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                "cursor:first",
+            )
+            .unwrap();
+        let second = db
+            .start_reported_run(
+                p.id,
+                "second",
+                "hook",
+                "agent",
+                Some("Claude Code"),
+                None,
+                None,
+                "claude:second",
+            )
+            .unwrap();
+
+        let active = db.list_active_runs(p.id).unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(Session::is_reported));
+        let error = db.get_active_session(p.id).unwrap_err().to_string();
+        assert!(error.contains("multiple Runs are active"), "{error}");
+        assert!(error.contains(&first.public_id()), "{error}");
+        assert!(error.contains(&second.public_id()), "{error}");
+    }
+
+    #[test]
+    fn window_and_reported_active_runs_cannot_mix() {
+        let db = db();
+        let p = project(&db);
+        let reported = db
+            .start_reported_run(
+                p.id,
+                "reported",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                "cursor:reported",
+            )
+            .unwrap();
+        assert!(db.start_session(p.id, "window", "manual").is_err());
+        db.complete_run(reported.id, "completed").unwrap();
+
+        db.start_session(p.id, "window", "manual").unwrap();
+        let error = db
+            .start_reported_run(
+                p.id,
+                "reported-two",
+                "hook",
+                "agent",
+                Some("Codex"),
+                None,
+                None,
+                "codex:reported",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("window attribution"), "{error}");
+    }
+
+    #[test]
+    fn reported_run_without_claims_has_no_interval_fallback() {
+        let db = db();
+        let p = project(&db);
+        let run = db
+            .start_reported_run(
+                p.id,
+                "reported",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                "cursor:zero",
+            )
+            .unwrap();
+        let unclaimed = "/home/user/project/unclaimed.rs".to_string();
+        db.open_run_boundary(run.id, "left-open", std::slice::from_ref(&unclaimed))
+            .unwrap();
+        db.insert_event(
+            p.id,
+            &unclaimed,
+            "MODIFIED",
+            Some("new"),
+            Some("old"),
+            None,
+            None,
+            Some(1),
+        )
+        .unwrap();
+        let completed = db.complete_run(run.id, "completed").unwrap();
+
+        assert!(db.get_session_events(&completed).unwrap().is_empty());
+        assert_eq!(db.count_run_claimed_events(run.id).unwrap(), 0);
+        assert_eq!(
+            db.get_run_boundary_by_external_id(run.id, "left-open")
+                .unwrap()
+                .unwrap()
+                .status,
+            "aborted"
+        );
+    }
+
+    #[test]
+    fn overlapping_reported_claims_are_collision_and_disjoint_claims_are_exclusive() {
+        let db = db();
+        let p = project(&db);
+        let first = db
+            .start_reported_run(
+                p.id,
+                "first",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                "cursor:collision",
+            )
+            .unwrap();
+        let second = db
+            .start_reported_run(
+                p.id,
+                "second",
+                "hook",
+                "agent",
+                Some("Codex"),
+                None,
+                None,
+                "codex:collision",
+            )
+            .unwrap();
+        let shared = "/home/user/project/shared.rs".to_string();
+        db.open_run_boundary(first.id, "first-shared", std::slice::from_ref(&shared))
+            .unwrap();
+        db.open_run_boundary(second.id, "second-shared", std::slice::from_ref(&shared))
+            .unwrap();
+        db.insert_event(
+            p.id,
+            &shared,
+            "MODIFIED",
+            Some("new"),
+            Some("old"),
+            None,
+            None,
+            Some(1),
+        )
+        .unwrap();
+        db.close_run_boundary(first.id, "first-shared", std::slice::from_ref(&shared))
+            .unwrap();
+        db.close_run_boundary(second.id, "second-shared", std::slice::from_ref(&shared))
+            .unwrap();
+        let event_id = db.max_event_id(p.id).unwrap();
+        assert_eq!(db.event_claim_count(event_id).unwrap(), 2);
+        assert_eq!(
+            db.classify_run_path_ownership(first.id, &shared).unwrap(),
+            "collision"
+        );
+
+        let first_only = "/home/user/project/first.rs".to_string();
+        let second_only = "/home/user/project/second.rs".to_string();
+        db.open_run_boundary(first.id, "first-only", std::slice::from_ref(&first_only))
+            .unwrap();
+        db.insert_event(
+            p.id,
+            &first_only,
+            "MODIFIED",
+            Some("new"),
+            Some("old"),
+            None,
+            None,
+            Some(1),
+        )
+        .unwrap();
+        db.close_run_boundary(first.id, "first-only", std::slice::from_ref(&first_only))
+            .unwrap();
+        db.open_run_boundary(second.id, "second-only", std::slice::from_ref(&second_only))
+            .unwrap();
+        db.insert_event(
+            p.id,
+            &second_only,
+            "MODIFIED",
+            Some("new"),
+            Some("old"),
+            None,
+            None,
+            Some(1),
+        )
+        .unwrap();
+        db.close_run_boundary(second.id, "second-only", std::slice::from_ref(&second_only))
+            .unwrap();
+
+        assert_eq!(
+            db.classify_run_path_ownership(first.id, &first_only)
+                .unwrap(),
+            "exclusive"
+        );
+        assert_eq!(
+            db.classify_run_path_ownership(second.id, &second_only)
+                .unwrap(),
+            "exclusive"
+        );
+    }
+
+    #[test]
+    fn reported_claim_matches_rename_old_path() {
+        let db = db();
+        let p = project(&db);
+        let run = db
+            .start_reported_run(
+                p.id,
+                "rename",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                "cursor:rename",
+            )
+            .unwrap();
+        let old = "/home/user/project/old.rs".to_string();
+        let new = "/home/user/project/new.rs".to_string();
+        db.open_run_boundary(run.id, "rename-tool", std::slice::from_ref(&old))
+            .unwrap();
+        db.insert_event(
+            p.id,
+            &new,
+            "RENAMED",
+            Some("hash"),
+            Some("hash"),
+            None,
+            Some(&old),
+            Some(1),
+        )
+        .unwrap();
+        db.close_run_boundary(run.id, "rename-tool", std::slice::from_ref(&old))
+            .unwrap();
+
+        let events = db.get_session_events(&run).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].old_path.as_deref(), Some(old.as_str()));
+    }
+
+    #[test]
+    fn integration_idempotency_rejects_hash_mismatch_and_replays_match() {
+        let db = db();
+        db.record_integration_response("key-1", "hash-a", None, "run_started", r#"{"ok":true}"#)
+            .unwrap();
+        assert_eq!(
+            db.get_integration_response("key-1", "hash-a")
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"ok":true}"#)
+        );
+        let error = db
+            .get_integration_response("key-1", "hash-b")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different payload"), "{error}");
+    }
+
     /// Stopping a session snapshots the events that landed inside its time
     /// window into session_events, so later recovery can use stable membership.
     #[test]
@@ -2778,11 +3571,12 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let db = Database { conn };
         let legacy = db.get_session_by_id(7).unwrap().unwrap();
         assert_eq!(legacy.name, "legacy-agent-work");
+        assert_eq!(legacy.attribution_mode, "window");
         assert_eq!(legacy.actor, "human");
         assert_eq!(legacy.status, "completed");
         let checkpoint = db.get_checkpoint_by_ref(1, "cp_9").unwrap().unwrap();
@@ -2797,6 +3591,16 @@ mod tests {
             .unwrap();
         assert!(created);
         assert_ne!(new_checkpoint.id, checkpoint.id);
+        let active_index: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_sessions_one_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_index, 0);
     }
 
     // ── retention methods ───────────────────────────────────────────

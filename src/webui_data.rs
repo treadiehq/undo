@@ -35,6 +35,7 @@ pub struct ProjectSummary {
     pub name: String,
     pub recording: bool,
     pub event_count: i64,
+    pub first_event_at: Option<i64>,
     pub last_event_at: Option<i64>,
 }
 
@@ -52,15 +53,13 @@ pub fn project_summaries(db: &Database) -> Result<Vec<ProjectSummary>> {
 }
 
 pub fn project_summary(db: &Database, project: &WatchedProject) -> Result<ProjectSummary> {
-    let last_event_at = db
-        .get_timeline(project.id, 1)?
-        .first()
-        .map(|event| event.timestamp);
+    let (first_event_at, last_event_at) = db.event_time_bounds(project.id)?;
     Ok(ProjectSummary {
         id: project.id,
         name: project_name(&project.root_path),
         recording: crate::daemon::is_recording(Path::new(&project.root_path)).unwrap_or(false),
         event_count: db.count_events(project.id)?,
+        first_event_at,
         last_event_at,
         root_path: project.root_path.clone(),
     })
@@ -94,13 +93,17 @@ pub struct FileChange {
     pub deleted: usize,
     pub binary: bool,
     pub old_path: Option<String>,
+    /// Integration-claim classification, not forensic process provenance.
+    pub ownership_status: String,
+    pub recoverable: bool,
+    pub warning: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct TimelineItem {
     /// `r_<id>` for Runs, `g_<first change id>` for un-attributed groups.
     pub id: String,
-    /// "run" or "edits".
+    /// "run", "collision", or "edits".
     pub kind: String,
     /// Display label: agent name, "Unattributed edits", or
     /// "Rapid unattributed changes".
@@ -185,13 +188,26 @@ pub fn timeline_payload(
 
     let mut items = Vec::new();
     let mut claimed: HashSet<i64> = HashSet::new();
-    for run in db.list_sessions(project.id)? {
+    let runs = db.list_sessions(project.id)?;
+    let max_event_id = db.max_event_id(project.id)?;
+    let first_relevant_claim = runs
+        .iter()
+        .filter(|run| run.is_active() || run.ended_at.unwrap_or(i64::MIN) >= window_start_ts)
+        .map(|run| run.start_event_id.saturating_add(1))
+        .chain(std::iter::once(window_start_id))
+        .min()
+        .unwrap_or(window_start_id);
+    let claim_counts = db.get_event_claim_counts(project.id, first_relevant_claim, max_event_id)?;
+    for run in runs {
         let run_end = run.ended_at.unwrap_or(i64::MAX);
         if run_end < window_start_ts && !run.is_active() {
             continue;
         }
         let mut events = db.get_session_events(&run)?;
         events.reverse();
+        if run.is_reported() {
+            events.retain(|event| claim_counts.get(&event.id).copied() == Some(1));
+        }
         for event in &events {
             claimed.insert(event.id);
         }
@@ -201,9 +217,20 @@ pub fn timeline_payload(
         items.push(run_item(project, &run, &events, db)?);
     }
 
+    let collision_events = window
+        .iter()
+        .filter(|event| claim_counts.get(&event.id).copied().unwrap_or(0) >= 2)
+        .cloned()
+        .collect::<Vec<_>>();
+    for group in split_by_gap(&collision_events, EDIT_GROUP_GAP_SECS) {
+        items.push(collision_item(project, group, window_start_id));
+    }
+
     let unclaimed: Vec<FileEvent> = window
         .into_iter()
-        .filter(|event| !claimed.contains(&event.id))
+        .filter(|event| {
+            !claimed.contains(&event.id) && claim_counts.get(&event.id).copied().unwrap_or(0) == 0
+        })
         .collect();
     for group in split_by_gap(&unclaimed, EDIT_GROUP_GAP_SECS) {
         items.push(edits_item(project, group, window_start_id));
@@ -223,7 +250,7 @@ pub fn timeline_payload(
         alert: panic_alert(&items, now, resolved_after),
         items,
         checkpoints,
-        max_event_id: db.max_event_id(project.id)?,
+        max_event_id,
         now,
     })
 }
@@ -264,20 +291,25 @@ fn run_item(
     events: &[FileEvent],
     db: &Database,
 ) -> Result<TimelineItem> {
-    let (files, stats_truncated) = build_file_changes(project, events);
+    let (mut files, stats_truncated) = build_file_changes(project, events);
+    if run.is_reported() {
+        for file in &mut files {
+            let absolute = Path::new(&project.root_path)
+                .join(&file.path)
+                .to_string_lossy()
+                .into_owned();
+            let status = db.classify_run_path_ownership(run.id, &absolute)?;
+            file.recoverable = status == "exclusive";
+            file.warning = ownership_warning(&status);
+            file.ownership_status = status;
+        }
+    }
     let checkpoints = db
         .list_checkpoints(project.id)?
         .into_iter()
         .filter(|checkpoint| checkpoint.run_id == Some(run.id))
         .collect::<Vec<_>>();
-    let label = run
-        .agent
-        .clone()
-        .unwrap_or_else(|| match run.actor.as_str() {
-            "human" => "You".to_string(),
-            "tool" => run.command.clone().unwrap_or_else(|| "Tool".to_string()),
-            other => other.to_string(),
-        });
+    let label = run_label(run);
     Ok(TimelineItem {
         id: run.public_id(),
         kind: "run".to_string(),
@@ -305,12 +337,26 @@ fn run_item(
     })
 }
 
+fn run_label(run: &Session) -> String {
+    run.agent
+        .clone()
+        .unwrap_or_else(|| match run.actor.as_str() {
+            "human" => "You".to_string(),
+            "tool" => run.command.clone().unwrap_or_else(|| "Tool".to_string()),
+            other => other.to_string(),
+        })
+}
+
 fn edits_item(
     project: &WatchedProject,
     events: &[FileEvent],
     window_start_id: i64,
 ) -> TimelineItem {
-    let (files, stats_truncated) = build_file_changes(project, events);
+    let (mut files, stats_truncated) = build_file_changes(project, events);
+    for file in &mut files {
+        file.ownership_status = "unattributed".to_string();
+        file.warning = Some("No integration claimed this recorded change.".to_string());
+    }
     let first = events.first().expect("gap groups are never empty");
     let last = events.last().expect("gap groups are never empty");
     // The restore boundary is "just before the first change in this group".
@@ -346,6 +392,66 @@ fn edits_item(
         stats_truncated,
         files,
         checkpoints: Vec::new(),
+    }
+}
+
+fn collision_item(
+    project: &WatchedProject,
+    events: &[FileEvent],
+    window_start_id: i64,
+) -> TimelineItem {
+    let (mut files, stats_truncated) = build_file_changes(project, events);
+    for file in &mut files {
+        file.ownership_status = "collision".to_string();
+        file.recoverable = false;
+        file.warning = Some(
+            "Multiple Runs claimed this change; whole-file Run recovery is disabled.".to_string(),
+        );
+    }
+    let first = events.first().expect("collision groups are never empty");
+    let last = events.last().expect("collision groups are never empty");
+    let boundary_event_id = first.id.saturating_sub(1).max(window_start_id - 1).max(0);
+    TimelineItem {
+        id: format!("collision_{}", first.id),
+        kind: "collision".to_string(),
+        label: "Attribution collision".to_string(),
+        actor: "collision".to_string(),
+        agent: None,
+        command: None,
+        intent: None,
+        status: "blocked".to_string(),
+        started_at: first.timestamp,
+        ended_at: Some(last.timestamp),
+        run_id: None,
+        pace: "machine".to_string(),
+        scope_hint: scope_hint(&files),
+        boundary_event_id,
+        last_event_id: last.id,
+        event_count: events.len(),
+        file_count: files.len(),
+        inserted: files.iter().map(|file| file.inserted).sum(),
+        deleted: files.iter().map(|file| file.deleted).sum(),
+        deleted_files: files.iter().filter(|file| file.change == "deleted").count(),
+        stats_truncated,
+        files,
+        checkpoints: Vec::new(),
+    }
+}
+
+fn ownership_warning(status: &str) -> Option<String> {
+    match status {
+        "collision" => Some(
+            "Multiple Runs claimed this file change; whole-file recovery is disabled.".to_string(),
+        ),
+        "interleaved" => Some(
+            "Other or unattributed edits touched this path after the Run started; whole-file recovery is disabled."
+                .to_string(),
+        ),
+        "unattributed" => Some(
+            "This path has no explicit claim from the Run; whole-file recovery is disabled."
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -455,6 +561,9 @@ fn build_file_changes(project: &WatchedProject, events: &[FileEvent]) -> (Vec<Fi
             old_path: old_path
                 .as_deref()
                 .map(|old| relative_path(old, &project.root_path).to_string()),
+            ownership_status: "exclusive".to_string(),
+            recoverable: true,
+            warning: None,
         });
     }
     // Most heavily changed files first — that is what a reviewer scans for.
@@ -717,20 +826,37 @@ pub fn recovery_view(
 // ── polling ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
+pub struct ActiveRunSummary {
+    /// Stable internal identity; the UI does not expose this as display copy.
+    pub id: String,
+    pub label: String,
+    pub started_at: i64,
+}
+
+#[derive(Serialize)]
 pub struct PollPayload {
     pub max_event_id: i64,
     pub recording: bool,
     pub active_run_id: Option<String>,
+    pub active_runs: Vec<ActiveRunSummary>,
     pub now: i64,
 }
 
 pub fn poll_payload(db: &Database, project: &WatchedProject) -> Result<PollPayload> {
+    let active_runs = db
+        .list_active_runs(project.id)?
+        .into_iter()
+        .map(|run| ActiveRunSummary {
+            id: run.public_id(),
+            label: run_label(&run),
+            started_at: run.started_at,
+        })
+        .collect::<Vec<_>>();
     Ok(PollPayload {
         max_event_id: db.max_event_id(project.id)?,
         recording: crate::daemon::is_recording(Path::new(&project.root_path)).unwrap_or(false),
-        active_run_id: db
-            .get_active_session(project.id)?
-            .map(|run| run.public_id()),
+        active_run_id: (active_runs.len() == 1).then(|| active_runs[0].id.clone()),
+        active_runs,
         now: Utc::now().timestamp(),
     })
 }
@@ -860,6 +986,9 @@ mod tests {
             deleted: 0,
             binary: false,
             old_path: None,
+            ownership_status: "exclusive".to_string(),
+            recoverable: true,
+            warning: None,
         };
         let clustered = vec![
             file("src/auth/login.rs"),
@@ -992,6 +1121,72 @@ mod tests {
         assert_eq!(run_item.label, "Claude Code");
         assert_eq!(run_item.event_count, 1);
         assert_eq!(run_item.file_count, 1);
+    }
+
+    #[test]
+    fn timeline_emits_multi_claim_event_once_as_collision() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let db = Database::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let project = db.get_or_create_project(&root_path).unwrap();
+        let file = root_path.join("shared.rs").to_string_lossy().into_owned();
+        let first = db
+            .start_reported_run(
+                project.id,
+                "first",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                "cursor:timeline-first",
+            )
+            .unwrap();
+        let second = db
+            .start_reported_run(
+                project.id,
+                "second",
+                "hook",
+                "agent",
+                Some("Codex"),
+                None,
+                None,
+                "codex:timeline-second",
+            )
+            .unwrap();
+        db.open_run_boundary(first.id, "first-change", std::slice::from_ref(&file))
+            .unwrap();
+        db.open_run_boundary(second.id, "second-change", std::slice::from_ref(&file))
+            .unwrap();
+        db.insert_event(project.id, &file, "MODIFIED", None, None, None, None, None)
+            .unwrap();
+        db.close_run_boundary(first.id, "first-change", std::slice::from_ref(&file))
+            .unwrap();
+        db.close_run_boundary(second.id, "second-change", std::slice::from_ref(&file))
+            .unwrap();
+        db.complete_run(first.id, "completed").unwrap();
+        db.complete_run(second.id, "completed").unwrap();
+
+        let payload = timeline_payload(&db, &project, 100, None).unwrap();
+        let collisions = payload
+            .items
+            .iter()
+            .filter(|item| item.kind == "collision")
+            .collect::<Vec<_>>();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].event_count, 1);
+        assert_eq!(collisions[0].files[0].ownership_status, "collision");
+        assert!(!collisions[0].files[0].recoverable);
+        assert_eq!(
+            payload
+                .items
+                .iter()
+                .map(|item| item.event_count)
+                .sum::<usize>(),
+            1
+        );
     }
 
     /// The diff endpoint reconstructs before/after content from snapshots and

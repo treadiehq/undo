@@ -4,6 +4,7 @@ export interface ProjectSummary {
   name: string
   recording: boolean
   event_count: number
+  first_event_at: number | null
   last_event_at: number | null
 }
 
@@ -24,6 +25,9 @@ export interface FileChange {
   deleted: number
   binary: boolean
   old_path: string | null
+  ownership_status: 'exclusive' | 'interleaved' | 'collision' | 'unattributed'
+  recoverable: boolean
+  warning: string | null
 }
 
 export interface Checkpoint {
@@ -39,7 +43,7 @@ export interface Checkpoint {
 
 export interface TimelineItem {
   id: string
-  kind: 'run' | 'edits'
+  kind: 'run' | 'collision' | 'edits'
   label: string
   actor: string
   agent: string | null
@@ -135,10 +139,18 @@ export interface ApplyResult {
   recovery: RecoveryView
 }
 
+export interface ActiveRunSummary {
+  /** Kept for stable identity; never shown as user-facing copy. */
+  id: string
+  label: string
+  started_at: number
+}
+
 export interface PollPayload {
   max_event_id: number
   recording: boolean
   active_run_id: string | null
+  active_runs: ActiveRunSummary[]
   now: number
 }
 

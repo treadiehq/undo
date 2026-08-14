@@ -1,5 +1,6 @@
 import { computed, reactive, readonly } from 'vue'
 import type {
+  ActiveRunSummary,
   ApplyResult,
   Bootstrap,
   DiffPayload,
@@ -38,7 +39,10 @@ interface UndoState {
   recoveryBusy: boolean
   applyResult: ApplyResult | null
   recording: boolean
-  activeRunId: string | null
+  activeRuns: ActiveRunSummary[]
+  // Timestamp selected in the restore timeline. Shared so the feed can preview
+  // which recorded activity falls after the restore point.
+  restoreTimestamp: number | null
   // Timeline item id to review in isolation (`undo ui r_421` deep link).
   focusId: string | null
   // Panic alert item ids the user dismissed this browser session.
@@ -63,7 +67,8 @@ const state = reactive<UndoState>({
   recoveryBusy: false,
   applyResult: null,
   recording: false,
-  activeRunId: null,
+  activeRuns: [],
+  restoreTimestamp: null,
   focusId: null,
   dismissedAlerts: new Set(),
   toasts: [],
@@ -161,6 +166,13 @@ async function refreshTimeline() {
     )
     state.timeline = payload
     state.recording = payload.project.recording
+    state.activeRuns = payload.items
+      .filter((item) => item.kind === 'run' && item.status === 'active')
+      .map((item) => ({
+        id: item.run_id ?? item.id,
+        label: item.label,
+        started_at: item.started_at,
+      }))
     lastMaxEventId = payload.max_event_id
     // A deep-linked Run opens expanded; drop the focus quietly when the
     // item is not in this project's timeline.
@@ -190,6 +202,8 @@ async function selectProject(id: number) {
   state.selections = new Map()
   state.diffTarget = null
   state.diff = null
+  state.activeRuns = []
+  state.restoreTimestamp = null
   lastMaxEventId = -1
   await refreshTimeline()
   startPolling()
@@ -202,7 +216,10 @@ function startPolling() {
     try {
       const poll = await api<PollPayload>(`/projects/${state.projectId}/poll`)
       state.recording = poll.recording
-      state.activeRunId = poll.active_run_id
+      state.activeRuns = poll.active_runs
+      if (state.timeline) {
+        state.timeline = { ...state.timeline, now: poll.now }
+      }
       if (poll.max_event_id !== lastMaxEventId) {
         lastMaxEventId = poll.max_event_id
         await refreshTimeline()
@@ -292,6 +309,39 @@ async function previewUndo({ item, paths, description }: UndoRequest) {
   }
 }
 
+interface TimestampPreviewRequest {
+  timestamp: number
+  description: string
+  path?: string
+}
+
+async function previewTimestamp({
+  timestamp,
+  description,
+  path = '.',
+}: TimestampPreviewRequest) {
+  if (state.projectId === null) return
+  state.recoveryBusy = true
+  state.applyResult = null
+  try {
+    state.recovery = await api<RecoveryView>(
+      `/projects/${state.projectId}/recoveries`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          timestamp,
+          path,
+          request: description,
+        }),
+      },
+    )
+  } catch (error) {
+    toast('error', error instanceof Error ? error.message : String(error))
+  } finally {
+    state.recoveryBusy = false
+  }
+}
+
 function clearFocus() {
   state.focusId = null
   if (window.location.hash) {
@@ -306,25 +356,10 @@ function clearFocus() {
 /// Panic-banner action: restore the whole project to the moment just before
 /// the destructive group began. Preview-then-apply like everything else.
 async function previewRestoreBefore(alert: PanicAlert) {
-  state.recoveryBusy = true
-  state.applyResult = null
-  try {
-    state.recovery = await api<RecoveryView>(
-      `/projects/${state.projectId}/recoveries`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          timestamp: alert.target_timestamp,
-          path: '.',
-          request: `Restore the project to just before the ${fmtClock(alert.started_at)} changes`,
-        }),
-      },
-    )
-  } catch (error) {
-    toast('error', error instanceof Error ? error.message : String(error))
-  } finally {
-    state.recoveryBusy = false
-  }
+  await previewTimestamp({
+    timestamp: alert.target_timestamp,
+    description: `Restore the project to just before the ${fmtClock(alert.started_at)} changes`,
+  })
 }
 
 function dismissAlert(itemId: string) {
@@ -332,19 +367,23 @@ function dismissAlert(itemId: string) {
   state.dismissedAlerts = new Set(state.dismissedAlerts)
 }
 
-async function applyRecovery() {
+async function applyRecovery(paths?: string[]) {
   if (!state.recovery) return
+  if (paths && paths.length === 0) return
   state.recoveryBusy = true
   try {
     const result = await api<ApplyResult>(
       `/projects/${state.projectId}/recoveries/${state.recovery.id}/apply`,
-      { method: 'POST', body: JSON.stringify({}) },
+      {
+        method: 'POST',
+        body: JSON.stringify(paths === undefined ? {} : { paths }),
+      },
     )
     state.applyResult = result
     toast(
       'ok',
       result.already_applied
-        ? `${result.recovery.id} was already applied`
+        ? 'This recovery plan was already applied'
         : `Restored ${result.files_changed} file${result.files_changed === 1 ? '' : 's'}`,
     )
     state.recovery = null
@@ -361,6 +400,10 @@ async function applyRecovery() {
 
 function dismissRecovery() {
   state.recovery = null
+}
+
+function setRestoreTimestamp(timestamp: number | null) {
+  state.restoreTimestamp = timestamp
 }
 
 const currentProject = computed(
@@ -397,6 +440,8 @@ export function useUndo() {
     selectionFor: (itemId: string) => state.selections.get(itemId) ?? new Set<string>(),
     openDiff,
     previewUndo,
+    previewTimestamp,
+    setRestoreTimestamp,
     previewRestoreBefore,
     clearFocus,
     dismissAlert,

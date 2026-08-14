@@ -5,6 +5,17 @@ import { fmtDay } from '~/utils/format'
 
 const { state, focusedItem, clearFocus } = useUndo()
 
+type RestoreImpact = 'undo' | 'partial' | 'keep' | null
+
+function restoreImpact(item: TimelineItem): RestoreImpact {
+  const target = state.restoreTimestamp
+  if (target === null) return null
+  const end = item.ended_at ?? state.timeline?.now ?? item.started_at
+  if (item.started_at > target) return 'undo'
+  if (end > target) return 'partial'
+  return 'keep'
+}
+
 // Items grouped under day separators (newest first, matching payload order).
 // In focus mode (`undo ui r_421`) the feed shows only the reviewed Run; the
 // full timeline is one click away.
@@ -37,7 +48,6 @@ const dayGroups = computed(() => {
       <span class="min-w-0 flex-1 truncate text-[12.5px] text-mut">
         Reviewing
         <span class="font-semibold text-ink">{{ focusedItem.label }}</span>
-        <span class="ml-1.5 font-mono text-[11px] text-dim">{{ focusedItem.id }}</span>
       </span>
       <button
         class="shrink-0 text-[12px] font-medium text-accent transition-opacity hover:opacity-75"
@@ -82,7 +92,12 @@ const dayGroups = computed(() => {
           </span>
           <span class="h-px flex-1 bg-edge" />
         </div>
-        <TimelineItemCard v-for="item in group.items" :key="item.id" :item="item" />
+        <TimelineItemCard
+          v-for="item in group.items"
+          :key="item.id"
+          :item="item"
+          :restore-impact="restoreImpact(item)"
+        />
       </template>
     </div>
   </section>

@@ -81,7 +81,7 @@ function restoreThisFile() {
           v-if="item && item.status !== 'active'"
           class="flex shrink-0 items-center gap-1.5 rounded-lg border border-edge px-2.5 py-1 text-[11.5px] font-medium text-mut transition-colors hover:border-edge-strong hover:text-ink disabled:opacity-40"
           :disabled="state.recoveryBusy"
-          title="Restore this file to its state before this item"
+          title="Preview restoring this file to its state before this item"
           @click="restoreThisFile"
         >
           <!-- <UiIcon name="undo" :size="11" /> -->
@@ -90,7 +90,7 @@ function restoreThisFile() {
           </svg>
 
 
-          Restore file
+          Preview file restore
         </button>
       </div>
 

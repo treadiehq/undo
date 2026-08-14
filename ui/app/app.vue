@@ -49,11 +49,11 @@ onMounted(() => {
     <!-- Main app -->
     <template v-else>
       <AppHeader />
+      <TimeScrubber />
       <main class="grid min-h-0 flex-1 grid-cols-[minmax(24rem,5fr)_minmax(20rem,6fr)]">
         <TimelineFeed />
         <DiffPanel />
       </main>
-      <!-- <TimeScrubber /> -->
     </template>
 
     <RecoveryModal />

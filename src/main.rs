@@ -5,6 +5,8 @@ use std::path::Path;
 
 mod activity;
 mod agent_events;
+mod agent_hooks;
+mod agent_setup;
 mod ask;
 mod cli;
 mod daemon;
@@ -234,6 +236,8 @@ fn main() {
     let cli = cli::Cli::parse();
 
     let result = match cli.command {
+        cli::Command::Setup { agent } => agent_setup::cmd_setup(agent),
+        cli::Command::Hook { agent } => agent_hooks::cmd_hook(agent),
         cli::Command::Start { force } => daemon::cmd_start(cli.verbose, force),
         cli::Command::Timeline {
             limit,

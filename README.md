@@ -14,42 +14,64 @@ curl -fsSL https://useundo.co/install.sh | bash
 
 Available for macOS and Linux.
 
-## Undo an agent's work
+## Set up automatic recording
+
+```bash
+undo setup --agent claude
+```
+
+Start a new Claude session normally. Undo's installed lifecycle hooks start the
+recorder automatically and attribute reported file changes to that session—no
+`undo run claude` wrapper required.
+
+Cursor and Codex are supported too:
+
+```bash
+undo setup --agent cursor
+undo setup --agent codex
+```
+
+Each setup command safely merges Undo's hooks into the agent's existing user
+configuration. Running it again updates the Undo hooks without replacing other
+settings.
+
+## Restore from the local UI
+
+```bash
+undo ui
+```
+
+The restore-first interface lets you:
+
+- preview a 10-minute rewind or choose an exact restore time
+- review concurrent agent Runs and unattributed edits in one timeline
+- select exactly which files to restore
+- inspect per-file diffs before anything changes
+
+When two agents claim the same recorded change, Undo marks it as a collision and
+blocks unsafe agent-specific recovery. Exclusive reported changes remain
+selectively recoverable. Every restore uses a preview-then-apply plan and backs
+up the current files first.
+
+To compare the experimental syntax-highlighted Pierre diff renderer, append
+`&diff=pierre` to the tokenized URL printed by `undo ui`. The lightweight Undo
+renderer remains the default.
+
+## CLI workflows
+
+The wrapper workflow remains available for unsupported agents and commands:
 
 ```bash
 undo run claude
+undo run exec --agent "My Agent" -- my-agent --non-interactive
 undo runs
 undo run show r_421
 undo ask r_421 "remove the auth migration work"
 undo apply rec_812
 ```
 
-`undo run` launches the agent and records its work. `undo ask` creates a preview
-and changes nothing. `undo apply` applies the exact preview you reviewed.
-
-Undo also works with `codex`, `opencode`, or any command:
-
-```bash
-undo run exec --agent "My Agent" -- my-agent --non-interactive
-```
-
-## See everything in the local UI
-
-```bash
-undo ui          # the full timeline
-undo ui r_421    # jump straight to one Run's review
-```
-
-Opens a local web interface: your history as a timeline of agent Runs and
-unattributed edits, per-file diffs, checkbox-selective undo ("keep these, undo
-the rest"), and one-click restores, all through the same preview-then-apply
-recovery plans as the CLI.
-
-To compare the experimental syntax-highlighted Pierre diff renderer, append
-`&diff=pierre` to the tokenized URL printed by `undo ui`. The lightweight Undo
-renderer remains the default.
-
-## Recover other changes
+`undo ask` creates a preview and changes nothing. `undo apply` applies the exact
+preview you reviewed.
 
 Undo can also restore recorded files by time, recover deleted files, and help
 after a large unexpected change:

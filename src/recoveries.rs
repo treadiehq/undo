@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use diffy::{apply_bytes, create_patch_bytes};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::db::Database;
 use crate::models::{FileEvent, Recovery, RecoveryEntry, RunIntent, Session, WatchedProject};
@@ -72,6 +72,7 @@ pub(crate) fn create_run_recovery_in(
         );
     }
     ensure_run_project(run, project)?;
+    ensure_reported_paths_recoverable(db, project, base_dir, run, paths)?;
     let plan = restore::plan_paths_restore_at_session_start(db, project, base_dir, paths, run)?;
     persist_restore_plan(
         db,
@@ -289,6 +290,51 @@ pub fn cmd_apply(reference: &str) -> Result<()> {
 /// Apply a persisted recovery plan against an explicit database and project.
 /// Carries the same expiry, ambiguity, and expected-hash preflight guarantees
 /// as the CLI path; it only skips the printing.
+pub(crate) fn apply_recovery_paths_in(
+    db: &Database,
+    project: &WatchedProject,
+    reference: &str,
+    paths: Option<&[String]>,
+) -> Result<AppliedRecovery> {
+    let Some(paths) = paths else {
+        return apply_recovery_in(db, project, reference);
+    };
+    let source = db
+        .get_recovery_by_ref(project.id, reference)?
+        .ok_or_else(|| anyhow::anyhow!("Recovery '{}' not found", reference))?;
+    let source_entries = db.get_recovery_entries(source.id)?;
+    let selected_entries = select_recovery_entries(project, &source_entries, paths)?;
+
+    // Applying any selection from an already-applied plan is still a no-op.
+    if source.status == "applied" {
+        return apply_recovery_in(db, project, reference);
+    }
+    ensure_recovery_is_applicable(&source)?;
+
+    if selected_entries.len() == source_entries.len() {
+        return apply_recovery_in(db, project, reference);
+    }
+
+    // A subset is a new immutable plan. Its apply/conflict status belongs to
+    // the derived plan; the source preview remains available and unchanged.
+    let request = format!(
+        "{} ({} of {} selected files)",
+        source.request,
+        selected_entries.len(),
+        source_entries.len()
+    );
+    let derived = db.create_recovery(
+        project.id,
+        source.run_id,
+        &request,
+        &source.kind,
+        &source.confidence,
+        source.ambiguity.as_deref(),
+        &selected_entries,
+    )?;
+    apply_recovery_in(db, project, &derived.public_id())
+}
+
 pub(crate) fn apply_recovery_in(
     db: &Database,
     project: &WatchedProject,
@@ -305,26 +351,7 @@ pub(crate) fn apply_recovery_in(
             already_applied: true,
         });
     }
-    if recovery.status != "planned" {
-        anyhow::bail!(
-            "Saved recovery plan {} cannot be applied because its status is '{}'.",
-            recovery.public_id(),
-            recovery.status
-        );
-    }
-    if Utc::now().timestamp() > recovery.expires_at {
-        anyhow::bail!(
-            "No files changed because saved recovery plan {} expired.\nCreate a new preview, then apply the new plan.",
-            recovery.public_id(),
-        );
-    }
-    if let Some(ambiguity) = &recovery.ambiguity {
-        anyhow::bail!(
-            "No files changed because saved recovery plan {} has overlapping changes.\nReview this conflict before trying another recovery: {}",
-            recovery.public_id(),
-            ambiguity
-        );
-    }
+    ensure_recovery_is_applicable(&recovery)?;
 
     let entries = db.get_recovery_entries(recovery.id)?;
     let fs = RestoreFs::open(project)?;
@@ -351,11 +378,74 @@ pub(crate) fn apply_recovery_in(
         });
     }
     db.mark_recovery_applied(recovery.id)?;
+    let applied_recovery = db
+        .get_recovery_by_ref(project.id, &recovery.public_id())?
+        .ok_or_else(|| anyhow::anyhow!("failed to read applied Recovery"))?;
     Ok(AppliedRecovery {
-        recovery,
+        recovery: applied_recovery,
         files_changed: entries.len(),
         already_applied: false,
     })
+}
+
+fn ensure_recovery_is_applicable(recovery: &Recovery) -> Result<()> {
+    if recovery.status != "planned" {
+        anyhow::bail!(
+            "Saved recovery plan {} cannot be applied because its status is '{}'.",
+            recovery.public_id(),
+            recovery.status
+        );
+    }
+    if Utc::now().timestamp() > recovery.expires_at {
+        anyhow::bail!(
+            "No files changed because saved recovery plan {} expired.\nCreate a new preview, then apply the new plan.",
+            recovery.public_id(),
+        );
+    }
+    if let Some(ambiguity) = &recovery.ambiguity {
+        anyhow::bail!(
+            "No files changed because saved recovery plan {} has overlapping changes.\nReview this conflict before trying another recovery: {}",
+            recovery.public_id(),
+            ambiguity
+        );
+    }
+    Ok(())
+}
+
+fn select_recovery_entries(
+    project: &WatchedProject,
+    entries: &[RecoveryEntry],
+    paths: &[String],
+) -> Result<Vec<RecoveryEntry>> {
+    if paths.is_empty() {
+        anyhow::bail!("select at least one file to restore");
+    }
+
+    let available = entries
+        .iter()
+        .map(|entry| {
+            (
+                crate::relative_path(&entry.path, &project.root_path).to_string(),
+                entry,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut requested = BTreeSet::new();
+    for path in paths {
+        if path.trim().is_empty() {
+            anyhow::bail!("selected restore path cannot be empty");
+        }
+        if !available.contains_key(path) {
+            anyhow::bail!("selected path '{}' is not part of this recovery plan", path);
+        }
+        requested.insert(path.as_str());
+    }
+
+    Ok(available
+        .into_iter()
+        .filter(|(path, _)| requested.contains(path.as_str()))
+        .map(|(_, entry)| (*entry).clone())
+        .collect())
 }
 
 pub fn print_recovery(db: &Database, project: &WatchedProject, recovery: &Recovery) -> Result<()> {
@@ -735,6 +825,39 @@ fn ensure_run_project(run: &Session, project: &WatchedProject) -> Result<()> {
     Ok(())
 }
 
+fn ensure_reported_paths_recoverable(
+    db: &Database,
+    project: &WatchedProject,
+    base_dir: &std::path::Path,
+    run: &Session,
+    paths: &[String],
+) -> Result<()> {
+    if !run.is_reported() {
+        return Ok(());
+    }
+    let mut blocked = Vec::new();
+    for path in paths {
+        let absolute = crate::safe_resolve_path(base_dir, path, &project.root_path)?;
+        let absolute = absolute.to_string_lossy().into_owned();
+        let status = db.classify_run_path_ownership(run.id, &absolute)?;
+        if status != "exclusive" {
+            blocked.push(format!(
+                "{} ({})",
+                crate::relative_path(&absolute, &project.root_path),
+                status
+            ));
+        }
+    }
+    if !blocked.is_empty() {
+        anyhow::bail!(
+            "No recovery plan was created because reported ownership is not exclusive for: {}. \
+             Collision, interleaved, and unattributed paths cannot be safely restored as whole files.",
+            blocked.join(", ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,6 +882,105 @@ mod tests {
             content: None,
         };
         assert!(current_matches_stored(&absent, &StoredState::Absent));
+    }
+
+    #[test]
+    fn reported_recovery_blocks_collision_and_interleaving() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let path = root.join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "current").unwrap();
+        let absolute = path.to_string_lossy().into_owned();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let first = db
+            .start_reported_run(
+                project.id,
+                "first",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                "cursor:first-recovery",
+            )
+            .unwrap();
+        let second = db
+            .start_reported_run(
+                project.id,
+                "second",
+                "hook",
+                "agent",
+                Some("Codex"),
+                None,
+                None,
+                "codex:second-recovery",
+            )
+            .unwrap();
+        db.open_run_boundary(first.id, "first-change", std::slice::from_ref(&absolute))
+            .unwrap();
+        db.open_run_boundary(second.id, "second-change", std::slice::from_ref(&absolute))
+            .unwrap();
+        db.insert_event(
+            project.id,
+            &absolute,
+            "MODIFIED",
+            Some("new"),
+            Some("old"),
+            None,
+            None,
+            Some(7),
+        )
+        .unwrap();
+        db.close_run_boundary(first.id, "first-change", std::slice::from_ref(&absolute))
+            .unwrap();
+        db.close_run_boundary(second.id, "second-change", std::slice::from_ref(&absolute))
+            .unwrap();
+        let selected = vec!["src/main.rs".to_string()];
+        let collision = ensure_reported_paths_recoverable(&db, &project, &root, &first, &selected)
+            .unwrap_err()
+            .to_string();
+        assert!(collision.contains("collision"), "{collision}");
+
+        let other = root.join("src/other.rs").to_string_lossy().into_owned();
+        std::fs::write(&other, "current").unwrap();
+        db.open_run_boundary(first.id, "exclusive", std::slice::from_ref(&other))
+            .unwrap();
+        db.insert_event(
+            project.id,
+            &other,
+            "MODIFIED",
+            Some("run"),
+            Some("old"),
+            None,
+            None,
+            Some(7),
+        )
+        .unwrap();
+        db.close_run_boundary(first.id, "exclusive", std::slice::from_ref(&other))
+            .unwrap();
+        db.insert_event(
+            project.id,
+            &other,
+            "MODIFIED",
+            Some("later"),
+            Some("run"),
+            None,
+            None,
+            Some(7),
+        )
+        .unwrap();
+        let interleaved = ensure_reported_paths_recoverable(
+            &db,
+            &project,
+            &root,
+            &first,
+            &["src/other.rs".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(interleaved.contains("interleaved"), "{interleaved}");
     }
 
     #[test]
@@ -910,6 +1132,121 @@ mod tests {
         };
 
         assert!(recovery_entries_to_plan(&project, &[entry]).is_err());
+    }
+
+    #[test]
+    fn selected_apply_uses_derived_plan_and_preserves_source() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let entries = [
+            RecoveryEntry {
+                recovery_id: 0,
+                path: first.to_string_lossy().to_string(),
+                action: "DELETE".to_string(),
+                target_hash: None,
+                source_timestamp: None,
+                expected_hash: Some(snapshots::hash_bytes(b"first")),
+                expected_exists: true,
+            },
+            RecoveryEntry {
+                recovery_id: 0,
+                path: second.to_string_lossy().to_string(),
+                action: "DELETE".to_string(),
+                target_hash: None,
+                source_timestamp: None,
+                expected_hash: Some(snapshots::hash_bytes(b"second")),
+                expected_exists: true,
+            },
+        ];
+        let source = db
+            .create_recovery(
+                project.id,
+                None,
+                "restore preview",
+                "timestamp",
+                "exact-timestamp",
+                None,
+                &entries,
+            )
+            .unwrap();
+
+        let selected = vec!["first.txt".to_string()];
+        let outcome =
+            apply_recovery_paths_in(&db, &project, &source.public_id(), Some(&selected)).unwrap();
+
+        assert_eq!(outcome.files_changed, 1);
+        assert_ne!(outcome.recovery.id, source.id);
+        assert_eq!(outcome.recovery.status, "applied");
+        assert!(!first.exists());
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+        let unchanged_source = db
+            .get_recovery_by_ref(project.id, &source.public_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged_source.status, "planned");
+        assert_eq!(
+            db.get_recovery_entries(outcome.recovery.id).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_apply_rejects_empty_and_unknown_paths() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("kept.txt");
+        std::fs::write(&file, "kept").unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let source = db
+            .create_recovery(
+                project.id,
+                None,
+                "restore preview",
+                "timestamp",
+                "exact-timestamp",
+                None,
+                &[RecoveryEntry {
+                    recovery_id: 0,
+                    path: file.to_string_lossy().to_string(),
+                    action: "DELETE".to_string(),
+                    target_hash: None,
+                    source_timestamp: None,
+                    expected_hash: Some(snapshots::hash_bytes(b"kept")),
+                    expected_exists: true,
+                }],
+            )
+            .unwrap();
+
+        let empty = Vec::new();
+        let error = apply_recovery_paths_in(&db, &project, &source.public_id(), Some(&empty))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("select at least one file"));
+
+        let unknown = vec!["unknown.txt".to_string()];
+        let error = apply_recovery_paths_in(&db, &project, &source.public_id(), Some(&unknown))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("not part of this recovery plan"));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "kept");
+        let unchanged_source = db
+            .get_recovery_by_ref(project.id, &source.public_id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged_source.status, "planned");
     }
 
     #[test]
