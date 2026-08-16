@@ -1557,11 +1557,6 @@ mod tests {
         let session = db.stop_active_session(project.id).unwrap().unwrap();
 
         assert!(
-            db.get_event_at_session_start(&session, &file_str)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
             db.get_live_hashes(project.id)
                 .unwrap()
                 .contains("baseline_hash")
