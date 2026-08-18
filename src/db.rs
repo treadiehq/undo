@@ -749,76 +749,6 @@ impl Database {
             .context("failed to query first path event after boundary")
     }
 
-    /// Find the newest restorable event at the exact start boundary of a
-    /// session. The event id fence matters because watcher events and session
-    /// commands are timestamped to whole seconds; events recorded after
-    /// `session start` can share the same timestamp as the start command.
-    pub fn get_event_at_session_start(
-        &self,
-        session: &Session,
-        path: &str,
-    ) -> Result<Option<FileEvent>> {
-        self.conn
-            .query_row(
-                "SELECT id, project_id, timestamp, path, event_type,
-                        current_hash, previous_hash, snapshot_path, old_path, file_size
-                 FROM file_events
-                 WHERE project_id = ?1
-                   AND path = ?2
-                   AND event_type != 'DELETED'
-                   AND (
-                        timestamp < ?3
-                        OR (timestamp = ?3 AND id <= ?4)
-                   )
-                 ORDER BY timestamp DESC, id DESC
-                 LIMIT 1",
-                params![
-                    session.project_id,
-                    path,
-                    session.started_at,
-                    session.start_event_id
-                ],
-                row_to_event,
-            )
-            .optional()
-            .context("failed to query event at session start")
-    }
-
-    /// Find the first event involving `path` inside a session. Event-id fences
-    /// preserve the exact start boundary even when several events share a
-    /// second, and `old_path` exposes the source side of renames.
-    pub fn get_first_path_event_in_session(
-        &self,
-        session: &Session,
-        path: &str,
-    ) -> Result<Option<FileEvent>> {
-        let end_event_id = match session.end_event_id {
-            Some(id) => id,
-            None => self.max_event_id(session.project_id)?,
-        };
-        self.conn
-            .query_row(
-                "SELECT id, project_id, timestamp, path, event_type,
-                        current_hash, previous_hash, snapshot_path, old_path, file_size
-                 FROM file_events
-                 WHERE project_id = ?1
-                   AND id > ?3
-                   AND id <= ?4
-                   AND (path = ?2 OR old_path = ?2)
-                 ORDER BY id ASC
-                 LIMIT 1",
-                params![
-                    session.project_id,
-                    path,
-                    session.start_event_id,
-                    end_event_id
-                ],
-                row_to_event,
-            )
-            .optional()
-            .context("failed to query first path event in session")
-    }
-
     /// Find the most recent DELETED event for a path, if any. A deleted file's
     /// last captured content survives only in the event's `previous_hash`, so
     /// restore uses this as a last resort when no non-DELETE event remains.
@@ -1789,15 +1719,6 @@ impl Database {
 
     // ── checkpoint operations ───────────────────────────────────────
 
-    pub fn create_checkpoint(&self, project_id: i64, name: &str, timestamp: i64) -> Result<()> {
-        self.immediate_transaction(|db| {
-            let run_id = db.get_active_session(project_id)?.map(|run| run.id);
-            let event_id = db.max_event_id(project_id)?;
-            db.create_checkpoint_at(project_id, run_id, name, timestamp, event_id, None)?;
-            Ok(())
-        })
-    }
-
     pub fn create_checkpoint_now(
         &self,
         project_id: i64,
@@ -1852,21 +1773,6 @@ impl Database {
         checkpoints
             .collect::<Result<Vec<_>, _>>()
             .context("failed to query checkpoints")
-    }
-
-    pub fn get_checkpoint(&self, project_id: i64, name: &str) -> Result<Option<Checkpoint>> {
-        self.conn
-            .query_row(
-                "SELECT id, project_id, run_id, name, timestamp, event_id, intent, created_at
-                 FROM checkpoints
-                 WHERE project_id = ?1 AND name = ?2
-                 ORDER BY timestamp DESC, id DESC
-                 LIMIT 1",
-                params![project_id, name],
-                row_to_checkpoint,
-            )
-            .optional()
-            .context("failed to query checkpoint")
     }
 
     fn get_checkpoint_for_run(&self, run_id: i64, name: &str) -> Result<Option<Checkpoint>> {
@@ -2701,26 +2607,6 @@ mod tests {
     }
 
     // ── checkpoints ──────────────────────────────────────────────────
-
-    /// Repeating a checkpoint is idempotent: agent retries must never move a
-    /// recovery boundary forward.
-    #[test]
-    fn checkpoint_create_is_idempotent() {
-        let db = db();
-        let p = project(&db);
-        db.create_checkpoint(p.id, "before refactor", 100).unwrap();
-        db.create_checkpoint(p.id, "before refactor", 200).unwrap();
-
-        let checkpoint = db
-            .get_checkpoint(p.id, "before refactor")
-            .unwrap()
-            .expect("checkpoint exists");
-        assert_eq!(checkpoint.timestamp, 100);
-
-        let checkpoints = db.list_checkpoints(p.id).unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].name, "before refactor");
-    }
 
     #[test]
     fn checkpoint_names_can_repeat_across_runs() {
