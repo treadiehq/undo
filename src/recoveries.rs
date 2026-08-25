@@ -9,7 +9,7 @@ use crate::restore::{
     self, ExpectedState, RestoreAction, RestoreKind, RestorePlan, RestorePlanEntry, RestoreSource,
 };
 use crate::restore_fs::{CappedRead, ProjectPath, RestoreFs};
-use crate::{BOLD, DIM, GREEN, RESET, YELLOW, find_project, snapshots};
+use crate::{BOLD, DIM, GREEN, RESET, YELLOW, resolve_project, snapshots};
 
 enum StoredState {
     Present { hash: String, timestamp: i64 },
@@ -41,7 +41,7 @@ pub fn create_run_recovery(
 ) -> Result<Recovery> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let recovery = create_run_recovery_in(
         &db, &project, &cwd, run, paths, request, kind, confidence, ambiguity,
     )?;
@@ -96,7 +96,7 @@ pub fn create_timestamp_recovery(
 ) -> Result<Recovery> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let recovery =
         create_timestamp_recovery_in(&db, &project, &cwd, path, target_timestamp, request, kind)?;
     print_recovery(&db, &project, &recovery)?;
@@ -137,7 +137,7 @@ pub fn create_event_boundary_recovery(
 ) -> Result<Recovery> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let recovery = create_event_boundary_recovery_in(
         &db,
         &project,
@@ -198,7 +198,7 @@ pub fn create_intent_recovery(
     })?;
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     ensure_run_project(run, &project)?;
     let events = db.get_events_between_ids(project.id, intent.start_event_id, end_event_id)?;
     let paths = paths_from_events(&events);
@@ -260,7 +260,7 @@ pub struct AppliedRecovery {
 pub fn cmd_apply(reference: &str) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let outcome = apply_recovery_in(&db, &project, reference)?;
     if outcome.already_applied {
         println!(

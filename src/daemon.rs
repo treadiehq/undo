@@ -49,15 +49,20 @@ pub fn ensure_recording(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Ensure recording for a path without creating a duplicate nested recorder.
-/// Active recorder roots take precedence, followed by a project already known
-/// to the database; only an unknown path becomes a new recorder root.
-pub fn ensure_recording_for_path(path: &Path) -> Result<PathBuf> {
+/// Resolve which project root the current folder belongs to, *without* starting
+/// a recorder. An active daemon's root takes precedence (most specific wins),
+/// then a project already known to the database; an unknown path resolves to
+/// itself. This is the read-only half of [`ensure_recording_for_path`]: every
+/// command that maps a working directory to a project (`run start`/`stop` as
+/// well as read-only `run list`/`show`, `ask`, `restore`, …) must agree on the
+/// answer, otherwise a Run recorded under an active *parent* daemon becomes
+/// invisible to commands that would otherwise resolve to a more specific nested
+/// project record (#82).
+pub fn recording_root_for_path(path: &Path) -> Result<PathBuf> {
     let path = path
         .canonicalize()
         .with_context(|| format!("cannot resolve recording folder {}", path.display()))?;
     let bt_dir = backtrack_dir()?;
-    migrate_old_pid_file(&bt_dir)?;
 
     let active_roots = active_daemons(&bt_dir)
         .into_iter()
@@ -72,7 +77,17 @@ pub fn ensure_recording_for_path(path: &Path) -> Result<PathBuf> {
         .find_project_for_path(&path)?
         .map(|project| PathBuf::from(project.root_path))
         .unwrap_or(path);
-    let root = root.canonicalize().unwrap_or(root);
+    Ok(root.canonicalize().unwrap_or(root))
+}
+
+/// Ensure recording for a path without creating a duplicate nested recorder.
+/// Active recorder roots take precedence, followed by a project already known
+/// to the database; only an unknown path becomes a new recorder root. This is
+/// the write half of [`recording_root_for_path`] — it resolves the same root
+/// and then guarantees a recorder is running for it.
+pub fn ensure_recording_for_path(path: &Path) -> Result<PathBuf> {
+    migrate_old_pid_file(&backtrack_dir()?)?;
+    let root = recording_root_for_path(path)?;
     ensure_recording(&root)?;
     Ok(root)
 }
@@ -793,6 +808,57 @@ mod tests {
         assert!(
             !pid_file_for_root(data_dir.path(), &nested.canonicalize().unwrap()).exists(),
             "the nested path must not get its own recorder marker"
+        );
+    }
+
+    /// The read-only resolver must agree with `ensure_recording_for_path`: an
+    /// active *parent* daemon's root wins over a nested path, so `run list`/
+    /// `show`/`ask`/`restore` resolve to the same project that `run start`/`stop`
+    /// record into (#82). It must not create a recorder for the nested path.
+    #[test]
+    fn recording_root_for_path_prefers_active_parent_daemon() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        std::fs::create_dir_all(data_dir.path().join("pids")).unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("packages").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+        let _lock = write_live_pid_file(data_dir.path(), &project_root.to_string_lossy());
+
+        let resolved = recording_root_for_path(&nested).unwrap();
+        assert_eq!(resolved, project_root);
+        assert!(
+            !pid_file_for_root(data_dir.path(), &nested.canonicalize().unwrap()).exists(),
+            "resolving must not create a recorder marker for the nested path"
+        );
+    }
+
+    /// With no live daemon, the resolver maps a subdirectory to its known project
+    /// root — but, unlike `ensure_recording_for_path`, it must NOT start a
+    /// recorder. Read-only commands rely on this: `undo run list` must never spin
+    /// up a daemon (#82).
+    #[test]
+    fn recording_root_for_path_resolves_known_project_without_starting_recorder() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        std::fs::create_dir_all(data_dir.path().join("pids")).unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let src = project.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let project_root = project.path().canonicalize().unwrap();
+
+        let db = Database::open().unwrap();
+        db.get_or_create_project(&project_root).unwrap();
+        drop(db);
+
+        let resolved = recording_root_for_path(&src).unwrap();
+        assert_eq!(resolved, project_root);
+        assert!(
+            !pid_file_for_root(data_dir.path(), &project_root).exists(),
+            "read-only resolution must not start a recorder"
         );
     }
 

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::db::Database;
 use crate::models::{Session, WatchedProject};
-use crate::{BOLD, DIM, GREEN, RED, RESET, YELLOW, find_project, groups};
+use crate::{BOLD, DIM, GREEN, RED, RESET, YELLOW, find_project, groups, resolve_project};
 
 #[derive(Clone, Copy)]
 pub enum Output {
@@ -131,7 +131,7 @@ pub fn cmd_run_stop(reference: Option<&str>, status: &str, output: Output) -> Re
 pub fn cmd_runs(output: Output) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let runs = db.list_sessions(project.id)?;
     if matches!(output, Output::Json) {
         let rows = runs
@@ -175,7 +175,7 @@ pub fn cmd_runs(output: Output) -> Result<()> {
 pub fn cmd_run_show(reference: &str, output: Output) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let run = db
         .get_run_by_ref(project.id, reference)?
         .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", reference))?;

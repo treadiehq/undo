@@ -188,6 +188,16 @@ pub fn find_project(db: &db::Database, cwd: &Path) -> Result<models::WatchedProj
     })
 }
 
+/// Resolve the project a working directory belongs to consistently with how
+/// Runs are recorded: an active daemon's root wins over a more specific nested
+/// project record, so inspection/recovery commands (`run list`/`show`, `ask`,
+/// `restore`, `recover`, `diff`, …) operate on the same project that `run
+/// start`/`run stop` write to. Read-only — it never starts a recorder. (#82)
+pub fn resolve_project(db: &db::Database, cwd: &Path) -> Result<models::WatchedProject> {
+    let root = daemon::recording_root_for_path(cwd)?;
+    find_project(db, &root)
+}
+
 pub fn relative_path<'a>(abs_path: &'a str, project_root: &str) -> &'a str {
     abs_path
         .strip_prefix(project_root)
@@ -406,7 +416,7 @@ fn main() {
 fn cmd_prune(keep: Option<String>, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = db::Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
 
     // Load `.undorc` from the project *root*, not the cwd. `undo prune` is
     // commonly run from a subdirectory; passing `&cwd` here silently falls
@@ -449,7 +459,7 @@ fn cmd_what_changed(duration_str: &str) -> Result<()> {
     let secs = duration::parse_duration(duration_str)?;
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = db::Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
 
     // saturating_sub: parse_duration accepts up to i64::MAX seconds, so a bare
     // `now - secs` underflows (debug panic / release wrap). Saturate instead.

@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::db::Database;
 use crate::models::FileEvent;
 use crate::snapshots;
-use crate::{BOLD, DIM, GREEN, RED, RESET, find_project};
+use crate::{BOLD, DIM, GREEN, RED, RESET, resolve_project};
 
 /// Heuristic: treat content as binary if it contains a NUL byte within the
 /// first 8 KiB (same approach used by git and most editors).
@@ -73,7 +73,7 @@ pub fn cmd_diff(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
 
     let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;
     let abs_path_str = abs_path.to_string_lossy().to_string();

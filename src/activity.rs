@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use crate::db::Database;
 use crate::duration;
 use crate::models::{Checkpoint, FileEvent, WatchedProject};
-use crate::{BLUE, BOLD, DIM, GREEN, RED, RESET, YELLOW, find_project, relative_path};
+use crate::{BLUE, BOLD, DIM, GREEN, RED, RESET, YELLOW, relative_path, resolve_project};
 
 const BURST_GAP_SECS: i64 = 10;
 const BURST_MIN_EVENTS: usize = 8;
@@ -73,7 +73,7 @@ pub fn cmd_checkpoint_for(
 pub fn cmd_checkpoints() -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let checkpoints = db.list_checkpoints(project.id)?;
 
     if checkpoints.is_empty() {
@@ -115,7 +115,7 @@ pub fn cmd_timeline(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let since_ts = parse_since(since)?;
     let mut events = match since_ts {
         Some(ts) => db.get_events_since_limited(project.id, ts, limit)?,
@@ -160,7 +160,7 @@ pub fn cmd_timeline(
 pub fn cmd_deleted(limit: usize) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let events = db.get_deleted_events(project.id, limit)?;
 
     if events.is_empty() {
@@ -190,7 +190,7 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
 
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let since = Utc::now().timestamp().saturating_sub(PANIC_WINDOW_SECS);
     let events = db.get_events_since(project.id, since)?;
     let bursts = detect_bursts(&events);

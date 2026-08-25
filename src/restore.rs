@@ -3,7 +3,7 @@ use crate::duration;
 use crate::models::{FileEvent, Session, WatchedProject};
 use crate::restore_fs::{CappedRead, ProjectPath, RestoreFs};
 use crate::snapshots;
-use crate::{BOLD, GREEN, RED, RESET, YELLOW, find_project};
+use crate::{BOLD, GREEN, RED, RESET, YELLOW, resolve_project};
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::BTreeSet;
@@ -39,7 +39,7 @@ pub fn cmd_restore(
         }
         let cwd = std::env::current_dir()?.canonicalize()?;
         let db = Database::open()?;
-        let project = find_project(&db, &cwd)?;
+        let project = resolve_project(&db, &cwd)?;
         let checkpoint = db
             .get_checkpoint_by_ref(project.id, checkpoint_name)?
             .ok_or_else(|| anyhow::anyhow!("checkpoint '{}' not found", checkpoint_name))?;
@@ -77,7 +77,7 @@ pub fn restore_at_timestamp(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
 
     let plan = plan_restore(&db, &project, &cwd, path_str, target_time, true)?;
 
@@ -104,7 +104,7 @@ pub fn restore_at_event_id(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let plan = plan_restore_at_event_id(&db, &project, &cwd, path_str, event_id)?;
     if plan.entries.is_empty() {
         println!("No saved version matches this restore target.");
@@ -135,7 +135,7 @@ fn resolve_restore_time(
         (None, Some(name), None) => {
             let cwd = std::env::current_dir()?.canonicalize()?;
             let db = Database::open()?;
-            let project = find_project(&db, &cwd)?;
+            let project = resolve_project(&db, &cwd)?;
             let checkpoint = db
                 .get_checkpoint_by_ref(project.id, name)?
                 .ok_or_else(|| anyhow::anyhow!("checkpoint '{}' not found", name))?;
@@ -151,7 +151,7 @@ fn resolve_restore_time(
 fn restore_deleted(path_str: &str, preview: bool) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
 
     let raw_path = cwd.join(path_str);
     reject_raw_symlink(&raw_path, path_str)?;

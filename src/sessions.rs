@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{Local, TimeZone};
 
 use crate::db::Database;
-use crate::{BOLD, DIM, GREEN, RESET, find_project, groups};
+use crate::{BOLD, DIM, GREEN, RESET, groups, resolve_project};
 
 pub fn cmd_session_start(name: &str) -> Result<()> {
     let name = name.trim();
@@ -12,7 +12,7 @@ pub fn cmd_session_start(name: &str) -> Result<()> {
 
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let session = db.start_session(project.id, name, "manual")?;
 
     println!(
@@ -29,7 +29,7 @@ pub fn cmd_session_start(name: &str) -> Result<()> {
 pub fn cmd_session_stop() -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
 
     let Some(session) = db.stop_active_session(project.id)? else {
         println!("No active Run.");
@@ -56,7 +56,7 @@ pub fn cmd_session_stop() -> Result<()> {
 pub fn cmd_session_show(name: &str) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let session = db
         .get_session_by_name(project.id, name)?
         .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", name))?;
