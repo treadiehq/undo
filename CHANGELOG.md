@@ -8,6 +8,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 Entries below `v0.1.12` were reconstructed from release commit summaries; they
 describe the headline changes of each tag rather than an exhaustive list.
 
+## [0.2.10] — 2026-08-25
+
+- `undo ask` no longer reverts every change group when the request names a
+  specific target. "revert all changes to auth" now scopes to the auth group
+  instead of the whole Run, while a bare "revert all"/"revert everything" (or
+  incidental words that match no group) still revert everything (#81).
+- Run inspection and recovery commands (`run list`/`show`, `ask`, `restore`,
+  `recover`, `diff`, `activity`, `sessions`, `prune`, `what-changed`) now
+  resolve the current folder to the same project that `run start`/`run stop`
+  record into. Runs recorded under an active parent daemon stay visible from
+  nested project checkouts, and recovery no longer operates on the wrong
+  project (#82).
+- `undo setup` only removes hooks it installed (identified by the
+  `UNDO_AGENT_HOOK=1` marker) and no longer deletes a user's own hook that
+  merely contains the `_hook --agent <agent>` substring (#83).
+- Agent hooks now fail fast with a clear message when a hook's external run id
+  collides with a window-attributed Run, instead of a confusing downstream
+  "cannot accept explicit change claims" error (#84).
+
 ## [0.2.9] — 2026-08-14
 
 - New `undo setup --agent claude|cursor|codex` commands safely install
