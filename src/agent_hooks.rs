@@ -184,6 +184,30 @@ fn is_transitional_end(reason: Option<&str>) -> bool {
     })
 }
 
+/// A Run resolved from an agent hook must use *reported* attribution and still
+/// be active. Hook events make explicit change claims, which window-attributed
+/// Runs reject downstream in `open_run_boundary`; validating here turns an
+/// `external_run_id` collision with a `run start --external-id` Run into a
+/// clear, early error instead of a confusing "cannot accept explicit change
+/// claims" failure later. Mirrors `agent_events::required_reported_run` (#84).
+fn validate_active_hook_run(
+    run: crate::models::Session,
+    external_run_id: &str,
+) -> Result<crate::models::Session> {
+    if !run.is_reported() {
+        anyhow::bail!(
+            "Run {} uses window attribution and cannot accept hook events; \
+             external_run_id '{}' is reserved for reported attribution",
+            run.public_id(),
+            external_run_id
+        );
+    }
+    if !run.is_active() {
+        anyhow::bail!("reported hook Run {} is already complete", run.public_id());
+    }
+    Ok(run)
+}
+
 fn required_hook_run(
     db: &Database,
     project_id: i64,
@@ -192,10 +216,7 @@ fn required_hook_run(
     let run = db
         .get_run_by_external_id(project_id, external_run_id)?
         .ok_or_else(|| anyhow::anyhow!("reported hook Run '{}' not found", external_run_id))?;
-    if !run.is_active() {
-        anyhow::bail!("reported hook Run {} is already complete", run.public_id());
-    }
-    Ok(run)
+    validate_active_hook_run(run, external_run_id)
 }
 
 fn ensure_hook_run(
@@ -205,10 +226,7 @@ fn ensure_hook_run(
     agent: Agent,
 ) -> Result<crate::models::Session> {
     if let Some(run) = db.get_run_by_external_id(project_id, external_run_id)? {
-        if run.is_active() {
-            return Ok(run);
-        }
-        anyhow::bail!("reported hook Run {} is already complete", run.public_id());
+        return validate_active_hook_run(run, external_run_id);
     }
     db.start_reported_run(
         project_id,
@@ -555,6 +573,58 @@ mod tests {
             extract_normalized_paths(&payload, root.path(), &root.path().to_string_lossy())
                 .unwrap(),
             vec![path.canonicalize().unwrap().to_string_lossy().into_owned()]
+        );
+    }
+
+    /// When a window-attributed Run already reserved the hook's `external_run_id`
+    /// (e.g. the user ran `undo run start --external-id cursor:conv-1`), the hook
+    /// must reject it early with a clear message rather than returning it and
+    /// failing later inside `open_run_boundary` (#84).
+    #[test]
+    fn ensure_hook_run_rejects_window_attributed_collision() {
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+        let external = "cursor:conv-1";
+        db.start_run(
+            project.id,
+            "manual",
+            "run",
+            "human",
+            None,
+            None,
+            None,
+            Some(external),
+        )
+        .unwrap();
+
+        let error = ensure_hook_run(&db, project.id, external, Agent::Cursor).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("window attribution"),
+            "expected a window-attribution rejection, got: {message}"
+        );
+        assert!(
+            message.contains(external),
+            "message should name the colliding external id, got: {message}"
+        );
+    }
+
+    /// The happy path: with no colliding Run, `ensure_hook_run` creates a
+    /// reported Run and reuses it on the next call for the same external id.
+    #[test]
+    fn ensure_hook_run_creates_then_reuses_reported_run() {
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+        let external = "cursor:conv-2";
+
+        let created = ensure_hook_run(&db, project.id, external, Agent::Cursor).unwrap();
+        assert!(created.is_reported());
+        assert!(created.is_active());
+
+        let reused = ensure_hook_run(&db, project.id, external, Agent::Cursor).unwrap();
+        assert_eq!(
+            created.id, reused.id,
+            "same external id must resolve to the same Run"
         );
     }
 
