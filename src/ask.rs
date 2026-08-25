@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use crate::db::Database;
 use crate::groups::{self, ChangeGroup};
 use crate::models::{RunIntent, Session, WatchedProject};
-use crate::{BOLD, DIM, GREEN, RESET, YELLOW, find_project, recoveries};
+use crate::{BOLD, DIM, GREEN, RESET, YELLOW, recoveries, resolve_project};
 
 #[derive(Debug)]
 struct AskIntent {
@@ -30,7 +30,7 @@ pub fn cmd_ask(query: &str, session_name: Option<&str>, apply: bool, yes: bool) 
 
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = find_project(&db, &cwd)?;
+    let project = resolve_project(&db, &cwd)?;
     let session = resolve_run(&db, project.id, session_name)?;
     if session.is_active() {
         anyhow::bail!(
@@ -164,7 +164,24 @@ fn build_proposal(
         .collect::<BTreeSet<_>>();
 
     let mut revert_groups = if intent.revert_all {
-        groups.to_vec()
+        // "all"/"everything" is only a whole-Run instruction when it stands alone.
+        // If the user also named a concrete target that matches real groups — e.g.
+        // "revert all changes to auth" — the scope word was a modifier, so scope to
+        // the matched groups instead of reverting every group. Fall back to the
+        // whole Run only when no named target matches anything (e.g. "revert all",
+        // or incidental words like "all my changes" that match no group) (#81).
+        let targets = intent
+            .revert_terms
+            .iter()
+            .filter(|term| !is_scope_word(term))
+            .cloned()
+            .collect::<Vec<_>>();
+        let scoped = select_groups(groups, project, &targets);
+        if scoped.is_empty() {
+            groups.to_vec()
+        } else {
+            scoped
+        }
     } else {
         select_groups(groups, project, &intent.revert_terms)
     };
@@ -361,6 +378,13 @@ fn contains_all_intent(input: &str) -> bool {
     input
         .split_whitespace()
         .any(|word| matches!(word, "all" | "everything"))
+}
+
+/// A whole-scope word rather than a target term. Matches the *stemmed* forms
+/// `important_terms` produces ("everything" stems to "everyth"), so revert-all
+/// scoping can tell a bare "revert all" from "all changes to <target>" (#81).
+fn is_scope_word(term: &str) -> bool {
+    matches!(term, "all" | "everyth")
 }
 
 fn important_terms(input: &str) -> Vec<String> {
@@ -631,6 +655,74 @@ mod tests {
                 .map(|g| g.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["auth"]
+        );
+    }
+
+    fn revert_ids(proposal: &AskProposal) -> Vec<&str> {
+        proposal
+            .revert_groups
+            .iter()
+            .map(|g| g.id.as_str())
+            .collect()
+    }
+
+    /// "all" in front of a concrete target is a modifier, not a whole-Run scope:
+    /// "revert all changes to auth" must touch only the auth group, not every
+    /// group. This is the #81 bug — previously the bare "all" selected all groups.
+    #[test]
+    fn revert_all_changes_to_target_scopes_to_that_target() {
+        let groups = vec![
+            group("auth", &["/repo/src/auth/login.rs"]),
+            group("database", &["/repo/src/db/connection.rs"]),
+            group("logging", &["/repo/src/logging/logger.rs"]),
+        ];
+
+        let proposal =
+            build_proposal("revert all changes to auth", session(), &project(), &groups).unwrap();
+
+        assert_eq!(
+            revert_ids(&proposal),
+            vec!["auth"],
+            "'all changes to auth' must scope to auth, not revert every group"
+        );
+        assert_eq!(
+            proposal
+                .keep_groups
+                .iter()
+                .map(|g| g.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["database", "logging"],
+        );
+    }
+
+    /// A bare "revert all" (no named target) still means the whole Run.
+    #[test]
+    fn bare_revert_all_selects_every_group() {
+        let groups = vec![
+            group("auth", &["/repo/src/auth/login.rs"]),
+            group("database", &["/repo/src/db/connection.rs"]),
+        ];
+
+        let proposal = build_proposal("revert all", session(), &project(), &groups).unwrap();
+        assert_eq!(revert_ids(&proposal), vec!["auth", "database"]);
+    }
+
+    /// Incidental words that match no group ("my" in "undo all my changes") must
+    /// NOT collapse the request to nothing — the scope word still means the whole
+    /// Run when nothing concrete matches. Regression guard for the group-aware fix.
+    #[test]
+    fn revert_all_with_incidental_noun_selects_every_group() {
+        let groups = vec![
+            group("auth", &["/repo/src/auth/login.rs"]),
+            group("database", &["/repo/src/db/connection.rs"]),
+        ];
+
+        let proposal =
+            build_proposal("undo all my changes", session(), &project(), &groups).unwrap();
+        assert_eq!(
+            revert_ids(&proposal),
+            vec!["auth", "database"],
+            "'all my changes' should revert everything, not match the incidental word 'my'"
         );
     }
 }
