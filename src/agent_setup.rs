@@ -150,7 +150,7 @@ fn merge_nested_event(
             validate_command_hook(hook)?;
         }
         let original_len = commands.len();
-        commands.retain(|hook| !is_undo_hook(hook, agent));
+        commands.retain(|hook| !is_undo_hook(hook));
         let removed_undo = commands.len() != original_len;
         if !(removed_undo && commands.is_empty()) {
             preserved.push(entry);
@@ -180,7 +180,7 @@ fn merge_direct_event(
     for hook in entries.iter() {
         validate_command_hook(hook)?;
     }
-    entries.retain(|hook| !is_undo_hook(hook, agent));
+    entries.retain(|hook| !is_undo_hook(hook));
     let mut managed = json!({ "command": command });
     if let Some(matcher) = tool_matcher(agent, event) {
         managed["matcher"] = Value::String(matcher.to_string());
@@ -213,13 +213,15 @@ fn validate_command_hook(hook: &Value) -> Result<()> {
     Ok(())
 }
 
-fn is_undo_hook(hook: &Value, agent: Agent) -> bool {
+/// An Undo-managed hook is identified *only* by the `UNDO_AGENT_HOOK=1` marker,
+/// which `hook_command` prefixes onto every hook it writes. Matching anything
+/// broader (e.g. a bare `_hook --agent <agent>` substring) risks deleting a
+/// user's own hook during setup, since `merge_*_event` drops whatever this
+/// flags. The marker is the whole point — keep the identity check exact (#83).
+fn is_undo_hook(hook: &Value) -> bool {
     hook.get("command")
         .and_then(Value::as_str)
-        .is_some_and(|command| {
-            command.contains(HOOK_MARKER)
-                || command.contains(&format!("_hook --agent {}", agent.as_str()))
-        })
+        .is_some_and(|command| command.contains(HOOK_MARKER))
 }
 
 fn hook_command(executable: &Path, agent: Agent) -> Result<String> {
@@ -381,6 +383,47 @@ mod tests {
         assert_eq!(
             config["hooks"]["Notification"][0]["hooks"][0]["command"],
             "notify"
+        );
+    }
+
+    /// A user's own hook must survive `undo setup` even when its command happens
+    /// to contain the `_hook --agent <agent>` substring. Only the
+    /// `UNDO_AGENT_HOOK=1` marker identifies an Undo-managed hook; matching the
+    /// bare substring would clobber unrelated user hooks (#83).
+    #[test]
+    fn preserves_user_hook_that_mentions_hook_agent_substring() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "hooks": {
+    "SessionStart": [{
+      "hooks": [{"type": "command", "command": "my-wrapper _hook --agent claude do-thing"}]
+    }]
+  }
+}"#,
+        )
+        .unwrap();
+
+        install_at(Agent::Claude, &path, Path::new("/usr/local/bin/undo")).unwrap();
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        let user_command = "my-wrapper _hook --agent claude do-thing";
+        let preserved = config["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| {
+                group["hooks"].as_array().is_some_and(|hooks| {
+                    hooks
+                        .iter()
+                        .any(|hook| hook["command"].as_str() == Some(user_command))
+                })
+            });
+        assert!(
+            preserved,
+            "a user hook containing '_hook --agent claude' was incorrectly removed"
         );
     }
 
