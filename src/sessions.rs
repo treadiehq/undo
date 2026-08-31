@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{Local, TimeZone};
 
 use crate::db::Database;
-use crate::{BOLD, DIM, GREEN, RESET, groups, resolve_project};
+use crate::{BOLD, DIM, GREEN, RESET, groups, project_for_run, resolve_project};
 
 pub fn cmd_session_start(name: &str) -> Result<()> {
     let name = name.trim();
@@ -31,10 +31,11 @@ pub fn cmd_session_stop() -> Result<()> {
     let db = Database::open()?;
     let project = resolve_project(&db, &cwd)?;
 
-    let Some(session) = db.stop_active_session(project.id)? else {
+    let Some(session) = crate::runs::active_run_for_context(&db, &cwd, project.id, None)? else {
         println!("No active Run.");
         return Ok(());
     };
+    let session = db.complete_run(session.id, "completed")?;
     let event_count = db.get_session_events(&session)?.len();
     let change_word = if event_count == 1 {
         "file change"
@@ -56,10 +57,11 @@ pub fn cmd_session_stop() -> Result<()> {
 pub fn cmd_session_show(name: &str) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = resolve_project(&db, &cwd)?;
-    let session = db
-        .get_session_by_name(project.id, name)?
+    let resolved_project = resolve_project(&db, &cwd)?;
+    let project_ids = crate::runs::run_context_project_ids(&db, &cwd, resolved_project.id)?;
+    let session = crate::runs::find_run_in_context(&db, &project_ids, name)?
         .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", name))?;
+    let project = project_for_run(&db, &session)?;
     let events = db.get_session_events(&session)?;
     let groups = groups::build_groups(&project, &events);
 

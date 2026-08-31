@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use crate::db::Database;
 use crate::groups::{self, ChangeGroup};
 use crate::models::{RunIntent, Session, WatchedProject};
-use crate::{BOLD, DIM, GREEN, RESET, YELLOW, recoveries, resolve_project};
+use crate::{BOLD, DIM, GREEN, RESET, YELLOW, project_for_run, recoveries, resolve_project};
 
 #[derive(Debug)]
 struct AskIntent {
@@ -30,8 +30,10 @@ pub fn cmd_ask(query: &str, session_name: Option<&str>, apply: bool, yes: bool) 
 
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = resolve_project(&db, &cwd)?;
-    let session = resolve_run(&db, project.id, session_name)?;
+    let resolved_project = resolve_project(&db, &cwd)?;
+    let project_ids = crate::runs::run_context_project_ids(&db, &cwd, resolved_project.id)?;
+    let session = resolve_run(&db, resolved_project.id, &project_ids, session_name)?;
+    let project = project_for_run(&db, &session)?;
     if session.is_active() {
         anyhow::bail!(
             "No recovery plan was created because Run {} is still active.\nFinish the Run, then try again.",
@@ -107,10 +109,15 @@ pub fn cmd_ask(query: &str, session_name: Option<&str>, apply: bool, yes: bool) 
     recoveries::cmd_apply(&recovery.public_id())
 }
 
-fn resolve_run(db: &Database, project_id: i64, name: Option<&str>) -> Result<Session> {
+fn resolve_run(
+    db: &Database,
+    project_id: i64,
+    project_ids: &[i64],
+    name: Option<&str>,
+) -> Result<Session> {
     if let Some(name) = name {
         return db
-            .get_run_by_ref(project_id, name)?
+            .get_historical_run_by_ref(project_ids, name)?
             .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", name));
     }
 
@@ -123,7 +130,14 @@ fn resolve_run(db: &Database, project_id: i64, name: Option<&str>) -> Result<Ses
 }
 
 fn match_explicit_intent<'a>(query: &str, intents: &'a [RunIntent]) -> Option<&'a RunIntent> {
-    let query_terms = important_terms(query);
+    let normalized_query = normalize(query);
+    let whole_run_scope = contains_all_intent(&normalized_query);
+    let query_terms = important_terms(query)
+        .into_iter()
+        // Scope words describe how much to undo; they are never task names.
+        // Without this gate, "all" fuzzy-matches labels such as "install".
+        .filter(|term| !is_scope_word(term))
+        .collect::<Vec<_>>();
     let mut matches = intents
         .iter()
         .filter(|intent| intent.end_event_id.is_some())
@@ -132,7 +146,16 @@ fn match_explicit_intent<'a>(query: &str, intents: &'a [RunIntent]) -> Option<&'
             let compact_label = compact(&normalized);
             let score = query_terms.iter().fold(0usize, |score, term| {
                 score
-                    + if normalized.split_whitespace().any(|part| part == term) {
+                    + if whole_run_scope
+                        && is_incidental_scope_term(term)
+                        && normalized != term.as_str()
+                    {
+                        // In a whole-Run request, pronouns such as "my" are
+                        // grammatical context, not fuzzy task references. An
+                        // intent whose complete label is exactly that term is
+                        // still a valid explicit target.
+                        0
+                    } else if normalized.split_whitespace().any(|part| part == term) {
                         5
                     } else if compact_label.contains(&compact(term)) {
                         2
@@ -173,7 +196,7 @@ fn build_proposal(
         let targets = intent
             .revert_terms
             .iter()
-            .filter(|term| !is_scope_word(term))
+            .filter(|term| is_revert_all_target(term, groups, project))
             .cloned()
             .collect::<Vec<_>>();
         let scoped = select_groups(groups, project, &targets);
@@ -200,6 +223,7 @@ fn build_proposal(
     let requested_terms = intent
         .revert_terms
         .iter()
+        .filter(|term| !intent.revert_all || is_revert_all_target(term, groups, project))
         .chain(intent.keep_terms.iter())
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -387,6 +411,58 @@ fn is_scope_word(term: &str) -> bool {
     matches!(term, "all" | "everyth")
 }
 
+/// Pronouns and determiners that commonly describe ownership in whole-Run
+/// requests ("all my changes", "everything we did"). This is intentionally
+/// separate from the global stopword list: a short project group may itself be
+/// named `us`, `it`, or `mine` and must remain explicitly targetable (#89).
+fn is_incidental_scope_term(term: &str) -> bool {
+    matches!(
+        term,
+        "as" | "he"
+            | "her"
+            | "him"
+            | "his"
+            | "it"
+            | "its"
+            | "me"
+            | "mine"
+            | "my"
+            | "our"
+            | "she"
+            | "their"
+            | "them"
+            | "they"
+            | "us"
+            | "we"
+            | "you"
+            | "your"
+    )
+}
+
+fn is_revert_all_target(term: &str, groups: &[ChangeGroup], project: &WatchedProject) -> bool {
+    !is_scope_word(term)
+        && (!is_incidental_scope_term(term) || is_concrete_group_target(term, groups, project))
+}
+
+/// True only for a strong, exact group reference. Fuzzy substring matches are
+/// deliberately insufficient here: `my` appearing inside `myapp` does not mean
+/// the user named that group, while a real `src/us` group remains reachable.
+fn is_concrete_group_target(term: &str, groups: &[ChangeGroup], project: &WatchedProject) -> bool {
+    groups.iter().any(|group| {
+        group.id.eq_ignore_ascii_case(term)
+            || contains_exact_token(&group.label, term)
+            || group.paths.iter().any(|path| {
+                contains_exact_token(crate::relative_path(path, &project.root_path), term)
+            })
+    })
+}
+
+fn contains_exact_token(value: &str, term: &str) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case(term))
+}
+
 fn important_terms(input: &str) -> Vec<String> {
     normalize(input)
         .split_whitespace()
@@ -520,6 +596,43 @@ mod tests {
             event_count: paths.len(),
             inserted: 0,
             deleted: 0,
+        }
+    }
+
+    fn file_event(id: i64, path: &str) -> crate::models::FileEvent {
+        crate::models::FileEvent {
+            id,
+            project_id: 1,
+            timestamp: 100 + id,
+            path: path.to_string(),
+            event_type: "MODIFIED".to_string(),
+            current_hash: None,
+            previous_hash: None,
+            snapshot_path: None,
+            old_path: None,
+            file_size: None,
+        }
+    }
+
+    fn production_groups(paths: &[&str]) -> Vec<ChangeGroup> {
+        let events = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| file_event(index as i64 + 1, path))
+            .collect::<Vec<_>>();
+        groups::build_groups(&project(), &events)
+    }
+
+    fn run_intent(id: i64, label: &str) -> RunIntent {
+        RunIntent {
+            id,
+            run_id: 1,
+            label: label.to_string(),
+            status: "completed".to_string(),
+            start_event_id: 10,
+            end_event_id: Some(20),
+            started_at: 100,
+            ended_at: Some(200),
         }
     }
 
@@ -723,6 +836,89 @@ mod tests {
             revert_ids(&proposal),
             vec!["auth", "database"],
             "'all my changes' should revert everything, not match the incidental word 'my'"
+        );
+    }
+
+    /// Production-derived ids such as `myapp` and `mysql` must not turn the
+    /// possessive "my" into a fuzzy group target in a whole-Run request (#89).
+    #[test]
+    fn revert_all_ignores_incidental_pronoun_substrings() {
+        for module in ["myapp", "mysql"] {
+            let module_path = format!("/repo/src/{module}/feature.rs");
+            let groups = production_groups(&[
+                "/repo/src/auth/login.rs",
+                "/repo/src/db/connection.rs",
+                &module_path,
+            ]);
+            let proposal =
+                build_proposal("undo all my changes", session(), &project(), &groups).unwrap();
+
+            assert_eq!(
+                revert_ids(&proposal),
+                vec!["auth", "db", module],
+                "incidental 'my' must not scope the request to {module}"
+            );
+            assert!(
+                proposal.unmatched_terms.is_empty(),
+                "scope grammar must not be reported as unmatched file targets"
+            );
+        }
+    }
+
+    /// Filtering incidental whole-Run words must not make real short group ids
+    /// unreachable, including an id that is itself a pronoun (#89).
+    #[test]
+    fn revert_all_preserves_exact_short_group_targets() {
+        for (target, other) in [("db", "auth"), ("us", "auth")] {
+            let target_path = format!("/repo/src/{target}/feature.rs");
+            let other_path = format!("/repo/src/{other}/feature.rs");
+            let groups = production_groups(&[&target_path, &other_path]);
+            let query = format!("revert all changes to {target}");
+            let proposal = build_proposal(&query, session(), &project(), &groups).unwrap();
+
+            assert_eq!(revert_ids(&proposal), vec![target]);
+        }
+    }
+
+    /// The whole-Run guard is local to incidental words; existing useful fuzzy
+    /// matching remains available for descriptive targets.
+    #[test]
+    fn revert_all_preserves_non_incidental_fuzzy_targets() {
+        let groups = production_groups(&["/repo/src/auth/login.rs", "/repo/src/db/connection.rs"]);
+        let proposal = build_proposal(
+            "revert all changes to authentication",
+            session(),
+            &project(),
+            &groups,
+        )
+        .unwrap();
+
+        assert_eq!(revert_ids(&proposal), vec!["auth"]);
+    }
+
+    /// Explicit task-boundary matching runs before group matching. Scope and
+    /// incidental terms must not let "all my changes" match `install` via
+    /// "all" or `myapp` via "my" and bypass the group-level fix (#89).
+    #[test]
+    fn whole_run_words_do_not_fuzzy_match_completed_intents() {
+        let intents = [
+            run_intent(1, "install database"),
+            run_intent(2, "myapp feature"),
+        ];
+        assert!(match_explicit_intent("undo all my changes", &intents).is_none());
+
+        let auth = run_intent(3, "auth");
+        assert_eq!(
+            match_explicit_intent("revert all changes to auth", &[auth]).map(|intent| intent.id),
+            Some(3),
+            "a concrete target should still match its completed task boundary"
+        );
+
+        let us = run_intent(4, "us");
+        assert_eq!(
+            match_explicit_intent("revert all changes to us", &[us]).map(|intent| intent.id),
+            Some(4),
+            "an exact short pronoun task label must remain targetable"
         );
     }
 }

@@ -69,14 +69,7 @@ fn handle_payload(agent: Agent, payload: &HookPayload, process_cwd: &Path) -> Re
             if is_transitional_end(payload.reason.as_deref()) {
                 return Ok(());
             }
-            if let Some(run) = db.get_run_by_external_id(project.id, &external_run_id)?
-                && run.is_active()
-            {
-                // Session-end hooks have a very small host timeout. Mutating
-                // tool post-hooks already reconcile exact paths, so completion
-                // must stay bounded instead of walking the project here.
-                db.complete_run(run.id, "completed")?;
-            }
+            complete_reported_hook_run(&db, project.id, &external_run_id)?;
         }
         "pretooluse" => {
             let Some(change_id) = payload.tool_use_id.as_deref() else {
@@ -206,6 +199,22 @@ fn validate_active_hook_run(
         anyhow::bail!("reported hook Run {} is already complete", run.public_id());
     }
     Ok(run)
+}
+
+/// Session-end is best-effort cleanup: a missing, completed, or colliding
+/// window-attributed Run is a no-op. Hooks may only complete Runs whose change
+/// attribution came from those hooks in the first place (#91).
+fn complete_reported_hook_run(db: &Database, project_id: i64, external_run_id: &str) -> Result<()> {
+    if let Some(run) = db.get_run_by_external_id(project_id, external_run_id)?
+        && run.is_reported()
+        && run.is_active()
+    {
+        // Session-end hooks have a very small host timeout. Mutating tool
+        // post-hooks already reconcile exact paths, so completion must stay
+        // bounded instead of walking the project here.
+        db.complete_run(run.id, "completed")?;
+    }
+    Ok(())
 }
 
 fn required_hook_run(
@@ -607,6 +616,66 @@ mod tests {
             message.contains(external),
             "message should name the colliding external id, got: {message}"
         );
+    }
+
+    /// SessionEnd must not complete a user-managed, window-attributed Run that
+    /// happens to reserve the same external id as an agent session (#91).
+    #[test]
+    fn session_end_preserves_window_attributed_collision() {
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+        let external = "cursor:conv-window";
+        let run = db
+            .start_run(
+                project.id,
+                "manual",
+                "run",
+                "human",
+                None,
+                None,
+                None,
+                Some(external),
+            )
+            .unwrap();
+        assert!(!run.is_reported());
+
+        complete_reported_hook_run(&db, project.id, external).unwrap();
+
+        let preserved = db
+            .get_run_by_external_id(project.id, external)
+            .unwrap()
+            .unwrap();
+        assert!(preserved.is_active());
+    }
+
+    /// A genuine reported Run is still completed by SessionEnd.
+    #[test]
+    fn session_end_completes_active_reported_run() {
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/proj")).unwrap();
+        let external = "cursor:conv-reported";
+        let run = db
+            .start_reported_run(
+                project.id,
+                "Cursor session",
+                "hook",
+                "agent",
+                Some("Cursor"),
+                None,
+                None,
+                external,
+            )
+            .unwrap();
+        assert!(run.is_reported());
+
+        complete_reported_hook_run(&db, project.id, external).unwrap();
+
+        let completed = db
+            .get_run_by_external_id(project.id, external)
+            .unwrap()
+            .unwrap();
+        assert!(!completed.is_active());
+        assert_eq!(completed.status, "completed");
     }
 
     /// The happy path: with no colliding Run, `ensure_hook_run` creates a

@@ -451,7 +451,7 @@ fn plan_restore_at_event_id(
     )
 }
 
-fn path_in_scope(path: &str, scope: &str) -> bool {
+pub(crate) fn path_in_scope(path: &str, scope: &str) -> bool {
     path == scope
         || path
             .strip_prefix(scope)
@@ -728,7 +728,7 @@ enum BoundaryState {
 /// aged out of retention: previously both earlier lookups returned `None` and
 /// restore reported "No snapshots found", even though the deletion itself was
 /// well within the retention window and the snapshot was still on disk.
-fn resolve_restore_source(
+pub(crate) fn resolve_restore_source(
     db: &Database,
     project_id: i64,
     path: &str,

@@ -515,6 +515,32 @@ impl Database {
             .context("failed to query project for path")
     }
 
+    /// Return every watched project whose root contains `path`, ordered from
+    /// most specific to least specific. Historical Run listing uses this to
+    /// include a nested project's old Runs alongside Runs currently recorded
+    /// by an active parent daemon, without pulling in unrelated sibling
+    /// projects (#85).
+    pub fn list_projects_for_path(&self, path: &Path) -> Result<Vec<WatchedProject>> {
+        let path_str = path.to_string_lossy().to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_path, created_at
+             FROM watched_projects
+             WHERE ?1 = root_path
+                OR SUBSTR(?1, 1, LENGTH(root_path) + 1) = root_path || '/'
+             ORDER BY LENGTH(root_path) DESC, id DESC",
+        )?;
+        let projects = stmt.query_map(rusqlite::params![path_str], |row| {
+            Ok(WatchedProject {
+                id: row.get(0)?,
+                root_path: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        projects
+            .collect::<Result<Vec<_>, _>>()
+            .context("failed to query projects for path")
+    }
+
     // ── event operations ────────────────────────────────────────────
 
     #[allow(clippy::too_many_arguments)]
@@ -1299,6 +1325,46 @@ impl Database {
                 .map(|run| run.filter(|run| run.project_id == project_id));
         }
         self.get_session_by_name(project_id, reference)
+    }
+
+    /// Resolve a Run reference for historical inspection or recovery.
+    ///
+    /// Public `r_<id>` values are database-primary-key identities, so they stay
+    /// referenceable after recording moves between nested and parent projects.
+    /// Human-readable names are searched only within the caller's contextual
+    /// projects and rejected when ambiguous. Keep single-project operational
+    /// lookups (checkpoints and agent events) on [`Self::get_run_by_ref`] so
+    /// they cannot accidentally target a Run in another tree (#85, #88).
+    pub fn get_historical_run_by_ref(
+        &self,
+        project_ids: &[i64],
+        reference: &str,
+    ) -> Result<Option<Session>> {
+        if let Some(id) = parse_public_id(reference, "r_") {
+            return self.get_session_by_id(id);
+        }
+
+        let mut matches = Vec::new();
+        for project_id in project_ids {
+            if let Some(run) = self.get_session_by_name(*project_id, reference)? {
+                matches.push(run);
+            }
+        }
+        match matches.as_slice() {
+            [] => Ok(None),
+            [run] => Ok(Some(run.clone())),
+            runs => {
+                let ids = runs
+                    .iter()
+                    .map(Session::public_id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "Run name '{}' is ambiguous across projects ({ids}); use an r_<id> reference",
+                    reference
+                )
+            }
+        }
     }
 
     pub fn get_run_by_external_id(
@@ -2425,6 +2491,32 @@ mod tests {
         assert_ne!(found.id, parent.id);
     }
 
+    /// Historical Run listing needs every watched root on the cwd's ancestor
+    /// chain, ordered most-specific first, but must not include siblings or
+    /// roots that merely share a string prefix (#85).
+    #[test]
+    fn list_projects_for_path_returns_only_component_ancestor_chain() {
+        let db = db();
+        let parent = db.get_or_create_project(Path::new("/work")).unwrap();
+        let nested = db
+            .get_or_create_project(Path::new("/work/packages/app"))
+            .unwrap();
+        db.get_or_create_project(Path::new("/work/packages/sibling"))
+            .unwrap();
+        db.get_or_create_project(Path::new("/workspace")).unwrap();
+
+        let projects = db
+            .list_projects_for_path(Path::new("/work/packages/app/src/main.rs"))
+            .unwrap();
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            vec![nested.id, parent.id]
+        );
+    }
+
     // ── transactions ─────────────────────────────────────────────────
 
     /// A transaction that returns `Ok` commits every write inside it.
@@ -2694,6 +2786,49 @@ mod tests {
         let sessions = db.list_sessions(p.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "agent-auth-work");
+    }
+
+    /// Public Run ids are global identities for historical inspection and
+    /// recovery, while operational/name lookups remain project-scoped (#85).
+    #[test]
+    fn historical_run_lookup_crosses_projects_only_for_public_id() {
+        let db = db();
+        let parent = db.get_or_create_project(Path::new("/work")).unwrap();
+        let nested = db
+            .get_or_create_project(Path::new("/work/packages/app"))
+            .unwrap();
+        let nested_run = db
+            .start_run(
+                nested.id,
+                "nested-history",
+                "run",
+                "human",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            db.get_run_by_ref(parent.id, &nested_run.public_id())
+                .unwrap()
+                .is_none(),
+            "operational lookup must remain project-scoped"
+        );
+        assert_eq!(
+            db.get_historical_run_by_ref(&[parent.id], &nested_run.public_id())
+                .unwrap()
+                .unwrap()
+                .id,
+            nested_run.id
+        );
+        assert!(
+            db.get_historical_run_by_ref(&[parent.id], "nested-history")
+                .unwrap()
+                .is_none(),
+            "human-readable names must remain project-scoped"
+        );
     }
 
     #[test]

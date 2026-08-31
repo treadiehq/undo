@@ -49,30 +49,28 @@ pub fn ensure_recording(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Resolve which project root the current folder belongs to, *without* starting
-/// a recorder. An active daemon's root takes precedence (most specific wins),
-/// then a project already known to the database; an unknown path resolves to
-/// itself. This is the read-only half of [`ensure_recording_for_path`]: every
-/// command that maps a working directory to a project (`run start`/`stop` as
-/// well as read-only `run list`/`show`, `ask`, `restore`, …) must agree on the
-/// answer, otherwise a Run recorded under an active *parent* daemon becomes
-/// invisible to commands that would otherwise resolve to a more specific nested
-/// project record (#82).
+/// Resolve which ready recording project the current folder belongs to,
+/// *without* starting a recorder. A ready daemon's root takes precedence (most
+/// specific wins), then a project already known to the database; an unknown
+/// path resolves to itself. Ignoring still-starting daemons keeps read-only
+/// commands usable until the new root has a complete project row (#82, #87).
 pub fn recording_root_for_path(path: &Path) -> Result<PathBuf> {
     let path = path
         .canonicalize()
         .with_context(|| format!("cannot resolve recording folder {}", path.display()))?;
     let bt_dir = backtrack_dir()?;
+    let db = Database::open()?;
 
-    let active_roots = active_daemons(&bt_dir)
-        .into_iter()
-        .map(|(_, root)| root)
-        .collect::<Vec<_>>();
+    // Read-only commands must not follow a parent daemon until it is ready and
+    // has a project row. A daemon holds its flock while still "starting"; using
+    // that root early makes project lookup fail transiently for known nested
+    // projects. Overlap/write paths intentionally continue to use every live
+    // daemon regardless of readiness (#87).
+    let active_roots = ready_recording_roots(&bt_dir, &db)?;
     if let Some(root) = most_specific_parent(&path, active_roots.iter()) {
         return Ok(root.to_path_buf());
     }
 
-    let db = Database::open()?;
     let root = db
         .find_project_for_path(&path)?
         .map(|project| PathBuf::from(project.root_path))
@@ -81,13 +79,29 @@ pub fn recording_root_for_path(path: &Path) -> Result<PathBuf> {
 }
 
 /// Ensure recording for a path without creating a duplicate nested recorder.
-/// Active recorder roots take precedence, followed by a project already known
-/// to the database; only an unknown path becomes a new recorder root. This is
-/// the write half of [`recording_root_for_path`] — it resolves the same root
-/// and then guarantees a recorder is running for it.
+/// Every live recorder root takes precedence here, including a daemon that is
+/// still starting, so a concurrent caller cannot spawn an overlapping watcher.
+/// With no live owner, a ready/known project is resolved and started as needed.
 pub fn ensure_recording_for_path(path: &Path) -> Result<PathBuf> {
-    migrate_old_pid_file(&backtrack_dir()?)?;
-    let root = recording_root_for_path(path)?;
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve recording folder {}", path.display()))?;
+    let bt_dir = backtrack_dir()?;
+    migrate_old_pid_file(&bt_dir)?;
+
+    // A starting parent still owns this tree for write-side purposes. Returning
+    // it preserves overlap safety and avoids attempting to spawn a nested
+    // recorder while the parent is coming up. Read-only resolution uses the
+    // stricter readiness gate in `recording_root_for_path`.
+    let active_roots = active_daemons(&bt_dir)
+        .into_iter()
+        .map(|(_, root)| root)
+        .collect::<Vec<_>>();
+    if let Some(root) = most_specific_parent(&path, active_roots.iter()) {
+        return Ok(root.to_path_buf());
+    }
+
+    let root = recording_root_for_path(&path)?;
     ensure_recording(&root)?;
     Ok(root)
 }
@@ -293,27 +307,69 @@ fn system_uid_threshold() -> u32 {
     if cfg!(target_os = "macos") { 500 } else { 1000 }
 }
 
-/// Return all (pid, root_path) pairs from PID files whose daemons
-/// are genuinely alive (verified via flock, not just PID existence).
-fn active_daemons(bt_dir: &Path) -> Vec<(u32, PathBuf)> {
+#[derive(Debug)]
+struct LiveDaemon {
+    pid: u32,
+    root: PathBuf,
+    /// Current daemons write `starting` or `ready`. `None` represents the
+    /// legacy two-line PID format and is handled conservatively by readers.
+    state: Option<String>,
+}
+
+/// Parse every flock-backed live daemon once, including its optional readiness
+/// state. Callers then choose the semantics they need: overlap checks care only
+/// about liveness, while read-only project resolution also requires readiness.
+fn live_daemons(bt_dir: &Path) -> Vec<LiveDaemon> {
     let pids_dir = bt_dir.join("pids");
     let Ok(entries) = std::fs::read_dir(&pids_dir) else {
         return Vec::new();
     };
     entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pid"))
-        .filter_map(|e| {
-            if !is_daemon_alive(&e.path()) {
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|x| x.to_str()) == Some("pid"))
+        .filter_map(|entry| {
+            if !is_daemon_alive(&entry.path()) {
                 return None;
             }
-            let contents = std::fs::read_to_string(e.path()).ok()?;
+            let contents = std::fs::read_to_string(entry.path()).ok()?;
             let mut lines = contents.lines();
-            let pid: u32 = lines.next()?.parse().ok()?;
-            let root = PathBuf::from(lines.next()?);
-            Some((pid, root))
+            Some(LiveDaemon {
+                pid: lines.next()?.parse().ok()?,
+                root: PathBuf::from(lines.next()?),
+                state: lines.next().map(str::to_string),
+            })
         })
         .collect()
+}
+
+/// Return all (pid, root_path) pairs from PID files whose daemons
+/// are genuinely alive (verified via flock, not just PID existence).
+fn active_daemons(bt_dir: &Path) -> Vec<(u32, PathBuf)> {
+    live_daemons(bt_dir)
+        .into_iter()
+        .map(|daemon| (daemon.pid, daemon.root))
+        .collect()
+}
+
+/// Roots that are safe for read-only project resolution. A current-format
+/// daemon must report `ready`; a legacy two-line daemon is accepted only when
+/// its exact project row already exists. Requiring the project row for both
+/// formats also makes a malformed/stale `ready` PID fail closed instead of
+/// making every read command resolve to a nonexistent project (#87).
+fn ready_recording_roots(bt_dir: &Path, db: &Database) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for daemon in live_daemons(bt_dir) {
+        if !matches!(daemon.state.as_deref(), Some("ready") | None) {
+            continue;
+        }
+        let has_exact_project = db
+            .find_project_for_path(&daemon.root)?
+            .is_some_and(|project| Path::new(&project.root_path) == daemon.root);
+        if has_exact_project {
+            roots.push(daemon.root);
+        }
+    }
+    Ok(roots)
 }
 
 /// Refuse to start if another daemon is already watching a parent or child
@@ -825,7 +881,10 @@ mod tests {
         let nested = project.path().join("packages").join("app");
         std::fs::create_dir_all(&nested).unwrap();
         let project_root = project.path().canonicalize().unwrap();
-        let _lock = write_live_pid_file(data_dir.path(), &project_root.to_string_lossy());
+        let db = Database::open().unwrap();
+        db.get_or_create_project(&project_root).unwrap();
+        drop(db);
+        let _lock = write_live_pid_file_with_state(data_dir.path(), &project_root, Some("ready"));
 
         let resolved = recording_root_for_path(&nested).unwrap();
         assert_eq!(resolved, project_root);
@@ -833,6 +892,53 @@ mod tests {
             !pid_file_for_root(data_dir.path(), &nested.canonicalize().unwrap()).exists(),
             "resolving must not create a recorder marker for the nested path"
         );
+    }
+
+    /// A parent daemon that holds its flock but is still `starting` has no
+    /// usable recording project yet. Read-only resolution falls back to the
+    /// known nested project, while write-side resolution still recognizes the
+    /// live parent so it cannot spawn an overlapping nested recorder (#87).
+    #[test]
+    fn starting_parent_is_skipped_for_reads_but_kept_for_writes() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        std::fs::create_dir_all(data_dir.path().join("pids")).unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let parent_root = parent.path().canonicalize().unwrap();
+        let nested_root = parent_root.join("packages").join("app");
+        let inside = nested_root.join("src");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let db = Database::open().unwrap();
+        db.get_or_create_project(&nested_root).unwrap();
+        drop(db);
+        let _lock = write_live_pid_file_with_state(data_dir.path(), &parent_root, Some("starting"));
+
+        assert_eq!(recording_root_for_path(&inside).unwrap(), nested_root);
+        assert_eq!(ensure_recording_for_path(&inside).unwrap(), parent_root);
+    }
+
+    /// Running pre-state-format daemons remain readable after upgrading: the
+    /// exact project row distinguishes a genuinely initialized legacy daemon
+    /// from a partially written current-format PID file (#87).
+    #[test]
+    fn legacy_live_daemon_with_project_row_counts_as_ready() {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        std::fs::create_dir_all(data_dir.path().join("pids")).unwrap();
+
+        let parent = tempfile::tempdir().unwrap();
+        let parent_root = parent.path().canonicalize().unwrap();
+        let nested = parent_root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let db = Database::open().unwrap();
+        db.get_or_create_project(&parent_root).unwrap();
+        drop(db);
+        let _lock = write_live_pid_file(data_dir.path(), &parent_root.to_string_lossy());
+
+        assert_eq!(recording_root_for_path(&nested).unwrap(), parent_root);
     }
 
     /// With no live daemon, the resolver maps a subdirectory to its known project
@@ -925,7 +1031,15 @@ mod tests {
     /// `is_daemon_alive` returns true. Caller must keep the returned
     /// File alive for the duration of the test.
     fn write_live_pid_file(bt_dir: &Path, root: &str) -> std::fs::File {
-        let path = pid_file_for_root(bt_dir, Path::new(root));
+        write_live_pid_file_with_state(bt_dir, Path::new(root), None)
+    }
+
+    fn write_live_pid_file_with_state(
+        bt_dir: &Path,
+        root: &Path,
+        state: Option<&str>,
+    ) -> std::fs::File {
+        let path = pid_file_for_root(bt_dir, root);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -935,7 +1049,10 @@ mod tests {
             .unwrap();
         assert!(try_lock_exclusive(&file), "failed to lock test PID file");
         use std::io::Write;
-        write!(&file, "{}\n{}", std::process::id(), root).unwrap();
+        write!(&file, "{}\n{}", std::process::id(), root.display()).unwrap();
+        if let Some(state) = state {
+            write!(&file, "\n{state}").unwrap();
+        }
         file
     }
 
@@ -951,6 +1068,19 @@ mod tests {
         let bt = dir.path();
         std::fs::create_dir_all(bt.join("pids")).unwrap();
         let _lock = write_live_pid_file(bt, "/foo");
+
+        let err = check_no_overlap(bt, Path::new("/foo/bar"), FOREIGN_PID).unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "{}", err);
+    }
+
+    /// Readiness filtering must never weaken overlap prevention: a peer that is
+    /// still starting already owns its tree and must block a nested recorder.
+    #[test]
+    fn overlap_rejects_child_of_starting_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let bt = dir.path();
+        std::fs::create_dir_all(bt.join("pids")).unwrap();
+        let _lock = write_live_pid_file_with_state(bt, Path::new("/foo"), Some("starting"));
 
         let err = check_no_overlap(bt, Path::new("/foo/bar"), FOREIGN_PID).unwrap_err();
         assert!(err.to_string().contains("overlaps"), "{}", err);

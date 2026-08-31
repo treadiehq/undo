@@ -198,6 +198,19 @@ pub fn resolve_project(db: &db::Database, cwd: &Path) -> Result<models::WatchedP
     find_project(db, &root)
 }
 
+/// Load the project that owns a Run. Historical Run IDs remain globally
+/// referenceable even when the active recorder now belongs to a parent
+/// project, so all downstream display and recovery work must use the Run's
+/// stored `project_id` rather than re-resolving the current directory (#85).
+pub fn project_for_run(db: &db::Database, run: &models::Session) -> Result<models::WatchedProject> {
+    db.get_project_by_id(run.project_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Run {} belongs to a project that no longer exists",
+            run.public_id()
+        )
+    })
+}
+
 pub fn relative_path<'a>(abs_path: &'a str, project_root: &str) -> &'a str {
     abs_path
         .strip_prefix(project_root)
@@ -507,6 +520,25 @@ fn cmd_what_changed(duration_str: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Once a historical Run is found by its global public id, downstream
+    /// grouping and recovery must use the project stored on the Run rather than
+    /// the project selected by the currently active daemon (#85).
+    #[test]
+    fn project_for_run_uses_the_runs_stored_project() {
+        let db = db::Database::open_in_memory().unwrap();
+        let parent = db.get_or_create_project(Path::new("/work")).unwrap();
+        let nested = db
+            .get_or_create_project(Path::new("/work/packages/app"))
+            .unwrap();
+        let run = db
+            .start_run(nested.id, "history", "run", "human", None, None, None, None)
+            .unwrap();
+
+        let project = project_for_run(&db, &run).unwrap();
+        assert_eq!(project.id, nested.id);
+        assert_ne!(project.id, parent.id);
+    }
 
     /// The project root and leading slash are stripped to yield a clean relative path.
     #[test]

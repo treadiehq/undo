@@ -7,8 +7,15 @@ use std::path::Path;
 
 use crate::db::Database;
 use crate::models::FileEvent;
+use crate::restore::{self, RestoreKind};
 use crate::snapshots;
 use crate::{BOLD, DIM, GREEN, RED, RESET, resolve_project};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiffSelection {
+    hash: String,
+    deleted_fallback: bool,
+}
 
 /// Heuristic: treat content as binary if it contains a NUL byte within the
 /// first 8 KiB (same approach used by git and most editors).
@@ -78,23 +85,15 @@ pub fn cmd_diff(
     let abs_path = crate::safe_resolve_path(&cwd, path_str, &project.root_path)?;
     let abs_path_str = abs_path.to_string_lossy().to_string();
 
-    let event = match diff_event(&db, project.id, &abs_path_str, duration, checkpoint)? {
-        Some(e) => e,
+    let selection = match diff_selection(&db, project.id, &abs_path_str, duration, checkpoint)? {
+        Some(selection) => selection,
         None => {
             println!("No saved version matches this selection.");
             return Ok(());
         }
     };
 
-    let hash = match saved_hash_for_diff(&event) {
-        Some(h) => h,
-        None => {
-            println!("No saved version matches this selection.");
-            return Ok(());
-        }
-    };
-
-    let snapshot_content = snapshots::load(project.id, hash)?;
+    let snapshot_content = snapshots::load(project.id, &selection.hash)?;
 
     if is_binary(&snapshot_content) {
         println!("The selected saved version is binary, so a text comparison is not available.");
@@ -102,7 +101,7 @@ pub fn cmd_diff(
     }
 
     if !abs_path.exists() {
-        if event.event_type == "DELETED" {
+        if selection.deleted_fallback {
             println!(
                 "This file is deleted. Recover it with:\n  {}undo restore-deleted {:?}{}",
                 BOLD, path_str, RESET
@@ -152,28 +151,55 @@ pub fn cmd_diff(
     Ok(())
 }
 
-fn diff_event(
+fn diff_selection(
     db: &Database,
     project_id: i64,
     path: &str,
     duration: Option<&str>,
     checkpoint: Option<&str>,
-) -> Result<Option<FileEvent>> {
+) -> Result<Option<DiffSelection>> {
     match (duration, checkpoint) {
         (Some(_), Some(_)) => anyhow::bail!("use either a duration or --checkpoint, not both"),
         (Some(duration), None) => {
             let secs = crate::duration::parse_duration(duration)?;
             let target_time = chrono::Utc::now().timestamp().saturating_sub(secs);
-            db.get_event_at_time(project_id, path, target_time)
+            diff_selection_at_time(db, project_id, path, target_time)
         }
         (None, Some(name)) => {
             let checkpoint = db
                 .get_checkpoint_by_ref(project_id, name)?
                 .ok_or_else(|| anyhow::anyhow!("checkpoint '{}' not found", name))?;
-            db.get_event_at_time(project_id, path, checkpoint.timestamp)
+            diff_selection_at_time(db, project_id, path, checkpoint.timestamp)
         }
-        (None, None) => db.get_latest_event(project_id, path),
+        (None, None) => Ok(db
+            .get_latest_event(project_id, path)?
+            .and_then(diff_selection_from_event)),
     }
+}
+
+fn diff_selection_at_time(
+    db: &Database,
+    project_id: i64,
+    path: &str,
+    target_time: i64,
+) -> Result<Option<DiffSelection>> {
+    Ok(
+        restore::resolve_restore_source(db, project_id, path, target_time)?.map(|source| {
+            DiffSelection {
+                hash: source.hash,
+                deleted_fallback: source.kind == RestoreKind::DeletedFallback,
+            }
+        }),
+    )
+}
+
+fn diff_selection_from_event(event: FileEvent) -> Option<DiffSelection> {
+    let deleted_fallback = event.event_type == "DELETED";
+    let hash = saved_hash_for_diff(&event)?.to_string();
+    Some(DiffSelection {
+        hash,
+        deleted_fallback,
+    })
 }
 
 pub(crate) fn saved_hash_for_diff(event: &FileEvent) -> Option<&str> {
@@ -390,5 +416,102 @@ mod tests {
     fn deleted_event_without_previous_hash_has_no_saved_diff_source() {
         let e = event("DELETED", None, None);
         assert_eq!(saved_hash_for_diff(&e), None);
+    }
+
+    fn deleted_only_history() -> (Database, i64, String) {
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/project")).unwrap();
+        let path = "/project/deleted.txt".to_string();
+        db.insert_event(
+            project.id,
+            &path,
+            "DELETED",
+            None,
+            Some("last_live_hash"),
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+        (db, project.id, path)
+    }
+
+    /// When retention leaves only the DELETED row, duration and checkpoint
+    /// queries must still resolve its pinned previous_hash (#92).
+    #[test]
+    fn time_based_diff_recovers_deleted_only_history() {
+        let (db, project_id, path) = deleted_only_history();
+        db.create_checkpoint_now(project_id, None, "after-delete", None)
+            .unwrap();
+
+        for (selection, deleted_fallback) in [
+            (
+                diff_selection(&db, project_id, &path, Some("1s"), None).unwrap(),
+                false,
+            ),
+            (
+                diff_selection(&db, project_id, &path, None, Some("after-delete")).unwrap(),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                selection,
+                Some(DiffSelection {
+                    hash: "last_live_hash".to_string(),
+                    deleted_fallback,
+                })
+            );
+        }
+    }
+
+    /// A deletion after the selected boundary carries the exact pre-deletion
+    /// content in previous_hash, even if every older event was pruned.
+    #[test]
+    fn diff_uses_first_later_deletion_to_reconstruct_pruned_boundary() {
+        let (db, project_id, path) = deleted_only_history();
+        let selection = diff_selection_at_time(&db, project_id, &path, 0)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selection.hash, "last_live_hash");
+        assert!(
+            !selection.deleted_fallback,
+            "content immediately before a later deletion is an exact boundary source"
+        );
+    }
+
+    /// Rename-away events describe absence after the rename and the old path's
+    /// previous content before it. Reusing restore's resolver preserves both
+    /// sides without an ad-hoc old_path filter in diff.
+    #[test]
+    fn time_based_diff_preserves_rename_boundaries() {
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/project")).unwrap();
+        let old_path = "/project/old.txt";
+        db.insert_event(
+            project.id,
+            "/project/new.txt",
+            "RENAMED",
+            Some("renamed_hash"),
+            Some("old_path_hash"),
+            None,
+            Some(old_path),
+            Some(10),
+        )
+        .unwrap();
+
+        assert!(
+            diff_selection_at_time(&db, project.id, old_path, chrono::Utc::now().timestamp())
+                .unwrap()
+                .is_none(),
+            "the old path is absent after rename-away"
+        );
+        assert_eq!(
+            diff_selection_at_time(&db, project.id, old_path, 0)
+                .unwrap()
+                .map(|selection| selection.hash),
+            Some("old_path_hash".to_string()),
+            "the old path existed immediately before the rename"
+        );
     }
 }

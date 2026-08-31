@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::cli::RecoverArgs;
 use crate::db::Database;
 use crate::groups::{self, ChangeGroup};
-use crate::{BOLD, DIM, RESET, recoveries, resolve_project};
+use crate::{BOLD, DIM, RESET, project_for_run, recoveries, resolve_project};
 
 pub fn cmd_recover(args: &RecoverArgs) -> Result<()> {
     if !args.preview && !args.yes {
@@ -26,10 +26,12 @@ pub fn cmd_recover(args: &RecoverArgs) -> Result<()> {
         .expect("clap requires --run unless --before-change is present");
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = resolve_project(&db, &cwd)?;
+    let resolved_project = resolve_project(&db, &cwd)?;
+    let project_ids = crate::runs::run_context_project_ids(&db, &cwd, resolved_project.id)?;
     let session = db
-        .get_run_by_ref(project.id, run_ref)?
+        .get_historical_run_by_ref(&project_ids, run_ref)?
         .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", run_ref))?;
+    let project = project_for_run(&db, &session)?;
     let events = db.get_session_events(&session)?;
     if events.is_empty() {
         println!("Run {} has no recorded file changes.", session.public_id());

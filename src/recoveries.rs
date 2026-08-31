@@ -9,7 +9,7 @@ use crate::restore::{
     self, ExpectedState, RestoreAction, RestoreKind, RestorePlan, RestorePlanEntry, RestoreSource,
 };
 use crate::restore_fs::{CappedRead, ProjectPath, RestoreFs};
-use crate::{BOLD, DIM, GREEN, RESET, YELLOW, resolve_project, snapshots};
+use crate::{BOLD, DIM, GREEN, RESET, YELLOW, project_for_run, resolve_project, snapshots};
 
 enum StoredState {
     Present { hash: String, timestamp: i64 },
@@ -31,6 +31,12 @@ struct RecoverySpec<'a> {
     ambiguity: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryPresentation {
+    SavedPreview,
+    ImmediateApply,
+}
+
 pub fn create_run_recovery(
     run: &Session,
     paths: &[String],
@@ -41,11 +47,11 @@ pub fn create_run_recovery(
 ) -> Result<Recovery> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = resolve_project(&db, &cwd)?;
+    let project = project_for_run(&db, run)?;
     let recovery = create_run_recovery_in(
         &db, &project, &cwd, run, paths, request, kind, confidence, ambiguity,
     )?;
-    print_recovery(&db, &project, &recovery)?;
+    print_recovery(&db, &project, &recovery, RecoveryPresentation::SavedPreview)?;
     Ok(recovery)
 }
 
@@ -88,18 +94,19 @@ pub(crate) fn create_run_recovery_in(
     )
 }
 
-pub fn create_timestamp_recovery(
+pub(crate) fn create_timestamp_recovery(
     path: &str,
     target_timestamp: i64,
     request: &str,
     kind: &str,
+    presentation: RecoveryPresentation,
 ) -> Result<Recovery> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
     let project = resolve_project(&db, &cwd)?;
     let recovery =
         create_timestamp_recovery_in(&db, &project, &cwd, path, target_timestamp, request, kind)?;
-    print_recovery(&db, &project, &recovery)?;
+    print_recovery(&db, &project, &recovery, presentation)?;
     Ok(recovery)
 }
 
@@ -147,7 +154,7 @@ pub fn create_event_boundary_recovery(
         request,
         kind,
     )?;
-    print_recovery(&db, &project, &recovery)?;
+    print_recovery(&db, &project, &recovery, RecoveryPresentation::SavedPreview)?;
     Ok(recovery)
 }
 
@@ -196,9 +203,8 @@ pub fn create_intent_recovery(
             intent.label,
         )
     })?;
-    let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = resolve_project(&db, &cwd)?;
+    let project = project_for_run(&db, run)?;
     ensure_run_project(run, &project)?;
     let events = db.get_events_between_ids(project.id, intent.start_event_id, end_event_id)?;
     let paths = paths_from_events(&events);
@@ -247,7 +253,7 @@ pub fn create_intent_recovery(
         &plan,
     )?;
     drop(publish_guard);
-    print_recovery(&db, &project, &recovery)?;
+    print_recovery(&db, &project, &recovery, RecoveryPresentation::SavedPreview)?;
     Ok(recovery)
 }
 
@@ -448,7 +454,12 @@ fn select_recovery_entries(
         .collect())
 }
 
-pub fn print_recovery(db: &Database, project: &WatchedProject, recovery: &Recovery) -> Result<()> {
+fn print_recovery(
+    db: &Database,
+    project: &WatchedProject,
+    recovery: &Recovery,
+    presentation: RecoveryPresentation,
+) -> Result<()> {
     let entries = db.get_recovery_entries(recovery.id)?;
     println!(
         "{}Saved recovery plan {}.{}",
@@ -484,10 +495,21 @@ pub fn print_recovery(db: &Database, project: &WatchedProject, recovery: &Recove
         restore::print_restore_plan(project, &plan, &recovery.public_id())?;
     }
     println!(
-        "Apply this exact plan with: undo apply {}",
-        recovery.public_id()
+        "{}",
+        recovery_next_step_message(presentation, &recovery.public_id())
     );
     Ok(())
+}
+
+fn recovery_next_step_message(presentation: RecoveryPresentation, recovery_id: &str) -> String {
+    match presentation {
+        RecoveryPresentation::SavedPreview => {
+            format!("Apply this exact plan with: undo apply {recovery_id}")
+        }
+        RecoveryPresentation::ImmediateApply => {
+            "Applying this exact plan now because --yes was provided.".to_string()
+        }
+    }
 }
 
 fn confidence_label(confidence: &str) -> &str {
@@ -861,6 +883,22 @@ fn ensure_reported_paths_recoverable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_presentation_matches_the_callers_next_action() {
+        let preview = recovery_next_step_message(RecoveryPresentation::SavedPreview, "rec_12");
+        assert_eq!(preview, "Apply this exact plan with: undo apply rec_12");
+
+        let immediate = recovery_next_step_message(RecoveryPresentation::ImmediateApply, "rec_12");
+        assert_eq!(
+            immediate,
+            "Applying this exact plan now because --yes was provided."
+        );
+        assert!(
+            !immediate.contains("undo apply"),
+            "an auto-applied plan must not print a manual apply instruction"
+        );
+    }
 
     #[test]
     fn current_state_matches_present_and_absent_states() {

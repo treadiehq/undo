@@ -5,7 +5,9 @@ use std::path::Path;
 
 use crate::db::Database;
 use crate::models::{Session, WatchedProject};
-use crate::{BOLD, DIM, GREEN, RED, RESET, YELLOW, find_project, groups, resolve_project};
+use crate::{
+    BOLD, DIM, GREEN, RED, RESET, YELLOW, find_project, groups, project_for_run, resolve_project,
+};
 
 #[derive(Clone, Copy)]
 pub enum Output {
@@ -115,14 +117,12 @@ pub fn cmd_run_stop(reference: Option<&str>, status: &str, output: Output) -> Re
     let db = Database::open()?;
     let project = find_project(&db, &root)?;
     sync_project(&db, &project, &root)?;
-    let run = match reference {
-        Some(reference) => db
-            .get_run_by_ref(project.id, reference)?
-            .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", reference))?,
-        None => db
-            .get_active_session(project.id)?
-            .ok_or_else(|| anyhow::anyhow!("No active Run."))?,
-    };
+    let run = active_run_for_context(&db, &cwd, project.id, reference)?.ok_or_else(|| {
+        reference.map_or_else(
+            || anyhow::anyhow!("No active Run."),
+            |reference| anyhow::anyhow!("Run '{}' not found", reference),
+        )
+    })?;
     let run = db.complete_run(run.id, status)?;
     print_completed(&run, output);
     Ok(run)
@@ -132,7 +132,7 @@ pub fn cmd_runs(output: Output) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
     let project = resolve_project(&db, &cwd)?;
-    let runs = db.list_sessions(project.id)?;
+    let runs = list_runs_for_context(&db, &project, &cwd)?;
     if matches!(output, Output::Json) {
         let rows = runs
             .iter()
@@ -175,10 +175,12 @@ pub fn cmd_runs(output: Output) -> Result<()> {
 pub fn cmd_run_show(reference: &str, output: Output) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let db = Database::open()?;
-    let project = resolve_project(&db, &cwd)?;
+    let resolved_project = resolve_project(&db, &cwd)?;
+    let project_ids = run_context_project_ids(&db, &cwd, resolved_project.id)?;
     let run = db
-        .get_run_by_ref(project.id, reference)?
+        .get_historical_run_by_ref(&project_ids, reference)?
         .ok_or_else(|| anyhow::anyhow!("Run '{}' not found", reference))?;
+    let project = project_for_run(&db, &run)?;
     let events = db.get_session_events(&run)?;
     let intents = db.list_run_intents(run.id)?;
     let checkpoints = db
@@ -324,6 +326,118 @@ pub fn cmd_run_show(reference: &str, output: Output) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// List Runs from every watched project on the current directory's ancestor
+/// chain. This remains stable if recording moves from parent to nested or vice
+/// versa, without pulling in sibling project history (#85, #88).
+fn list_runs_for_context(
+    db: &Database,
+    recording_project: &WatchedProject,
+    cwd: &Path,
+) -> Result<Vec<Session>> {
+    let mut runs = Vec::new();
+    for project_id in run_context_project_ids(db, cwd, recording_project.id)? {
+        runs.extend(db.list_sessions(project_id)?);
+    }
+    runs.sort_by(|left, right| {
+        right
+            .started_at
+            .cmp(&left.started_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(runs)
+}
+
+/// Durable project context for Run history: every watched root containing cwd,
+/// independent of which daemon happens to be active now. The currently
+/// resolved project is included first as a defensive fallback (#85, #88).
+pub(crate) fn run_context_project_ids(
+    db: &Database,
+    cwd: &Path,
+    resolved_project_id: i64,
+) -> Result<Vec<i64>> {
+    let mut ids = vec![resolved_project_id];
+    for project in db.list_projects_for_path(cwd)? {
+        if !ids.contains(&project.id) {
+            ids.push(project.id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Find a Run within the cwd's durable project context. Unlike the historical
+/// public-id lookup, this never crosses into an unrelated project, so it is
+/// safe for state-changing operations such as `run stop`.
+pub(crate) fn find_run_in_context(
+    db: &Database,
+    project_ids: &[i64],
+    reference: &str,
+) -> Result<Option<Session>> {
+    let mut matches = Vec::new();
+    for project_id in project_ids {
+        if let Some(run) = db.get_run_by_ref(*project_id, reference)?
+            && !matches
+                .iter()
+                .any(|existing: &Session| existing.id == run.id)
+        {
+            matches.push(run);
+        }
+    }
+    match matches.as_slice() {
+        [] => Ok(None),
+        [run] => Ok(Some(run.clone())),
+        runs => {
+            let ids = runs
+                .iter()
+                .map(Session::public_id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Run name '{}' is ambiguous across projects ({ids}); use an r_<id> reference",
+                reference
+            )
+        }
+    }
+}
+
+/// Resolve the active Run to close across every project root containing cwd.
+/// A topology change may switch the daemon-selected project between start and
+/// stop, but the durable watched-project chain remains stable. Multiple active
+/// matches are never guessed; the caller must provide an explicit Run id.
+pub(crate) fn active_run_for_context(
+    db: &Database,
+    cwd: &Path,
+    resolved_project_id: i64,
+    reference: Option<&str>,
+) -> Result<Option<Session>> {
+    let project_ids = run_context_project_ids(db, cwd, resolved_project_id)?;
+    if let Some(reference) = reference {
+        // Preserve `complete_run`'s idempotency for an explicitly referenced
+        // already-complete Run; only the no-reference path requires active rows.
+        return find_run_in_context(db, &project_ids, reference);
+    }
+
+    let mut active = Vec::new();
+    for project_id in project_ids {
+        active.extend(db.list_active_runs(project_id)?);
+    }
+    active.sort_by_key(|run| std::cmp::Reverse(run.started_at));
+    match active.as_slice() {
+        [] => Ok(None),
+        [run] => Ok(Some(run.clone())),
+        runs => {
+            let ids = runs
+                .iter()
+                .map(Session::public_id)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "multiple Runs are active across this folder's project history ({ids}); \
+                 specify one with `undo run stop <RUN>`"
+            )
+        }
+    }
 }
 
 pub fn cmd_run_command(
@@ -598,6 +712,124 @@ fn print_completed(run: &Session, output: Output) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// With a parent project currently recording, `run list` includes Runs from
+    /// historical nested projects on the cwd path, but not sibling projects
+    /// under the same parent (#85).
+    #[test]
+    fn run_list_context_includes_nested_history_but_not_siblings() {
+        let db = Database::open_in_memory().unwrap();
+        let parent = db.get_or_create_project(Path::new("/work")).unwrap();
+        let nested = db
+            .get_or_create_project(Path::new("/work/packages/app"))
+            .unwrap();
+        let sibling = db
+            .get_or_create_project(Path::new("/work/packages/other"))
+            .unwrap();
+
+        let parent_run = db
+            .start_run(parent.id, "parent", "run", "human", None, None, None, None)
+            .unwrap();
+        let nested_run = db
+            .start_run(nested.id, "nested", "run", "human", None, None, None, None)
+            .unwrap();
+        db.start_run(
+            sibling.id, "sibling", "run", "human", None, None, None, None,
+        )
+        .unwrap();
+
+        for resolved in [&parent, &nested] {
+            let runs =
+                list_runs_for_context(&db, resolved, Path::new("/work/packages/app/src/main.rs"))
+                    .unwrap();
+            let ids = runs.iter().map(|run| run.id).collect::<BTreeSet<_>>();
+            assert_eq!(
+                ids,
+                BTreeSet::from([parent_run.id, nested_run.id]),
+                "list output must not change when daemon topology flips"
+            );
+        }
+    }
+
+    /// Stopping without an explicit id finds the sole active Run anywhere on
+    /// the cwd's watched-project ancestor chain, regardless of which project
+    /// the current daemon resolves to (#88).
+    #[test]
+    fn active_run_context_survives_parent_nested_topology_flips() {
+        let db = Database::open_in_memory().unwrap();
+        let parent = db.get_or_create_project(Path::new("/work")).unwrap();
+        let nested = db
+            .get_or_create_project(Path::new("/work/packages/app"))
+            .unwrap();
+        let cwd = Path::new("/work/packages/app/src");
+
+        let nested_run = db
+            .start_run(nested.id, "nested", "run", "human", None, None, None, None)
+            .unwrap();
+        let found = active_run_for_context(&db, cwd, parent.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, nested_run.id);
+        db.complete_run(nested_run.id, "completed").unwrap();
+
+        let parent_run = db
+            .start_run(parent.id, "parent", "run", "human", None, None, None, None)
+            .unwrap();
+        let found = active_run_for_context(&db, cwd, nested.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, parent_run.id);
+    }
+
+    /// If both parent and nested projects have active Runs, stop must never
+    /// guess. The error gives stable ids, and an explicit id selects only the
+    /// requested Run within the cwd context (#88).
+    #[test]
+    fn active_run_context_requires_id_when_multiple_runs_are_active() {
+        let db = Database::open_in_memory().unwrap();
+        let parent = db.get_or_create_project(Path::new("/work")).unwrap();
+        let nested = db
+            .get_or_create_project(Path::new("/work/packages/app"))
+            .unwrap();
+        let sibling = db
+            .get_or_create_project(Path::new("/work/packages/other"))
+            .unwrap();
+        let cwd = Path::new("/work/packages/app/src");
+        let parent_run = db
+            .start_run(parent.id, "same", "run", "human", None, None, None, None)
+            .unwrap();
+        let nested_run = db
+            .start_run(nested.id, "same", "run", "human", None, None, None, None)
+            .unwrap();
+        let sibling_run = db
+            .start_run(
+                sibling.id, "sibling", "run", "human", None, None, None, None,
+            )
+            .unwrap();
+
+        let error = active_run_for_context(&db, cwd, parent.id, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&parent_run.public_id()), "{error}");
+        assert!(error.contains(&nested_run.public_id()), "{error}");
+
+        let selected = active_run_for_context(&db, cwd, parent.id, Some(&nested_run.public_id()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, nested_run.id);
+
+        let name_error = active_run_for_context(&db, cwd, parent.id, Some("same"))
+            .unwrap_err()
+            .to_string();
+        assert!(name_error.contains("ambiguous"), "{name_error}");
+        assert!(
+            active_run_for_context(&db, cwd, parent.id, Some(&sibling_run.public_id()))
+                .unwrap()
+                .is_none(),
+            "state-changing lookup must not cross into a sibling project"
+        );
+    }
 
     #[test]
     fn known_agent_commands_are_identified() {

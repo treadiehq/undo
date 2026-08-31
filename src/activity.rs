@@ -193,6 +193,13 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
     let project = resolve_project(&db, &cwd)?;
     let since = Utc::now().timestamp().saturating_sub(PANIC_WINDOW_SECS);
     let events = db.get_events_since(project.id, since)?;
+    // Burst selection and the eventual `restore .` must describe the same
+    // subtree. Without this filter, a rapid change group in a sibling folder
+    // can choose the timestamp used to revert legitimate work under `cwd`.
+    // Include `old_path` so renames out of the subtree still count as activity
+    // that happened within it (#86).
+    let scope = cwd.to_string_lossy();
+    let events = events_in_scope(events, &scope);
     let bursts = detect_bursts(&events);
 
     if restore_before_latest_burst {
@@ -200,11 +207,17 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
             anyhow::bail!("No recent group of rapid file changes was found.");
         };
         let target = latest.start.saturating_sub(1);
+        println!("{}", panic_timing_warning());
+        println!(
+            "This restores by timestamp, so later changes in the current folder may also be changed or deleted."
+        );
+        println!();
         let recovery = crate::recoveries::create_timestamp_recovery(
             ".",
             target,
             "Emergency recovery to before the latest destructive burst",
             "panic",
+            crate::recoveries::RecoveryPresentation::ImmediateApply,
         )?;
         return crate::recoveries::cmd_apply(&recovery.public_id());
     }
@@ -259,11 +272,13 @@ pub fn cmd_panic(restore_before_latest_burst: bool, yes: bool) -> Result<()> {
     }
 
     println!();
-    println!(
-        "Emergency recovery uses timing, not task ownership. Prefer a Run or checkpoint when available."
-    );
+    println!("{}", panic_timing_warning());
     println!("Next: run the Preview command before using Restore.");
     Ok(())
+}
+
+fn panic_timing_warning() -> &'static str {
+    "Emergency recovery uses timing, not task ownership. Prefer a Run or checkpoint when available."
 }
 
 fn panic_restore_commands(target: i64) -> (String, String) {
@@ -292,6 +307,19 @@ fn filtered_checkpoints(
         checkpoints.retain(|c| c.timestamp >= since);
     }
     Ok(checkpoints)
+}
+
+fn events_in_scope(events: Vec<FileEvent>, scope: &str) -> Vec<FileEvent> {
+    events
+        .into_iter()
+        .filter(|event| {
+            crate::restore::path_in_scope(&event.path, scope)
+                || event
+                    .old_path
+                    .as_deref()
+                    .is_some_and(|path| crate::restore::path_in_scope(path, scope))
+        })
+        .collect()
 }
 
 fn detect_bursts(events: &[FileEvent]) -> Vec<Burst> {
@@ -439,6 +467,13 @@ fn event_color(event_type: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn panic_warning_explains_timestamp_scope() {
+        let warning = panic_timing_warning();
+        assert!(warning.contains("timing, not task ownership"));
+        assert!(warning.contains("Run or checkpoint"));
+    }
+
     fn event(id: i64, timestamp: i64, path: &str, event_type: &str) -> FileEvent {
         FileEvent {
             id,
@@ -452,6 +487,51 @@ mod tests {
             old_path: None,
             file_size: None,
         }
+    }
+
+    /// A qualifying burst in a sibling subtree must not choose the timestamp
+    /// for `panic --undo-burst` when the cwd itself has no burst (#86).
+    #[test]
+    fn panic_burst_detection_ignores_sibling_subtrees() {
+        let mut events = vec![
+            event(1, 100, "/parent/other/a.rs", "MODIFIED"),
+            event(2, 101, "/parent/other/b.rs", "MODIFIED"),
+            event(3, 102, "/parent/other/c.rs", "MODIFIED"),
+            event(4, 103, "/parent/other/d.rs", "MODIFIED"),
+            event(5, 104, "/parent/other/e.rs", "MODIFIED"),
+        ];
+        events.extend([
+            event(6, 200, "/parent/sub/one.rs", "MODIFIED"),
+            event(7, 230, "/parent/sub/two.rs", "MODIFIED"),
+            event(8, 260, "/parent/sub/three.rs", "MODIFIED"),
+        ]);
+
+        assert_eq!(
+            detect_bursts(&events).len(),
+            1,
+            "the project-wide stream contains a sibling burst"
+        );
+        let scoped = events_in_scope(events, "/parent/sub");
+        assert!(
+            detect_bursts(&scoped).is_empty(),
+            "cwd-scoped detection must refuse when only a sibling had a burst"
+        );
+    }
+
+    /// Rename activity belongs to the cwd when either endpoint is inside it,
+    /// while component-aware matching excludes shared-prefix siblings.
+    #[test]
+    fn panic_scope_includes_rename_old_path_and_rejects_prefix_siblings() {
+        let mut renamed_out = event(1, 100, "/parent/other/file.rs", "RENAMED");
+        renamed_out.old_path = Some("/parent/sub/file.rs".to_string());
+        let direct = event(2, 101, "/parent/sub/direct.rs", "MODIFIED");
+        let prefix_sibling = event(3, 102, "/parent/sub-old/file.rs", "MODIFIED");
+
+        let scoped = events_in_scope(vec![renamed_out, direct, prefix_sibling], "/parent/sub");
+        assert_eq!(
+            scoped.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     #[test]
