@@ -12,7 +12,7 @@ scripts, tools, and your own edits.
 curl -fsSL https://useundo.co/install.sh | bash
 ```
 
-Available for macOS and Linux.
+Available for macOS (Apple Silicon and Intel) and Linux (x86_64, glibc 2.36+).
 
 ## Set up automatic recording
 

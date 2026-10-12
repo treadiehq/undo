@@ -59,13 +59,14 @@ echo hello > /tmp/undo-test-proj/a.txt
 
 ## Tests and lints
 
-CI runs three checks (see `.github/workflows/ci.yml`); run them locally before
-opening a PR:
+CI runs Rust checks, installer regressions, and the web UI build (see
+`.github/workflows/ci.yml`). Run the relevant checks locally before opening a PR:
 
 ```bash
 cargo fmt --all --check                  # formatting
 cargo clippy --all-targets -- -D warnings # lints (warnings are errors)
 cargo test --all                          # unit tests
+python3 tests/test_install.py              # offline installer regressions (Python 3)
 ```
 
 `cargo fmt --all` (without `--check`) applies formatting. If you have

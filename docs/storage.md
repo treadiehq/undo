@@ -89,6 +89,12 @@ Built-in ignored names include:
 - `.env` and every `.env.*` variant;
 - files ending in `.pem`, `.key`, `.p12`, `.pfx`, or `.keystore`.
 
+Undo also always excludes its own restore staging and quarantine paths:
+`<name>.undo.partial.<pid>_<timestamp>.<attempt>` and the corresponding
+`.undo.displaced.` names. These internal paths cannot be opted back in with a
+negation rule; similarly named ordinary files remain recordable. Existing
+history is not rewritten by this filter.
+
 Add project-specific exclusions with gitignore syntax:
 
 ```text

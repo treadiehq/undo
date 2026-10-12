@@ -35,6 +35,9 @@ jobs:
       - name: Test
         run: cargo test --all
 
+      - name: Test installer
+        run: python3 tests/test_install.py
+
   webui:
     name: web UI build
     runs-on: ubuntu-latest

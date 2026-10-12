@@ -2,7 +2,7 @@
 
 ## Install
 
-On macOS or Linux:
+On macOS (Apple Silicon or Intel), or Linux x86_64 with glibc 2.36 or newer:
 
 ```bash
 curl -fsSL https://useundo.co/install.sh | bash

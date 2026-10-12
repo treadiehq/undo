@@ -783,6 +783,20 @@ fn process_event(
             if event.paths.len() >= 2 {
                 let old = &event.paths[0];
                 let new = &event.paths[1];
+                if crate::ignore::is_restore_temporary_path(old)
+                    || crate::ignore::is_restore_temporary_path(new)
+                {
+                    // Atomic exchange can leave `old` present with restored
+                    // bytes. Inspect the real endpoints rather than inventing
+                    // a deletion or recording an internal rename source. Hash
+                    // comparison deduplicates paired notifications, so bypass
+                    // the time debouncer for this reconciliation.
+                    let paths = [old, new]
+                        .into_iter()
+                        .filter_map(|path| path.to_str().map(str::to_owned))
+                        .collect::<Vec<_>>();
+                    return reconcile_paths(db, project, root, &paths);
+                }
                 let new_meta = symlink_metadata_timeout(new);
                 let new_is_dir = new_meta.as_ref().is_some_and(|m| m.is_dir());
                 if should_ignore_with_type(new, root, new_is_dir) {
@@ -1292,6 +1306,90 @@ mod tests {
             hashes.contains("overwritten_hash"),
             "overwritten destination hash must stay live while its DELETED event survives: {:?}",
             hashes
+        );
+    }
+
+    /// Atomic restore exchanges can report either rename direction. Record the
+    /// real file's final contents, never a deletion or an internal old_path.
+    #[test]
+    fn restore_rename_events_only_reconcile_the_real_file() {
+        use notify::event::RenameMode;
+
+        for temp_is_source in [false, true] {
+            let data_dir = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data_dir.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let root = tree.path();
+            crate::ignore::init(root);
+            let db = Database::open_in_memory().unwrap();
+            let project = db.get_or_create_project(root).unwrap();
+            let real = root.join("file.txt");
+            let temp = root.join("file.txt.undo.partial.123_456.0");
+            std::fs::write(&real, b"before").unwrap();
+            reconcile_paths(&db, &project, root, &[real.to_str().unwrap().to_string()]).unwrap();
+            std::fs::write(&real, b"restored content").unwrap();
+            std::fs::write(&temp, b"displaced content").unwrap();
+            let (old, new) = if temp_is_source {
+                (&temp, &real)
+            } else {
+                (&real, &temp)
+            };
+            let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(old.clone())
+                .add_path(new.clone());
+            process_event(&db, &project, root, event, &mut Debouncer::new(), false).unwrap();
+
+            let events = db.get_timeline(project.id, 20).unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.path == real.to_str().unwrap() && e.old_path.is_none())
+            );
+            let latest = db
+                .get_latest_event(project.id, real.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(latest.event_type, "MODIFIED");
+            assert_eq!(latest.current_hash, Some(compute_hash(b"restored content")));
+        }
+    }
+
+    /// Quarantining a real deletion must still record the deletion, without
+    /// creating a recoverable history entry for the quarantine file.
+    #[test]
+    fn restore_quarantine_records_only_the_real_deletion() {
+        use notify::event::RenameMode;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data_dir.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path();
+        crate::ignore::init(root);
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(root).unwrap();
+        let real = root.join("file.txt");
+        let temp = root.join("file.txt.undo.displaced.123_456.0");
+        std::fs::write(&real, b"before").unwrap();
+        reconcile_paths(&db, &project, root, &[real.to_str().unwrap().to_string()]).unwrap();
+        std::fs::rename(&real, &temp).unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(real.clone())
+            .add_path(temp);
+        process_event(&db, &project, root, event, &mut Debouncer::new(), false).unwrap();
+        let events = db.get_timeline(project.id, 20).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|e| e.path == real.to_str().unwrap() && e.old_path.is_none())
+        );
+        assert_eq!(
+            db.get_latest_event(project.id, real.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .event_type,
+            "DELETED"
         );
     }
 

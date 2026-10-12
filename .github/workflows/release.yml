@@ -27,6 +27,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust
+        if: runner.os == 'macOS'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -44,8 +45,26 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Compile against a fixed glibc baseline, independent of ubuntu-latest.
+      # Debian 12 supplies glibc 2.36; newer glibc distributions can run it too.
+      - name: Build Linux (glibc 2.36 baseline)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm \
+            --volume "$PWD:/work" --workdir /work \
+            rust:1-slim-bookworm \
+            cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify Linux binary on Debian 12
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm \
+            --volume "$PWD/target/${{ matrix.target }}/release:/release:ro" \
+            debian:bookworm-slim /release/undo --version
 
       - name: Package
         shell: bash

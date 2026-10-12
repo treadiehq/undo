@@ -1113,6 +1113,12 @@ mod tests {
         let (second_name, _second) = create_temp_file(&fs.project, OsStr::new("file.txt")).unwrap();
 
         assert_ne!(first_name, second_name);
+        assert!(crate::ignore::is_restore_temporary_path(Path::new(
+            &first_name
+        )));
+        assert!(crate::ignore::is_restore_temporary_path(Path::new(
+            &temporary_name(OsStr::new("file.txt"), "displaced", timestamp_nanos(), 0)
+        )));
         assert!(fs.project.symlink_metadata(&first_name).is_ok());
         assert!(fs.project.symlink_metadata(&second_name).is_ok());
     }

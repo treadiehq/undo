@@ -8,6 +8,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reache
 Entries below `v0.1.12` were reconstructed from release commit summaries; they
 describe the headline changes of each tag rather than an exhaustive list.
 
+## [Unreleased]
+
+## [0.2.12] — 2026-10-12
+
+- Linux releases now build against Debian 12's glibc 2.36 baseline and must
+  start successfully in a clean Debian 12 runtime before packaging.
+- The installer checks that the downloaded executable runs before replacing
+  an existing installation, and exits with an error on incompatible systems.
+- Recording excludes Undo's internal restore staging and quarantine files,
+  including when `.undoignore` contains a whitelist. Atomic restore rename
+  events record the actual project file state without internal rename paths.
+
 ## [0.2.10] — 2026-08-25
 
 - `undo ask` no longer reverts every change group when the request names a
@@ -314,7 +326,8 @@ describe the headline changes of each tag rather than an exhaustive list.
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.12...HEAD
+[0.2.12]: https://github.com/treadiehq/undo/compare/v0.2.11...v0.2.12
 [0.2.9]: https://github.com/treadiehq/undo/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/treadiehq/undo/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/treadiehq/undo/compare/v0.2.6...v0.2.7

@@ -41,11 +41,20 @@ URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY}-${LATEST}-
 
 echo "Downloading ${BINARY} ${LATEST} for ${TARGET}..."
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+UNDO_INSTALL_TMP=$(mktemp -d)
+trap 'rm -rf "$UNDO_INSTALL_TMP"' EXIT
 
-curl -fsSL "$URL" -o "${TMPDIR}/${BINARY}.tar.gz"
-tar xzf "${TMPDIR}/${BINARY}.tar.gz" -C "$TMPDIR"
+curl -fsSL "$URL" -o "${UNDO_INSTALL_TMP}/${BINARY}.tar.gz"
+tar xzf "${UNDO_INSTALL_TMP}/${BINARY}.tar.gz" -C "$UNDO_INSTALL_TMP"
+
+# Check the staged executable before replacing a working installation. In
+# particular, a missing glibc version must fail the installer, not just print
+# an error hidden by a successful `head` process at the end of a pipeline.
+chmod +x "${UNDO_INSTALL_TMP}/${BINARY}"
+if ! VERSION=$("${UNDO_INSTALL_TMP}/${BINARY}" --version); then
+  echo "Error: the downloaded ${BINARY} cannot run on this system; installation cancelled." >&2
+  exit 1
+fi
 
 # Install to /usr/local/bin if writable, otherwise ~/.local/bin
 INSTALL_DIR="/usr/local/bin"
@@ -54,8 +63,7 @@ if [ ! -w "$INSTALL_DIR" ]; then
   mkdir -p "$INSTALL_DIR"
 fi
 
-mv "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
-chmod +x "${INSTALL_DIR}/${BINARY}"
+mv "${UNDO_INSTALL_TMP}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
 
 echo ""
 echo "Installed ${BINARY} ${LATEST} to ${INSTALL_DIR}/${BINARY}"
@@ -68,6 +76,6 @@ if [ "$INSTALL_DIR" = "${HOME}/.local/bin" ]; then
 fi
 
 echo ""
-"${INSTALL_DIR}/${BINARY}" --help | head -1
+echo "$VERSION"
 echo ""
 echo "Run 'undo start' in any project directory to begin."
