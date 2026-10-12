@@ -30,9 +30,9 @@ fn apply_schema(conn: &Connection) -> Result<()> {
     )?;
 
     let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if schema_version > 4 {
+    if schema_version > 5 {
         anyhow::bail!(
-            "Undo data uses schema version {}, but this binary supports through version 4. \
+            "Undo data uses schema version {}, but this binary supports through version 5. \
              Upgrade Undo before opening this history.",
             schema_version
         );
@@ -188,6 +188,8 @@ fn apply_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_events_project_time
             ON file_events(project_id, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_events_project_id
+            ON file_events(project_id, id);
         CREATE INDEX IF NOT EXISTS idx_events_path
             ON file_events(project_id, path, timestamp);
         CREATE INDEX IF NOT EXISTS idx_state_project_path
@@ -261,8 +263,30 @@ fn apply_schema(conn: &Connection) -> Result<()> {
          WHERE status IS NULL OR status = '' OR (status = 'active' AND ended_at IS NOT NULL)",
         [],
     )?;
-    conn.pragma_update(None, "user_version", 4)?;
+    if schema_version < 5 {
+        migrate_window_run_events_v5(conn)?;
+    }
 
+    Ok(())
+}
+
+/// Old window attribution also filtered by wall-clock timestamps, which could
+/// omit retained events after a clock step. Repair completed windows from their
+/// durable event boundaries; reported Runs keep only their explicit claims.
+fn migrate_window_run_events_v5(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT OR IGNORE INTO session_events (session_id, event_id)
+         SELECT s.id, e.id
+         FROM sessions s
+         JOIN file_events e ON e.project_id = s.project_id
+             AND e.id > s.start_event_id AND e.id <= s.end_event_id
+         WHERE s.attribution_mode = 'window'
+           AND s.ended_at IS NOT NULL AND s.end_event_id IS NOT NULL",
+        [],
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -440,6 +464,16 @@ impl Database {
         Ok(())
     }
 
+    /// Set a recorded event's timestamp for deterministic history tests.
+    #[cfg(test)]
+    pub(crate) fn set_event_timestamp(&self, event_id: i64, timestamp: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE file_events SET timestamp = ?1 WHERE id = ?2",
+            params![timestamp, event_id],
+        )?;
+        Ok(())
+    }
+
     // ── project operations ──────────────────────────────────────────
 
     pub fn get_or_create_project(&self, root_path: &Path) -> Result<WatchedProject> {
@@ -580,19 +614,40 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_timeline(&self, project_id: i64, limit: usize) -> Result<Vec<FileEvent>> {
+    /// Apply timeline filters before limiting the newest matching events.
+    /// Deletion activity includes events with no recoverable previous snapshot.
+    pub fn get_timeline_filtered(
+        &self,
+        project_id: i64,
+        since_timestamp: Option<i64>,
+        limit: usize,
+        deleted_only: bool,
+    ) -> Result<Vec<FileEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, timestamp, path, event_type,
                     current_hash, previous_hash, snapshot_path, old_path, file_size
              FROM file_events
-             WHERE project_id = ?1
+             WHERE project_id = ?1 AND timestamp >= ?2
+               AND (?3 = 0 OR event_type = 'DELETED')
              ORDER BY timestamp DESC, id DESC
-             LIMIT ?2",
+             LIMIT ?4",
         )?;
-        let events = stmt.query_map(params![project_id, limit as i64], row_to_event)?;
+        let events = stmt.query_map(
+            params![
+                project_id,
+                since_timestamp.unwrap_or(i64::MIN),
+                deleted_only,
+                limit as i64
+            ],
+            row_to_event,
+        )?;
         events
             .collect::<Result<Vec<_>, _>>()
             .context("failed to query timeline")
+    }
+
+    pub fn get_timeline(&self, project_id: i64, limit: usize) -> Result<Vec<FileEvent>> {
+        self.get_timeline_filtered(project_id, None, limit, false)
     }
 
     pub fn get_events_since(
@@ -619,21 +674,7 @@ impl Database {
         since_timestamp: i64,
         limit: usize,
     ) -> Result<Vec<FileEvent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, timestamp, path, event_type,
-                    current_hash, previous_hash, snapshot_path, old_path, file_size
-             FROM file_events
-             WHERE project_id = ?1 AND timestamp >= ?2
-             ORDER BY timestamp DESC, id DESC
-             LIMIT ?3",
-        )?;
-        let events = stmt.query_map(
-            params![project_id, since_timestamp, limit as i64],
-            row_to_event,
-        )?;
-        events
-            .collect::<Result<Vec<_>, _>>()
-            .context("failed to query limited events")
+        self.get_timeline_filtered(project_id, Some(since_timestamp), limit, false)
     }
 
     pub fn get_latest_event(&self, project_id: i64, path: &str) -> Result<Option<FileEvent>> {
@@ -1175,8 +1216,6 @@ impl Database {
                 db.link_session_events(
                     session.id,
                     session.project_id,
-                    session.started_at,
-                    ended_at,
                     session.start_event_id,
                     end_event_id,
                 )?;
@@ -1250,13 +1289,7 @@ impl Database {
     }
 
     pub fn get_session_events(&self, session: &Session) -> Result<Vec<FileEvent>> {
-        let mapped_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
-
-        if mapped_count > 0 || session.is_reported() {
+        if session.is_reported() {
             let mut stmt = self.conn.prepare(
                 "SELECT e.id, e.project_id, e.timestamp, e.path, e.event_type,
                         e.current_hash, e.previous_hash, e.snapshot_path, e.old_path, e.file_size
@@ -1271,7 +1304,9 @@ impl Database {
                 .context("failed to query mapped session events");
         }
 
-        let ended_at = session.ended_at.unwrap_or_else(|| Utc::now().timestamp());
+        // Window membership is defined by committed event IDs. Older versions
+        // may have saved incomplete links when the wall clock stepped, so use
+        // these boundaries even when some session_events rows already exist.
         let end_event_id = match session.end_event_id {
             Some(id) => id,
             None => self.max_event_id(session.project_id)?,
@@ -1283,18 +1318,10 @@ impl Database {
              WHERE project_id = ?1
                AND id > ?2
                AND id <= ?3
-               AND timestamp >= ?4
-               AND timestamp <= ?5
              ORDER BY timestamp DESC, id DESC",
         )?;
         let events = stmt.query_map(
-            params![
-                session.project_id,
-                session.start_event_id,
-                end_event_id,
-                session.started_at,
-                ended_at
-            ],
+            params![session.project_id, session.start_event_id, end_event_id],
             row_to_event,
         )?;
         events
@@ -1733,8 +1760,6 @@ impl Database {
         &self,
         session_id: i64,
         project_id: i64,
-        started_at: i64,
-        ended_at: i64,
         start_event_id: i64,
         end_event_id: i64,
     ) -> Result<()> {
@@ -1744,17 +1769,8 @@ impl Database {
              FROM file_events
              WHERE project_id = ?2
                AND id > ?3
-               AND id <= ?4
-               AND timestamp >= ?5
-               AND timestamp <= ?6",
-            params![
-                session_id,
-                project_id,
-                start_event_id,
-                end_event_id,
-                started_at,
-                ended_at
-            ],
+               AND id <= ?4",
+            params![session_id, project_id, start_event_id, end_event_id],
         )?;
         Ok(())
     }
@@ -2640,6 +2656,117 @@ mod tests {
         assert_eq!(events[1].path, "/home/user/project/second.rs");
     }
 
+    /// Newer mixed activity must not consume a deletion-only timeline's limit.
+    /// All deletion activity belongs here, including events without snapshots.
+    #[test]
+    fn timeline_deleted_filter_precedes_limit() {
+        let db = db();
+        let p = project(&db);
+        let mut deletion_ids = Vec::new();
+        for i in 0..20 {
+            db.insert_event(
+                p.id,
+                &format!("/home/user/project/deleted-{i}.rs"),
+                "DELETED",
+                None,
+                (i == 0).then_some("retained-hash"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let id = db.max_event_id(p.id).unwrap();
+            db.set_event_timestamp(id, 100).unwrap();
+            deletion_ids.push(id);
+        }
+        for i in 0..20 {
+            db.insert_event_at(
+                p.id,
+                &format!("/home/user/project/modified-{i}.rs"),
+                "MODIFIED",
+                100,
+            )
+            .unwrap();
+        }
+        deletion_ids.reverse();
+        assert_eq!(db.get_deleted_events(p.id, 20).unwrap().len(), 1);
+
+        for since in [None, Some(100)] {
+            for limit in [1, 3, 20] {
+                let events = db.get_timeline_filtered(p.id, since, limit, true).unwrap();
+                assert_eq!(
+                    events.iter().map(|event| event.id).collect::<Vec<_>>(),
+                    deletion_ids[..limit],
+                    "since={since:?}, limit={limit}"
+                );
+                assert!(events.iter().all(|event| event.event_type == "DELETED"));
+            }
+        }
+        // Existing unfiltered callers (including the web UI) keep their window.
+        for events in [
+            db.get_timeline(p.id, 20).unwrap(),
+            db.get_events_since_limited(p.id, 100, 20).unwrap(),
+        ] {
+            assert_eq!(events.len(), 20);
+            assert!(events.iter().all(|event| event.event_type == "MODIFIED"));
+        }
+    }
+
+    /// Deletion filtering must preserve the inclusive time boundary and project
+    /// scope, even when another project's deletion is the newest event.
+    #[test]
+    fn timeline_deleted_filter_respects_time_and_project() {
+        let db = db();
+        let p = project(&db);
+        let other = db.get_or_create_project(Path::new("/other")).unwrap();
+        for (timestamp, name, kind) in [
+            (99, "outside", "DELETED"),
+            (100, "boundary", "DELETED"),
+            (101, "inside", "DELETED"),
+            (102, "modified", "MODIFIED"),
+        ] {
+            db.insert_event_at(
+                p.id,
+                &format!("/home/user/project/{name}.rs"),
+                kind,
+                timestamp,
+            )
+            .unwrap();
+        }
+        db.insert_event_at(other.id, "/other/deleted.rs", "DELETED", 999)
+            .unwrap();
+
+        let events = db.get_timeline_filtered(p.id, Some(100), 10, true).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            [101, 100]
+        );
+        assert!(events.iter().all(|event| event.project_id == p.id));
+        assert_eq!(
+            db.get_timeline_filtered(p.id, Some(100), 1, true)
+                .unwrap()
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            [101]
+        );
+        assert!(
+            db.get_timeline_filtered(p.id, Some(102), 10, true)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_timeline_filtered(p.id, None, 10, true)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(db.get_events_since_limited(p.id, 100, 3).unwrap().len(), 3);
+    }
+
     /// Same-second events must resolve deterministically to the newest inserted
     /// row, otherwise preview and restore can disagree during rapid edits.
     #[test]
@@ -3280,8 +3407,8 @@ mod tests {
         assert!(error.contains("different payload"), "{error}");
     }
 
-    /// Stopping a session snapshots the events that landed inside its time
-    /// window into session_events, so later recovery can use stable membership.
+    /// Stopping a session links the events inside its event-ID boundaries, so
+    /// later attribution queries can use stable membership.
     #[test]
     fn session_stop_links_events_in_window() {
         let db = db();
@@ -3348,6 +3475,291 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(paths, vec!["/home/user/project/src/agent.rs"]);
+    }
+
+    /// Wall-clock steps must not change Run membership, including when every
+    /// event falls outside its timestamps. Project and event-ID bounds still apply.
+    #[test]
+    fn window_run_membership_ignores_clock_steps() {
+        for offset in [-5, 1000] {
+            for include_normal in [false, true] {
+                let db = db();
+                let p = project(&db);
+                let other = db.get_or_create_project(Path::new("/other")).unwrap();
+                let now = Utc::now().timestamp();
+                db.insert_event_at(p.id, "/home/user/project/before.rs", "CREATED", now)
+                    .unwrap();
+                let run = db.start_session(p.id, "clock-step", "manual").unwrap();
+                let mut expected = BTreeSet::new();
+                if include_normal {
+                    db.insert_event_at(
+                        p.id,
+                        "/home/user/project/normal.rs",
+                        "CREATED",
+                        run.started_at,
+                    )
+                    .unwrap();
+                    expected.insert(db.max_event_id(p.id).unwrap());
+                }
+                db.insert_event_at(other.id, "/other/file.rs", "CREATED", run.started_at)
+                    .unwrap();
+                db.insert_event_at(
+                    p.id,
+                    "/home/user/project/skewed.rs",
+                    "CREATED",
+                    run.started_at + offset,
+                )
+                .unwrap();
+                expected.insert(db.max_event_id(p.id).unwrap());
+                let event_ids = |run: &Session| {
+                    db.get_session_events(run)
+                        .unwrap()
+                        .into_iter()
+                        .map(|e| e.id)
+                        .collect::<BTreeSet<_>>()
+                };
+                assert_eq!(
+                    event_ids(&run),
+                    expected,
+                    "active: offset={offset}, normal={include_normal}"
+                );
+
+                let completed = db.complete_run(run.id, "completed").unwrap();
+                db.insert_event_at(
+                    p.id,
+                    "/home/user/project/after.rs",
+                    "CREATED",
+                    run.started_at,
+                )
+                .unwrap();
+                assert_eq!(
+                    event_ids(&completed),
+                    expected,
+                    "completed: offset={offset}, normal={include_normal}"
+                );
+                assert_eq!(
+                    db.count_run_claimed_events(run.id).unwrap() as usize,
+                    expected.len()
+                );
+                for id in expected {
+                    assert_eq!(db.event_claim_count(id).unwrap(), 1);
+                }
+            }
+        }
+    }
+
+    /// Cached links are not authoritative for window Runs: an older version
+    /// may have saved only the events whose wall-clock timestamps matched.
+    #[test]
+    fn window_run_reads_include_events_missing_from_saved_mapping() {
+        let db = db();
+        let p = project(&db);
+        let run = db.start_session(p.id, "partial", "manual").unwrap();
+        db.insert_event_at(
+            p.id,
+            "/home/user/project/normal.rs",
+            "CREATED",
+            run.started_at,
+        )
+        .unwrap();
+        db.insert_event_at(
+            p.id,
+            "/home/user/project/skewed.rs",
+            "CREATED",
+            run.started_at - 5,
+        )
+        .unwrap();
+        let missing_id = db.max_event_id(p.id).unwrap();
+        let completed = db.complete_run(run.id, "completed").unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM session_events WHERE event_id = ?1",
+                params![missing_id],
+            )
+            .unwrap();
+        assert_eq!(db.count_run_claimed_events(run.id).unwrap(), 1);
+        assert_eq!(db.get_session_events(&completed).unwrap().len(), 2);
+    }
+
+    /// Reopening v4 history repairs both partial and empty window mappings,
+    /// without claiming active windows or unreported paths in reported Runs.
+    #[test]
+    fn migration_repairs_window_run_links_after_clock_steps() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let db = Database::open().unwrap();
+        let p = project(&db);
+        let other = db.get_or_create_project(Path::new("/other")).unwrap();
+        let mut windows = Vec::new();
+        let mut window_ids = Vec::new();
+        let mut other_ids = Vec::new();
+        db.insert_event_at(p.id, "/home/user/project/before.rs", "CREATED", 0)
+            .unwrap();
+        let before_id = db.max_event_id(p.id).unwrap();
+        for (name, include_normal, offset) in [("partial", true, -5), ("empty", false, 1000)] {
+            let run = db.start_session(p.id, name, "manual").unwrap();
+            if include_normal {
+                db.insert_event_at(
+                    p.id,
+                    "/home/user/project/normal.rs",
+                    "CREATED",
+                    run.started_at,
+                )
+                .unwrap();
+                window_ids.push(db.max_event_id(p.id).unwrap());
+            }
+            db.insert_event_at(other.id, "/other/file.rs", "CREATED", run.started_at)
+                .unwrap();
+            other_ids.push(db.max_event_id(other.id).unwrap());
+            db.insert_event_at(
+                p.id,
+                "/home/user/project/skewed.rs",
+                "CREATED",
+                run.started_at + offset,
+            )
+            .unwrap();
+            let missing_id = db.max_event_id(p.id).unwrap();
+            window_ids.push(missing_id);
+            windows.push(db.complete_run(run.id, "completed").unwrap());
+            db.conn
+                .execute(
+                    "DELETE FROM session_events WHERE event_id = ?1",
+                    params![missing_id],
+                )
+                .unwrap();
+        }
+        let reported = db
+            .start_reported_run(
+                p.id,
+                "reported",
+                "hook",
+                "agent",
+                None,
+                None,
+                None,
+                "reported:clock-step",
+            )
+            .unwrap();
+        let claimed = "/home/user/project/claimed.rs".to_string();
+        db.open_run_boundary(reported.id, "change", std::slice::from_ref(&claimed))
+            .unwrap();
+        db.insert_event_at(p.id, &claimed, "CREATED", reported.started_at - 5)
+            .unwrap();
+        let claimed_id = db.max_event_id(p.id).unwrap();
+        db.insert_event_at(
+            p.id,
+            "/home/user/project/unclaimed.rs",
+            "CREATED",
+            reported.started_at,
+        )
+        .unwrap();
+        let unclaimed_id = db.max_event_id(p.id).unwrap();
+        db.close_run_boundary(reported.id, "change", std::slice::from_ref(&claimed))
+            .unwrap();
+        let reported = db.complete_run(reported.id, "completed").unwrap();
+        let empty_reported = db
+            .start_reported_run(
+                p.id,
+                "no-claims",
+                "hook",
+                "agent",
+                None,
+                None,
+                None,
+                "reported:empty",
+            )
+            .unwrap();
+        db.insert_event_at(
+            p.id,
+            "/home/user/project/no-claim.rs",
+            "CREATED",
+            empty_reported.started_at,
+        )
+        .unwrap();
+        let empty_reported = db.complete_run(empty_reported.id, "completed").unwrap();
+        let active = db.start_session(p.id, "active", "manual").unwrap();
+        db.insert_event_at(
+            p.id,
+            "/home/user/project/active.rs",
+            "CREATED",
+            active.started_at - 5,
+        )
+        .unwrap();
+        let active_id = db.max_event_id(p.id).unwrap();
+        db.conn.pragma_update(None, "user_version", 4).unwrap();
+        drop(db);
+
+        // A second open also checks migration idempotence.
+        for _ in 0..2 {
+            let db = Database::open().unwrap();
+            let version: i64 = db
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 5);
+            assert_eq!(db.count_run_claimed_events(windows[0].id).unwrap(), 2);
+            assert_eq!(db.count_run_claimed_events(windows[1].id).unwrap(), 1);
+            for run in &windows {
+                assert_eq!(
+                    db.get_session_events(run).unwrap().len() as i64,
+                    db.count_run_claimed_events(run.id).unwrap()
+                );
+            }
+            for &id in &window_ids {
+                assert_eq!(db.event_claim_count(id).unwrap(), 1);
+            }
+            for &id in &other_ids {
+                assert_eq!(db.event_claim_count(id).unwrap(), 0);
+            }
+            assert_eq!(db.event_claim_count(before_id).unwrap(), 0);
+            assert_eq!(db.event_claim_count(unclaimed_id).unwrap(), 0);
+            assert_eq!(db.event_claim_count(active_id).unwrap(), 0);
+            assert_eq!(db.count_run_claimed_events(active.id).unwrap(), 0);
+            assert_eq!(db.get_session_events(&active).unwrap().len(), 1);
+            assert_eq!(db.count_run_claimed_events(reported.id).unwrap(), 1);
+            assert_eq!(db.get_session_events(&reported).unwrap()[0].id, claimed_id);
+            assert_eq!(db.count_run_claimed_events(empty_reported.id).unwrap(), 0);
+            assert!(db.get_session_events(&empty_reported).unwrap().is_empty());
+        }
+    }
+
+    /// An interrupted repair must leave the old version retryable and must not
+    /// publish a subset of new mappings before reporting a migration failure.
+    #[test]
+    fn window_run_migration_rolls_back_on_failure() {
+        let db = db();
+        let p = project(&db);
+        let run = db.start_session(p.id, "repair", "manual").unwrap();
+        for name in ["first", "second"] {
+            db.insert_event_at(
+                p.id,
+                &format!("/home/user/project/{name}.rs"),
+                "CREATED",
+                run.started_at,
+            )
+            .unwrap();
+        }
+        db.complete_run(run.id, "completed").unwrap();
+        db.conn
+            .execute_batch(
+                "DELETE FROM session_events;
+             PRAGMA user_version = 4;
+             CREATE TRIGGER fail_window_repair BEFORE INSERT ON session_events
+             WHEN NEW.event_id = 2 BEGIN SELECT RAISE(ABORT, 'repair failed'); END;",
+            )
+            .unwrap();
+        assert!(apply_schema(&db.conn).is_err());
+        assert_eq!(db.count_run_claimed_events(run.id).unwrap(), 0);
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        db.conn
+            .execute_batch("DROP TRIGGER fail_window_repair;")
+            .unwrap();
+        apply_schema(&db.conn).unwrap();
+        assert_eq!(db.count_run_claimed_events(run.id).unwrap(), 2);
     }
 
     #[test]
@@ -3592,7 +4004,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let db = Database { conn };
         let legacy = db.get_session_by_id(7).unwrap().unwrap();

@@ -27,11 +27,12 @@ pub fn is_recording(root: &Path) -> Result<bool> {
 /// Ensure continuous history is active before opening a Run. Returns true when
 /// this call started the recorder and false when one was already running.
 pub fn ensure_recording(root: &Path) -> Result<bool> {
+    let bt_dir = backtrack_dir()?;
+    check_no_legacy_overlap(&bt_dir, root)?;
     if is_recording(root)? {
         return Ok(false);
     }
 
-    let bt_dir = backtrack_dir()?;
     let log_path = crate::logging::log_path(&bt_dir);
     let log_cursor = startup_log_cursor(&log_path);
     let executable = std::env::current_exe()?;
@@ -87,7 +88,7 @@ pub fn ensure_recording_for_path(path: &Path) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("cannot resolve recording folder {}", path.display()))?;
     let bt_dir = backtrack_dir()?;
-    migrate_old_pid_file(&bt_dir)?;
+    check_no_legacy_overlap(&bt_dir, &path)?;
 
     // A starting parent still owns this tree for write-side purposes. Returning
     // it preserves overlap safety and avoids attempting to spawn a nested
@@ -240,23 +241,117 @@ fn is_structured_log_line(line: &str) -> bool {
             .any(|level| message.starts_with(level))
 }
 
-/// Migrate the old singleton `~/.undo/pid` to the new per-project layout.
-/// Called once at the top of `cmd_start` and `cmd_stop` so old daemons
-/// are visible after an upgrade.
-fn migrate_old_pid_file(bt_dir: &Path) -> Result<()> {
-    let old_pid = bt_dir.join("pid");
-    if !old_pid.exists() {
-        return Ok(());
+/// Include the singleton marker without copying it: an older recorder cannot
+/// acquire a lock on a replacement file, so migration would hide a live owner.
+fn recorder_markers(bt_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut markers = Vec::new();
+    let singleton = bt_dir.join("pid");
+    if singleton.exists() {
+        markers.push(singleton);
     }
-    let contents = std::fs::read_to_string(&old_pid)?;
-    if let Some(root_line) = contents.lines().nth(1) {
-        let root = Path::new(root_line);
-        let new_path = pid_file_for_root(bt_dir, root);
-        if !new_path.exists() {
-            std::fs::write(&new_path, &contents)?;
+    match std::fs::read_dir(bt_dir.join("pids")) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().and_then(|extension| extension.to_str()) == Some("pid") {
+                    markers.push(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    markers.sort();
+    Ok(markers)
+}
+
+struct LegacyRecorder {
+    pid: i32,
+    root: PathBuf,
+    marker: PathBuf,
+}
+
+impl LegacyRecorder {
+    fn guidance(&self) -> String {
+        format!(
+            "A legacy recorder may still be running for {} (PID {}).\n\
+             Stop it with Ctrl-C in its original terminal, then retry.\n\
+             If it has already stopped, verify that this PID belongs to another process or no longer exists before removing the stale marker: {}\n\
+             Undo has preserved the marker and has not sent a signal to this unverified PID.",
+            self.root.display(),
+            self.pid,
+            self.marker.display(),
+        )
+    }
+}
+
+/// PID existence is used only to refuse unsafe actions, never to authorize a
+/// signal. Only ESRCH proves absence; permission or other probe errors do not.
+fn pid_may_be_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn legacy_recorder_at(marker: &Path) -> Result<Option<LegacyRecorder>> {
+    let contents = match std::fs::read_to_string(marker) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", marker.display()));
+        }
+    };
+    let mut lines = contents.lines();
+    let Some(pid) = lines
+        .next()
+        .and_then(|line| line.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return Ok(None);
+    };
+    let Some(root) = lines
+        .next()
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+    else {
+        return Ok(None);
+    };
+    // Both pre-v0.1.9 layouts had two lines and no lock. Later two-line
+    // recorders that do hold a lock remain on the normal verified path.
+    if lines.next().is_some() || is_daemon_alive(marker) || !pid_may_be_running(pid) {
+        return Ok(None);
+    }
+    Ok(Some(LegacyRecorder {
+        pid,
+        root,
+        marker: marker.to_path_buf(),
+    }))
+}
+
+fn roots_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn legacy_overlap_message(bt_dir: &Path, root: &Path) -> Result<Option<String>> {
+    let mut messages = Vec::new();
+    for marker in recorder_markers(bt_dir)? {
+        if let Some(legacy) = legacy_recorder_at(&marker)?
+            && roots_overlap(root, &legacy.root)
+        {
+            messages.push(legacy.guidance());
         }
     }
-    let _ = std::fs::remove_file(&old_pid);
+    Ok((!messages.is_empty()).then(|| messages.join("\n\n")))
+}
+
+fn check_no_legacy_overlap(bt_dir: &Path, root: &Path) -> Result<()> {
+    if let Some(message) = legacy_overlap_message(bt_dir, root)? {
+        anyhow::bail!("{message}");
+    }
     Ok(())
 }
 
@@ -382,23 +477,12 @@ fn ready_recording_roots(bt_dir: &Path, db: &Database) -> Result<Vec<PathBuf>> {
 /// so `is_daemon_alive` would otherwise report our own pid file as alive and
 /// the equal-paths branch below would self-reject every fresh `undo start`.
 fn check_no_overlap(bt_dir: &Path, new_root: &Path, exclude_pid: u32) -> Result<()> {
-    let new_str = new_root.to_string_lossy();
+    check_no_legacy_overlap(bt_dir, new_root)?;
     for (pid, existing) in active_daemons(bt_dir) {
         if pid == exclude_pid {
             continue;
         }
-        let ex_str = existing.to_string_lossy();
-
-        let overlap = if new_str.len() >= ex_str.len() {
-            // new_root is equal to or a child of existing
-            new_str.starts_with(ex_str.as_ref())
-                && (new_str.len() == ex_str.len() || new_str.as_bytes()[ex_str.len()] == b'/')
-        } else {
-            // new_root is a parent of existing
-            ex_str.starts_with(new_str.as_ref()) && ex_str.as_bytes()[new_str.len()] == b'/'
-        };
-
-        if overlap {
+        if roots_overlap(new_root, &existing) {
             anyhow::bail!(
                 "Undo did not start: this folder overlaps with one already being recorded.\n\
                  Recorded folder: {}\n\
@@ -425,7 +509,9 @@ pub fn cmd_start(verbose: bool, force: bool) -> Result<()> {
         check_directory_ownership(&cwd)?;
     }
 
-    migrate_old_pid_file(&bt_dir)?;
+    // Check before taking or rewriting our marker, including under --force.
+    // A legacy PID cannot authorize overwriting evidence of a live recorder.
+    check_no_legacy_overlap(&bt_dir, &cwd)?;
 
     let pid_path = pid_file_for_root(&bt_dir, &cwd);
 
@@ -548,8 +634,6 @@ fn write_pid_state(file: &mut std::fs::File, root: &Path, state: &str) -> Result
 pub fn cmd_stop(all: bool) -> Result<()> {
     let bt_dir = backtrack_dir()?;
 
-    migrate_old_pid_file(&bt_dir)?;
-
     if all {
         return stop_all_daemons(&bt_dir);
     }
@@ -557,15 +641,23 @@ pub fn cmd_stop(all: bool) -> Result<()> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     let pid_path = pid_file_for_root(&bt_dir, &cwd);
 
-    if !pid_path.exists() {
-        println!("Undo is not recording file changes for this folder.");
-        return Ok(());
+    let had_marker = pid_path.exists();
+    if had_marker {
+        stop_one_daemon(&pid_path)?;
     }
-
-    stop_one_daemon(&pid_path)
+    // A singleton recorder can coexist with a newer recorder after a prior
+    // upgrade. Stop the verified one first, then report the unresolved legacy.
+    check_no_legacy_overlap(&bt_dir, &cwd)?;
+    if !had_marker {
+        println!("Undo is not recording file changes for this folder.");
+    }
+    Ok(())
 }
 
 fn stop_one_daemon(pid_path: &Path) -> Result<()> {
+    if let Some(legacy) = legacy_recorder_at(pid_path)? {
+        anyhow::bail!("{}", legacy.guidance());
+    }
     let contents = std::fs::read_to_string(pid_path)?;
     let pid: u32 = contents
         .lines()
@@ -612,23 +704,20 @@ fn stop_one_daemon(pid_path: &Path) -> Result<()> {
 }
 
 fn stop_all_daemons(bt_dir: &Path) -> Result<()> {
-    let pids_dir = bt_dir.join("pids");
-    if !pids_dir.exists() {
-        println!("Undo is not recording file changes in any folder.");
-        return Ok(());
-    }
-
     let mut stopped = 0;
-    for entry in std::fs::read_dir(&pids_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("pid")
-            && stop_one_daemon(&path).is_ok()
-        {
-            stopped += 1;
+    let mut errors = Vec::new();
+    for path in recorder_markers(bt_dir)? {
+        match stop_one_daemon(&path) {
+            Ok(()) => stopped += 1,
+            Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
     }
-
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "Some recorders could not be stopped:\n{}",
+            errors.join("\n\n")
+        );
+    }
     if stopped == 0 {
         println!("Undo was not recording file changes in any folder.");
     }
@@ -648,18 +737,7 @@ pub fn cmd_status() -> Result<()> {
             println!("Folder:        {}", project.root_path);
 
             let project_root = Path::new(&project.root_path);
-            let pid_path = pid_file_for_root(&bt_dir, project_root);
-            let daemon_status = if pid_path.exists() {
-                if is_daemon_alive(&pid_path) {
-                    let contents = std::fs::read_to_string(&pid_path).unwrap_or_default();
-                    let pid = contents.lines().next().unwrap_or("?");
-                    format!("{}running{} (PID {})", GREEN, RESET, pid)
-                } else {
-                    format!("{}not running{} (stale PID)", YELLOW, RESET)
-                }
-            } else {
-                format!("{}not running{}", RED, RESET)
-            };
+            let daemon_status = recording_status(&bt_dir, project_root)?;
             println!("Recording:     {}", daemon_status);
 
             let db_path = bt_dir.join("database.db");
@@ -720,12 +798,32 @@ pub fn cmd_status() -> Result<()> {
             );
         }
         None => {
-            println!("Undo is not recording file changes for this folder.");
-            println!("Run {}undo start{} to begin.", BOLD, RESET);
+            println!("Recording:     {}", recording_status(&bt_dir, &cwd)?);
+            if legacy_overlap_message(&bt_dir, &cwd)?.is_none() {
+                println!("Run {}undo start{} to begin.", BOLD, RESET);
+            }
         }
     }
 
     Ok(())
+}
+
+fn recording_status(bt_dir: &Path, root: &Path) -> Result<String> {
+    if let Some(message) = legacy_overlap_message(bt_dir, root)? {
+        return Ok(format!(
+            "{YELLOW}legacy recorder needs attention{RESET}\n{message}"
+        ));
+    }
+    let pid_path = pid_file_for_root(bt_dir, root);
+    Ok(if is_daemon_alive(&pid_path) {
+        let contents = std::fs::read_to_string(&pid_path)?;
+        let pid = contents.lines().next().unwrap_or("?");
+        format!("{GREEN}running{RESET} (PID {pid})")
+    } else if pid_path.exists() {
+        format!("{YELLOW}not running{RESET} (stale PID)")
+    } else {
+        format!("{RED}not running{RESET}")
+    })
 }
 
 /// Try to acquire an exclusive, non-blocking flock on an open file.
@@ -742,19 +840,73 @@ fn signal_terminate(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
 }
 
-/// Probe whether a daemon is alive by trying to lock its PID file.
+/// Probe whether a daemon is alive by trying to share-lock its PID file.
 /// If we can acquire the lock the daemon is dead; the lock is released
 /// when the probing File handle is dropped.
 fn is_daemon_alive(pid_path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(pid_path) else {
         return false;
     };
-    !try_lock_exclusive(&file)
+    // Probes must coexist: an exclusive probe (including one briefly inherited
+    // by a spawning child) could make another reader mistake a legacy marker
+    // for a verified recorder. Only the recorder takes an exclusive lock.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestProcess(std::process::Child);
+
+    impl TestProcess {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+    }
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Legacy markers have no lock. A live PID cannot prove process identity,
+    /// so stop must preserve both the marker and the process and explain why.
+    #[test]
+    fn stop_preserves_potentially_live_legacy_recorders() {
+        for singleton in [true, false] {
+            let data = tempfile::tempdir().unwrap();
+            std::fs::create_dir(data.path().join("pids")).unwrap();
+            let root = Path::new("/legacy/project");
+            let marker = if singleton {
+                data.path().join("pid")
+            } else {
+                pid_file_for_root(data.path(), root)
+            };
+            let mut process = TestProcess::spawn();
+            let contents = format!("{}\n{}", process.0.id(), root.display());
+            std::fs::write(&marker, &contents).unwrap();
+
+            let error = stop_one_daemon(&marker).unwrap_err().to_string();
+
+            assert!(error.contains("legacy recorder"), "{error}");
+            assert!(error.contains("Ctrl-C"), "{error}");
+            assert!(error.contains("verify"), "{error}");
+            assert!(
+                !error.contains("kill "),
+                "must not suggest signaling an unverified PID"
+            );
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), contents);
+            assert!(process.0.try_wait().unwrap().is_none());
+        }
+    }
 
     /// `signal_terminate` must actually deliver SIGTERM via the syscall: spawn a
     /// long-lived child, signal it, and confirm it exits. Proves the libc::kill
@@ -995,34 +1147,205 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// The legacy single-file pid format must be migrated to the per-project layout on startup.
+    /// Both singleton and pre-flock per-project recorders must block all
+    /// overlapping startup routes without hiding the marker or claiming it is
+    /// stale. Unrelated roots remain usable.
     #[test]
-    fn migrate_old_pid_creates_new_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let bt = dir.path();
-        std::fs::create_dir_all(bt.join("pids")).unwrap();
+    fn legacy_recorders_block_overlap_and_appear_in_status() {
+        for singleton in [true, false] {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            std::fs::create_dir(data.path().join("pids")).unwrap();
+            let tree = tempfile::tempdir().unwrap();
+            let parent = tree.path().canonicalize().unwrap();
+            let root = parent.join("project");
+            let nested = root.join("src");
+            std::fs::create_dir_all(&nested).unwrap();
+            let process = TestProcess::spawn();
+            let marker = if singleton {
+                data.path().join("pid")
+            } else {
+                pid_file_for_root(data.path(), &root)
+            };
+            let contents = format!("{}\n{}", process.0.id(), root.display());
+            std::fs::write(&marker, &contents).unwrap();
 
-        let old_pid = bt.join("pid");
-        let root = "/home/user/project";
-        std::fs::write(&old_pid, format!("12345\n{}", root)).unwrap();
-
-        migrate_old_pid_file(bt).unwrap();
-
-        assert!(!old_pid.exists(), "old pid file should be removed");
-        let new_pid = pid_file_for_root(bt, Path::new(root));
-        assert!(new_pid.exists(), "new per-project pid file should exist");
-        let contents = std::fs::read_to_string(&new_pid).unwrap();
-        assert!(contents.contains("12345"));
-        assert!(contents.contains(root));
+            for path in [&root, &nested, &parent] {
+                let error = check_no_overlap(data.path(), path, std::process::id())
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("legacy recorder"), "{error}");
+                assert!(
+                    ensure_recording(path)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("legacy recorder")
+                );
+                assert!(
+                    ensure_recording_for_path(path)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("legacy recorder")
+                );
+                let status = recording_status(data.path(), path).unwrap();
+                assert!(
+                    status.contains("legacy recorder needs attention"),
+                    "{status}"
+                );
+                assert!(!status.contains("not running"), "{status}");
+            }
+            assert!(
+                check_no_overlap(
+                    data.path(),
+                    &parent.join("project-extra"),
+                    std::process::id()
+                )
+                .is_ok()
+            );
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), contents);
+            if singleton {
+                assert!(!pid_file_for_root(data.path(), &root).exists());
+            }
+        }
     }
 
-    /// Migration is safe to call when no legacy pid file exists.
+    /// A reaped process proves the legacy recorder is gone. Stale markers in
+    /// either layout must not block startup, and stop can safely clean them up.
     #[test]
-    fn migrate_is_noop_when_no_old_pid() {
-        let dir = tempfile::tempdir().unwrap();
-        let bt = dir.path();
-        std::fs::create_dir_all(bt.join("pids")).unwrap();
-        assert!(migrate_old_pid_file(bt).is_ok());
+    fn exited_legacy_recorders_do_not_block_and_can_be_cleaned_up() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data.path().join("pids")).unwrap();
+        let root = Path::new("/legacy/project");
+        let mut process = TestProcess::spawn();
+        let pid = process.0.id();
+        process.0.kill().unwrap();
+        process.0.wait().unwrap();
+        for marker in [
+            data.path().join("pid"),
+            pid_file_for_root(data.path(), root),
+        ] {
+            std::fs::write(&marker, format!("{pid}\n{}", root.display())).unwrap();
+            assert!(check_no_overlap(data.path(), root, std::process::id()).is_ok());
+            assert!(
+                recording_status(data.path(), root)
+                    .unwrap()
+                    .contains("not running")
+            );
+            stop_one_daemon(&marker).unwrap();
+            assert!(!marker.exists());
+        }
+    }
+
+    /// Current-format stale markers may point at a reused live PID. They must
+    /// retain flock semantics, and stop must never signal that unrelated PID.
+    #[test]
+    fn current_stale_markers_are_not_classified_as_legacy() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data.path().join("pids")).unwrap();
+        let root = Path::new("/current/project");
+        let marker = pid_file_for_root(data.path(), root);
+        let mut process = TestProcess::spawn();
+        for state in ["starting", "ready"] {
+            std::fs::write(
+                &marker,
+                format!("{}\n{}\n{state}", process.0.id(), root.display()),
+            )
+            .unwrap();
+            assert!(legacy_recorder_at(&marker).unwrap().is_none());
+            assert!(check_no_overlap(data.path(), root, std::process::id()).is_ok());
+            stop_one_daemon(&marker).unwrap();
+            assert!(process.0.try_wait().unwrap().is_none());
+        }
+    }
+
+    /// A locked two-line marker is a verified post-v0.1.9 recorder, not an
+    /// unverified pre-flock recorder. Existing discovery/readiness still apply.
+    #[test]
+    fn locked_two_line_recorder_does_not_trigger_legacy_guard() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data.path().join("pids")).unwrap();
+        let root = Path::new("/locked/project");
+        let _lock = write_live_pid_file(data.path(), root.to_str().unwrap());
+        assert!(legacy_overlap_message(data.path(), root).unwrap().is_none());
+        assert!(
+            recording_status(data.path(), root)
+                .unwrap()
+                .contains("running")
+        );
+        assert_eq!(active_daemons(data.path()).len(), 1);
+    }
+
+    /// Another observer's shared probe must not hide an unverified legacy
+    /// marker from startup guards or make it safe for stop to signal the PID.
+    #[test]
+    fn concurrent_probe_does_not_hide_a_legacy_recorder() {
+        let data = tempfile::tempdir().unwrap();
+        let marker = data.path().join("pid");
+        let mut process = TestProcess::spawn();
+        std::fs::write(&marker, format!("{}\n/legacy/project", process.0.id())).unwrap();
+        let probe = std::fs::File::open(&marker).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+            0
+        );
+        assert!(!is_daemon_alive(&marker));
+        assert!(check_no_legacy_overlap(data.path(), Path::new("/legacy/project")).is_err());
+        assert!(stop_one_daemon(&marker).is_err());
+        assert!(marker.exists());
+        assert!(process.0.try_wait().unwrap().is_none());
+    }
+
+    /// Stop-all must surface legacy guidance instead of swallowing the error,
+    /// while still visiting other markers that it can safely clean up.
+    #[test]
+    fn stop_all_reports_legacy_recorders_and_processes_other_markers() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data.path().join("pids")).unwrap();
+        let mut process = TestProcess::spawn();
+        let singleton = data.path().join("pid");
+        let legacy = pid_file_for_root(data.path(), Path::new("/other/legacy"));
+        for marker in [&singleton, &legacy] {
+            std::fs::write(marker, format!("{}\n/legacy/project", process.0.id())).unwrap();
+        }
+        let stale = pid_file_for_root(data.path(), Path::new("/current/project"));
+        std::fs::write(
+            &stale,
+            format!("{}\n/current/project\nready", process.0.id()),
+        )
+        .unwrap();
+        let error = stop_all_daemons(data.path()).unwrap_err().to_string();
+        assert!(error.contains(&singleton.display().to_string()), "{error}");
+        assert!(error.contains(&legacy.display().to_string()), "{error}");
+        assert!(error.contains("Ctrl-C"), "{error}");
+        assert!(singleton.exists());
+        assert!(legacy.exists());
+        assert!(!stale.exists());
+        assert!(process.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_probe_rejects_non_process_pids_and_malformed_markers() {
+        let data = tempfile::tempdir().unwrap();
+        let marker = data.path().join("pid");
+        for contents in [
+            "0\n/project",
+            "-1\n/project",
+            "2147483648\n/project",
+            "bad\n/project",
+            "1\nrelative",
+        ] {
+            std::fs::write(&marker, contents).unwrap();
+            assert!(legacy_recorder_at(&marker).unwrap().is_none());
+        }
+        assert!(!pid_may_be_running(0));
+        assert!(!pid_may_be_running(-1));
+        assert!(pid_may_be_running(std::process::id() as i32));
+    }
+
+    #[test]
+    fn legacy_guard_is_clear_without_any_markers() {
+        let data = tempfile::tempdir().unwrap();
+        assert!(check_no_legacy_overlap(data.path(), Path::new("/project")).is_ok());
     }
 
     // ── overlap detection ───────────────────────────────────────────

@@ -60,6 +60,8 @@ pub enum Command {
     /// Start recording file changes in the current folder
     Start {
         /// Bypass ownership, file-count, and overlap safety checks
+        ///
+        /// Legacy recorders must still be stopped manually before starting an overlapping recorder.
         #[arg(long)]
         force: bool,
     },

@@ -117,17 +117,16 @@ pub fn cmd_timeline(
     let db = Database::open()?;
     let project = resolve_project(&db, &cwd)?;
     let since_ts = parse_since(since)?;
-    let mut events = match since_ts {
-        Some(ts) => db.get_events_since_limited(project.id, ts, limit)?,
-        None => db.get_timeline(project.id, limit)?,
-    };
-
-    if deleted_only {
-        events.retain(|e| e.event_type == "DELETED");
-    }
+    let events = db.get_timeline_filtered(project.id, since_ts, limit, deleted_only)?;
 
     if events.is_empty() {
-        println!("No file changes recorded yet.");
+        let message = match (deleted_only, since_ts.is_some()) {
+            (true, true) => "No deletion events found in the requested time range.",
+            (true, false) => "No deletion events recorded yet.",
+            (false, true) => "No file changes found in the requested time range.",
+            (false, false) => "No file changes recorded yet.",
+        };
+        println!("{message}");
         return Ok(());
     }
 

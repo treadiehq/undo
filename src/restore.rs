@@ -345,35 +345,7 @@ pub(crate) fn plan_paths_restore_at_session_start(
     paths: &[String],
     session: &Session,
 ) -> Result<RestorePlan> {
-    let fs = RestoreFs::open(project)?;
-    let mut entries = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for path_str in paths {
-        let (db_path, target) = target_from_input(project, cwd, path_str)?;
-        fs.validate(&target)?;
-        if !seen.insert(target.clone()) {
-            continue;
-        }
-        let rel_path = target.display();
-        if let Some(source) = resolve_exact_source_at_session_start(db, session, &db_path)? {
-            entries.push(RestorePlanEntry {
-                path: target,
-                rel_path,
-                action: RestoreAction::Write { source },
-                expected_current: None,
-            });
-        } else if fs.exists(&target)? {
-            entries.push(RestorePlanEntry {
-                path: target,
-                rel_path,
-                action: RestoreAction::DeleteCreatedAfterTarget,
-                expected_current: None,
-            });
-        }
-    }
-
-    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok(RestorePlan { entries })
+    plan_paths_restore_at_event_id(db, project, cwd, paths, session.start_event_id)
 }
 
 pub(crate) fn plan_paths_restore_at_event_id(
@@ -470,7 +442,12 @@ fn target_from_input(
         cwd.join(path)
     };
     let target = ProjectPath::from_absolute(Path::new(&project.root_path), &absolute)?;
-    Ok((absolute.to_string_lossy().to_string(), target))
+    // Match stored event paths using the same lexical normalization as the
+    // restore target. Canonicalizing here would hide leaf symlinks from validate.
+    Ok((
+        target.absolute(project).to_string_lossy().to_string(),
+        target,
+    ))
 }
 
 pub(crate) fn print_restore_plan(
@@ -717,17 +694,15 @@ enum BoundaryState {
 /// Decide which snapshot to restore for `path` as of `target_time`.
 ///
 /// Resolution order:
-/// 1. the newest non-DELETE snapshot at or before `target_time`,
-/// 2. the state immediately before the first later change, when older history
-///    was pruned but that event's `previous_hash` still proves the path existed,
-/// 3. the earliest recorded snapshot (when the window predates all history),
+/// 1. the exact state at `target_time`, including the state before the first
+///    later change when its `previous_hash` proves the path existed,
+/// 2. the contents immediately before the deletion at that boundary,
+/// 3. the earliest recorded snapshot (including targets before all history),
 /// 4. the last contents of a deleted file, recovered from the most recent
-///    DELETED event's `previous_hash`.
+///    DELETED event's `previous_hash` as a final fallback.
 ///
-/// Step 4 is the fix for files that were deleted after their creating event
-/// aged out of retention: previously both earlier lookups returned `None` and
-/// restore reported "No snapshots found", even though the deletion itself was
-/// well within the retention window and the snapshot was still on disk.
+/// Deleted contents are a single-file convenience fallback. Directory and
+/// event-ID planners must continue to treat deletion as absence.
 pub(crate) fn resolve_restore_source(
     db: &Database,
     project_id: i64,
@@ -736,7 +711,22 @@ pub(crate) fn resolve_restore_source(
 ) -> Result<Option<RestoreSource>> {
     match resolve_state_at_time(db, project_id, path, target_time)? {
         BoundaryState::Present(source) => return Ok(Some(source)),
-        BoundaryState::Absent | BoundaryState::Unknown => {}
+        BoundaryState::Absent => {
+            // Use the deletion at this boundary, not the globally latest one:
+            // the path may have been recreated and deleted again afterward.
+            if let Some(event) = db.get_path_state_event_at_time(project_id, path, target_time)?
+                && event.path == path
+                && event.event_type == "DELETED"
+                && let Some(hash) = event.previous_hash
+            {
+                return Ok(Some(RestoreSource {
+                    hash,
+                    timestamp: event.timestamp,
+                    kind: RestoreKind::DeletedFallback,
+                }));
+            }
+        }
+        BoundaryState::Unknown => {}
     }
 
     if let Some(e) = db.get_oldest_event(project_id, path)?
@@ -841,17 +831,6 @@ fn resolve_exact_source_at_time(
     }
 }
 
-fn resolve_exact_source_at_session_start(
-    db: &Database,
-    session: &Session,
-    path: &str,
-) -> Result<Option<RestoreSource>> {
-    match resolve_state_at_event_id(db, session.project_id, path, session.start_event_id)? {
-        BoundaryState::Present(source) => Ok(Some(source)),
-        BoundaryState::Absent | BoundaryState::Unknown => Ok(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -926,6 +905,185 @@ mod tests {
 
         assert_eq!(target, 1_713_200_000);
         assert_eq!(label, "Unix timestamp 1713200000");
+    }
+
+    fn insert_timed_event(
+        db: &Database,
+        project_id: i64,
+        path: &str,
+        timestamp: i64,
+        event_type: &str,
+        current_hash: Option<&str>,
+        previous_hash: Option<&str>,
+    ) -> i64 {
+        db.insert_event(
+            project_id,
+            path,
+            event_type,
+            current_hash,
+            previous_hash,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let id = db.max_event_id(project_id).unwrap();
+        db.set_event_timestamp(id, timestamp).unwrap();
+        id
+    }
+
+    /// A later deletion must not hide the deletion at the requested boundary,
+    /// or make restore fall back to the file's oldest contents (#99).
+    #[test]
+    fn resolve_deleted_file_uses_deletion_at_requested_time() {
+        let (db, pid) = mem_db();
+        let path = "/proj/gone.rs";
+        for (timestamp, event_type, current, previous) in [
+            (100, "CREATED", Some("first"), None),
+            (200, "MODIFIED", Some("last"), Some("first")),
+            (300, "DELETED", None, Some("last")),
+            (500, "CREATED", Some("recreated"), None),
+            (600, "MODIFIED", Some("last-again"), Some("recreated")),
+            (700, "DELETED", None, Some("last-again")),
+        ] {
+            insert_timed_event(&db, pid, path, timestamp, event_type, current, previous);
+        }
+
+        for (target, hash, kind, timestamp) in [
+            (50, "first", RestoreKind::OldestFallback, 100),
+            (100, "first", RestoreKind::Exact, 100),
+            (250, "last", RestoreKind::Exact, 200),
+            (300, "last", RestoreKind::DeletedFallback, 300),
+            (400, "last", RestoreKind::DeletedFallback, 300),
+            (550, "recreated", RestoreKind::Exact, 500),
+            (650, "last-again", RestoreKind::Exact, 600),
+            (700, "last-again", RestoreKind::DeletedFallback, 700),
+            (800, "last-again", RestoreKind::DeletedFallback, 700),
+        ] {
+            let source = resolve_restore_source(&db, pid, path, target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.hash, hash, "target {target}");
+            assert_eq!(source.kind, kind, "target {target}");
+            assert_eq!(source.timestamp, timestamp, "target {target}");
+        }
+    }
+
+    /// A retained deletion still proves the previous contents when all older
+    /// events have been pruned, on either side of the deletion boundary.
+    #[test]
+    fn resolve_deleted_file_preserves_pruned_history() {
+        let (db, pid) = mem_db();
+        let path = "/proj/gone.rs";
+        insert_timed_event(&db, pid, path, 300, "DELETED", None, Some("last"));
+
+        for (target, kind) in [
+            (50, RestoreKind::Exact),
+            (299, RestoreKind::Exact),
+            (300, RestoreKind::DeletedFallback),
+            (400, RestoreKind::DeletedFallback),
+        ] {
+            let source = resolve_restore_source(&db, pid, path, target)
+                .unwrap()
+                .unwrap();
+            assert_eq!(source.hash, "last");
+            assert_eq!(source.kind, kind);
+            assert_eq!(
+                resolve_exact_source_at_time(&db, pid, path, target)
+                    .unwrap()
+                    .is_some(),
+                target < 300
+            );
+        }
+    }
+
+    /// Exercise the actual missing-file planning and snapshot write, so a
+    /// successful restore cannot silently put back the oldest contents (#99).
+    #[test]
+    fn restore_deleted_file_by_time_writes_last_pre_deletion_contents() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("gone.txt");
+        let path = file.to_string_lossy();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let first = b"oldest contents";
+        let last = b"last contents before deletion";
+        let first_hash = crate::snapshots::hash_bytes(first);
+        let last_hash = crate::snapshots::hash_bytes(last);
+        let guard = crate::snapshots::acquire_publish_guard().unwrap();
+        crate::snapshots::save_durable(&guard, project.id, &first_hash, first).unwrap();
+        crate::snapshots::save_durable(&guard, project.id, &last_hash, last).unwrap();
+        for (timestamp, event_type, current, previous) in [
+            (100, "CREATED", Some(first_hash.as_str()), None),
+            (
+                200,
+                "MODIFIED",
+                Some(last_hash.as_str()),
+                Some(first_hash.as_str()),
+            ),
+            (300, "DELETED", None, Some(last_hash.as_str())),
+        ] {
+            insert_timed_event(
+                &db, project.id, &path, timestamp, event_type, current, previous,
+            );
+        }
+        drop(guard);
+
+        let plan = plan_restore(&db, &project, &root, "gone.txt", 400, true).unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert!(!file.exists(), "planning must not write the file");
+        super::apply_restore_plan(&project, &plan, true).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), last);
+        match &plan.entries[0].action {
+            RestoreAction::Write { source } => {
+                assert_eq!(source.kind, RestoreKind::DeletedFallback);
+            }
+            other => panic!("expected write action, got {other:?}"),
+        }
+    }
+
+    /// Directory and event-boundary restores preserve absence even though
+    /// time-based single-file restore offers the deleted contents as a fallback.
+    #[test]
+    fn exact_restore_keeps_deleted_file_absent() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("gone.txt");
+        let path = file.to_string_lossy();
+        std::fs::write(&file, "recreated contents").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let boundary =
+            insert_timed_event(&db, project.id, &path, 300, "DELETED", None, Some("last"));
+        insert_timed_event(
+            &db,
+            project.id,
+            &path,
+            500,
+            "CREATED",
+            Some("recreated"),
+            None,
+        );
+
+        for plan in [
+            plan_restore(&db, &project, &root, ".", 400, true).unwrap(),
+            plan_restore_at_event_id(&db, &project, &root, "gone.txt", boundary).unwrap(),
+        ] {
+            assert_eq!(plan.entries.len(), 1);
+            assert!(matches!(
+                plan.entries[0].action,
+                RestoreAction::DeleteCreatedAfterTarget
+            ));
+        }
+        assert!(
+            plan_restore(&db, &project, &root, "gone.txt", 400, false)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 
     /// A file deleted after its creating event aged out of retention must still
@@ -1464,6 +1622,58 @@ mod tests {
             new_entry.action,
             RestoreAction::DeleteCreatedAfterTarget
         ));
+    }
+
+    /// Unknown history never proves a file was created by the Run. Keep those
+    /// paths out of the plan while still deleting a recorded Run creation.
+    #[test]
+    fn plan_session_restore_skips_unknown_paths() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let created = root.join("created.txt");
+        let unrelated = root.join("notes.txt");
+        std::fs::write(&created, "run content").unwrap();
+        std::fs::write(&unrelated, "precious unrelated notes").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        db.start_session(project.id, "selected-run", "manual")
+            .unwrap();
+        db.insert_event(
+            project.id,
+            &created.to_string_lossy(),
+            "CREATED",
+            Some("run-hash"),
+            None,
+            None,
+            None,
+            Some(11),
+        )
+        .unwrap();
+        let run = db.stop_active_session(project.id).unwrap().unwrap();
+
+        let plan = plan_paths_restore_at_session_start(
+            &db,
+            &project,
+            &root,
+            &[
+                "created.txt".to_string(),
+                "notes.txt".to_string(),
+                "missing.txt".to_string(),
+            ],
+            &run,
+        )
+        .unwrap();
+
+        assert_eq!(plan.entries.len(), 1, "{plan:?}");
+        assert_eq!(plan.entries[0].rel_path, "created.txt");
+        assert!(matches!(
+            plan.entries[0].action,
+            RestoreAction::DeleteCreatedAfterTarget
+        ));
+        assert_eq!(
+            std::fs::read(unrelated).unwrap(),
+            b"precious unrelated notes"
+        );
     }
 
     /// Session recovery uses the rename event itself when the source path's

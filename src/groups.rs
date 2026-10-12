@@ -1,10 +1,11 @@
 use crate::models::{FileEvent, WatchedProject};
 use crate::{relative_path, snapshots};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct ChangeGroup {
     pub id: String,
     pub label: String,

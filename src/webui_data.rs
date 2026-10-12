@@ -183,28 +183,29 @@ pub fn timeline_payload(
     // Queries return newest-first; clustering wants chronological order.
     window.reverse();
 
-    let window_start_ts = window.first().map(|event| event.timestamp).unwrap_or(0);
-    let window_start_id = window.first().map(|event| event.id).unwrap_or(0);
+    let window_start_id = window.iter().map(|event| event.id).min().unwrap_or(0);
 
     let mut items = Vec::new();
     let mut claimed: HashSet<i64> = HashSet::new();
-    let runs = db.list_sessions(project.id)?;
+    // A clock step can put a Run's events after its end timestamp. Select Runs
+    // by event boundaries so those present in the visible history stay visible.
+    let runs: Vec<_> = db
+        .list_sessions(project.id)?
+        .into_iter()
+        .filter(|run| run.end_event_id.is_none_or(|id| id >= window_start_id))
+        .collect();
     let max_event_id = db.max_event_id(project.id)?;
     let first_relevant_claim = runs
         .iter()
-        .filter(|run| run.is_active() || run.ended_at.unwrap_or(i64::MIN) >= window_start_ts)
         .map(|run| run.start_event_id.saturating_add(1))
         .chain(std::iter::once(window_start_id))
         .min()
         .unwrap_or(window_start_id);
     let claim_counts = db.get_event_claim_counts(project.id, first_relevant_claim, max_event_id)?;
     for run in runs {
-        let run_end = run.ended_at.unwrap_or(i64::MAX);
-        if run_end < window_start_ts && !run.is_active() {
-            continue;
-        }
         let mut events = db.get_session_events(&run)?;
-        events.reverse();
+        // Net file changes and diff boundaries need commit order, not wall time.
+        events.sort_by_key(|event| event.id);
         if run.is_reported() {
             events.retain(|event| claim_counts.get(&event.id).copied() == Some(1));
         }
@@ -937,6 +938,67 @@ mod tests {
         assert_eq!(a.event_count, 2);
         assert_eq!(a.first_event_id, 1);
         assert_eq!(a.last_event_id, 2);
+    }
+
+    /// Run diffs use commit order even when wall-clock timestamps run backwards.
+    #[test]
+    fn timeline_run_keeps_event_order_after_clock_steps() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/repo")).unwrap();
+        let run = db
+            .start_session(project.id, "clock-step", "manual")
+            .unwrap();
+        db.insert_event_at(project.id, "/repo/new.rs", "CREATED", run.started_at + 1000)
+            .unwrap();
+        let first_id = db.max_event_id(project.id).unwrap();
+        db.insert_event_at(project.id, "/repo/new.rs", "MODIFIED", run.started_at - 5)
+            .unwrap();
+        let last_id = db.max_event_id(project.id).unwrap();
+        db.complete_run(run.id, "completed").unwrap();
+
+        let payload = timeline_payload(&db, &project, 100, None).unwrap();
+        assert_eq!(payload.items.len(), 1);
+        let item = &payload.items[0];
+        assert_eq!(item.id, run.public_id());
+        assert_eq!(item.event_count, 2);
+        assert_eq!(item.last_event_id, last_id);
+        assert_eq!(item.files.len(), 1);
+        let file = &item.files[0];
+        assert_eq!(file.change, "created");
+        assert_eq!(file.first_event_id, first_id);
+        assert_eq!(file.last_event_id, last_id);
+        assert_eq!(file.last_timestamp, run.started_at - 5);
+    }
+
+    /// Future-dated events still belong to a completed Run in a limited
+    /// timeline, while Runs that ended before the visible event range stay out.
+    #[test]
+    fn timeline_keeps_run_with_only_future_dated_events() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(Path::new("/repo")).unwrap();
+        let old = db.start_session(project.id, "old", "manual").unwrap();
+        db.insert_event_at(project.id, "/repo/old.rs", "CREATED", old.started_at)
+            .unwrap();
+        db.complete_run(old.id, "completed").unwrap();
+        let run = db.start_session(project.id, "future", "manual").unwrap();
+        db.insert_event_at(
+            project.id,
+            "/repo/future.rs",
+            "CREATED",
+            run.started_at + 1000,
+        )
+        .unwrap();
+        db.complete_run(run.id, "completed").unwrap();
+
+        let payload = timeline_payload(&db, &project, 1, None).unwrap();
+        assert_eq!(payload.items.len(), 1);
+        assert_eq!(payload.items[0].id, run.public_id());
+        assert_eq!(payload.items[0].event_count, 1);
+        assert_eq!(payload.items[0].files[0].path, "future.rs");
     }
 
     /// Six or more changes at tool speed read as "machine"; slow, sparse

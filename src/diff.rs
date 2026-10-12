@@ -223,8 +223,8 @@ pub(crate) fn print_unified_diff_with_labels(
 ) {
     let diff = TextDiff::from_lines(old, new);
 
-    println!("{}--- {:<9}{}{}", DIM, old_label, path, RESET);
-    println!("{}+++ {:<9}{}{}", DIM, new_label, path, RESET);
+    println!("{}--- {} {}{}", DIM, old_label, path, RESET);
+    println!("{}+++ {} {}{}", DIM, new_label, path, RESET);
     println!();
 
     for (idx, group) in diff.grouped_ops(3).iter().enumerate() {

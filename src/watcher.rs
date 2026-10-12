@@ -106,6 +106,7 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 
 struct Debouncer {
     last_event: HashMap<PathBuf, Instant>,
+    pending: HashMap<PathBuf, Instant>,
     last_cleanup: Instant,
 }
 
@@ -113,25 +114,61 @@ impl Debouncer {
     fn new() -> Self {
         Self {
             last_event: HashMap::new(),
+            pending: HashMap::new(),
             last_cleanup: Instant::now(),
         }
     }
 
     fn should_process(&mut self, path: &Path) -> bool {
-        self.maybe_cleanup();
-        let now = Instant::now();
+        self.should_process_at(path, Instant::now())
+    }
+
+    fn should_process_at(&mut self, path: &Path, now: Instant) -> bool {
+        self.maybe_cleanup(now);
         if let Some(last) = self.last_event.get(path)
             && now.duration_since(*last) < Duration::from_millis(DEBOUNCE_MS)
         {
+            // Keep the leading snapshot, but also reread after the last
+            // suppressed write has gone quiet. Never discard the trailing edge.
+            self.pending
+                .insert(path.to_path_buf(), now + Duration::from_millis(DEBOUNCE_MS));
             return false;
         }
+        self.pending.remove(path);
         self.last_event.insert(path.to_path_buf(), now);
         true
     }
 
+    fn forget(&mut self, path: &Path) {
+        self.last_event.remove(path);
+        self.pending.remove(path);
+    }
+
+    fn take_pending(&mut self, now: Instant, force: bool) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        self.pending.retain(|path, deadline| {
+            if force || *deadline <= now {
+                paths.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        paths.sort();
+        paths
+    }
+
+    fn wait_duration(&self, now: Instant) -> Duration {
+        self.pending
+            .values()
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+            .unwrap_or(Duration::from_millis(DEBOUNCE_MS))
+            .min(Duration::from_millis(DEBOUNCE_MS))
+    }
+
     /// Periodically evict entries that are too old to matter for debouncing.
-    fn maybe_cleanup(&mut self) {
-        let now = Instant::now();
+    fn maybe_cleanup(&mut self, now: Instant) {
         if now.duration_since(self.last_cleanup) < Duration::from_secs(DEBOUNCE_CLEANUP_SECS) {
             return;
         }
@@ -600,6 +637,17 @@ pub fn watch_directory(
 
     watcher.watch(root, RecursiveMode::Recursive)?;
 
+    watch_events(db, project, root, rx, shutdown, verbose)
+}
+
+fn watch_events(
+    db: &Database,
+    project: &WatchedProject,
+    root: &Path,
+    rx: mpsc::Receiver<notify::Result<Event>>,
+    shutdown: Arc<AtomicBool>,
+    verbose: bool,
+) -> Result<()> {
     // Identity of the watched filesystem when recording began. If the root comes
     // back as a different device after a pause, the resume scan must not treat the
     // vanished files as deletions (#31).
@@ -626,6 +674,9 @@ pub fn watch_directory(
                     root.display()
                 );
                 paused = true;
+                // Resume performs a guarded scan. Do not carry deferred reads
+                // from the old filesystem across a mount change.
+                debouncer = Debouncer::new();
             } else if accessible && paused {
                 crate::log_notice!(
                     "Recording resumed: the watched directory is accessible again: {}",
@@ -660,7 +711,12 @@ pub fn watch_directory(
             }
         }
 
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        // Drain on every iteration, not only on channel timeout: unrelated
+        // filesystem activity must never starve a file's trailing snapshot.
+        if !paused {
+            flush_pending(db, project, root, &mut debouncer, false, verbose);
+        }
+        match rx.recv_timeout(debouncer.wait_duration(Instant::now())) {
             Ok(Ok(event)) => {
                 if paused {
                     continue;
@@ -669,21 +725,9 @@ pub fn watch_directory(
                 // malformed event) can never unwind and kill the whole daemon —
                 // which would stop recording silently while still appearing to
                 // run. Log and move on to the next event instead.
-                match guard_event(|| {
+                report_event_outcome(guard_event(|| {
                     process_event(db, project, root, event, &mut debouncer, verbose)
-                }) {
-                    EventOutcome::Ok => {}
-                    EventOutcome::Failed(e) => {
-                        // Always surface errors — a silent failure means the user
-                        // believes changes are being recorded when they aren't.
-                        crate::log_warn!("File skipped: Undo could not record this change: {}", e);
-                    }
-                    EventOutcome::Panicked => {
-                        crate::log_warn!(
-                            "File skipped: the change handler panicked; recording continues"
-                        );
-                    }
-                }
+                }));
             }
             Ok(Err(e)) => {
                 // Always surface watcher errors too.
@@ -694,7 +738,37 @@ pub fn watch_directory(
         }
     }
 
+    if !paused {
+        // A graceful stop/disconnect must not abandon writes already deferred.
+        flush_pending(db, project, root, &mut debouncer, true, verbose);
+    }
     Ok(())
+}
+
+fn flush_pending(
+    db: &Database,
+    project: &WatchedProject,
+    root: &Path,
+    debouncer: &mut Debouncer,
+    force: bool,
+    verbose: bool,
+) {
+    for path in debouncer.take_pending(Instant::now(), force) {
+        // Reread current bytes through the normal file/ignore/size guards.
+        // Leave absence to structural events: a queued rename still needs
+        // the source's recorded state when its paired notification arrives.
+        debouncer.forget(&path);
+        report_event_outcome(guard_event(|| {
+            process_event(
+                db,
+                project,
+                root,
+                Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path),
+                debouncer,
+                verbose,
+            )
+        }));
+    }
 }
 
 // ── event dispatch ──────────────────────────────────────────────────
@@ -707,12 +781,23 @@ enum EventOutcome {
     Panicked,
 }
 
+fn report_event_outcome(outcome: EventOutcome) {
+    match outcome {
+        EventOutcome::Ok => {}
+        EventOutcome::Failed(e) => {
+            crate::log_warn!("File skipped: Undo could not record this change: {}", e);
+        }
+        EventOutcome::Panicked => {
+            crate::log_warn!("File skipped: the change handler panicked; recording continues");
+        }
+    }
+}
+
 /// Run `f` (the per-event processing) catching both errors and panics.
 /// `AssertUnwindSafe` is required because the closure mutably borrows the
 /// debouncer and holds a DB handle; that is sound here because on a panic we
-/// discard the event and continue — no partially-mutated state is observed
-/// across the boundary in a way that could violate invariants (DB writes are
-/// autocommit; the debouncer is just a timing cache).
+/// report the failure and continue. Handlers commit events and file state in
+/// transactions; deferred paths are independently reconciled from the filesystem.
 fn guard_event<F: FnOnce() -> Result<()>>(f: F) -> EventOutcome {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(Ok(())) => EventOutcome::Ok,
@@ -773,9 +858,10 @@ fn process_event(
                 if should_ignore_with_type(path, root, false) {
                     continue;
                 }
-                if debouncer.should_process(path) {
-                    handle_delete(db, project, path, verbose)?;
-                }
+                // Structural changes must not be dropped behind a recent
+                // write, and supersede any deferred reread of this name.
+                debouncer.forget(path);
+                handle_delete(db, project, path, verbose)?;
             }
         }
 
@@ -783,6 +869,8 @@ fn process_event(
             if event.paths.len() >= 2 {
                 let old = &event.paths[0];
                 let new = &event.paths[1];
+                debouncer.forget(old);
+                debouncer.forget(new);
                 if crate::ignore::is_restore_temporary_path(old)
                     || crate::ignore::is_restore_temporary_path(new)
                 {
@@ -802,10 +890,10 @@ fn process_event(
                 if should_ignore_with_type(new, root, new_is_dir) {
                     // `old` has been renamed away, so its type is moot: pass
                     // is_dir=false to avoid an unguarded stat (#28).
-                    if !should_ignore_with_type(old, root, false) && debouncer.should_process(old) {
+                    if !should_ignore_with_type(old, root, false) {
                         handle_delete(db, project, old, verbose)?;
                     }
-                } else if debouncer.should_process(new) {
+                } else {
                     // Only regular files become RENAMED events; symlinks and
                     // directories are no-ops, matching the old is_symlink guard.
                     if let Some(meta) = new_meta.filter(|m| m.is_file()) {
@@ -822,6 +910,7 @@ fn process_event(
                 }
             } else {
                 for path in &event.paths {
+                    debouncer.forget(path);
                     let meta = symlink_metadata_timeout(path);
                     let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
                     if should_ignore_with_type(path, root, is_dir) {
@@ -831,16 +920,12 @@ fn process_event(
                         // Symlinks are never recorded — skip without a delete.
                         Some(m) if m.file_type().is_symlink() => {}
                         Some(m) if m.is_file() => {
-                            if debouncer.should_process(path) {
-                                handle_modify(db, project, path, m.len(), mtime_nanos(m), verbose)?;
-                            }
+                            handle_modify(db, project, path, m.len(), mtime_nanos(m), verbose)?;
                         }
                         // Missing (renamed away) or a directory: a delete, which
                         // is a no-op for anything not tracked as a file.
                         _ => {
-                            if debouncer.should_process(path) {
-                                handle_delete(db, project, path, verbose)?;
-                            }
+                            handle_delete(db, project, path, verbose)?;
                         }
                     }
                 }
@@ -1148,6 +1233,27 @@ fn handle_rename(
         .get_file_state(project.id, &old_str)?
         .and_then(|s| if s.exists_now { s.latest_hash } else { None });
 
+    // Deduplicate only a pair already recorded as RENAMED. Linux can deliver
+    // From/To before Both; those individual updates must not hide the pair.
+    if source_prev_hash.is_none()
+        && dest_prev_hash.as_deref() == Some(hash.as_str())
+        && db.get_latest_event(project.id, &new_str)?.is_some_and(|e| {
+            e.event_type == "RENAMED"
+                && e.old_path.as_deref() == Some(old_str.as_str())
+                && e.current_hash.as_deref() == Some(hash.as_str())
+        })
+    {
+        db.upsert_file_state(
+            project.id,
+            &new_str,
+            &hash,
+            true,
+            content.len() as i64,
+            mtime_nanos,
+        )?;
+        return Ok(());
+    }
+
     // Durable snapshot before the committing event (#41).
     let publish_guard = snapshots::acquire_publish_guard()?;
     let snap = Some(snapshots::save_durable(
@@ -1213,6 +1319,435 @@ fn handle_rename(
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    /// Real database, snapshots, and watch loop with deterministic event delivery.
+    /// Native backends coalesce differently; these tests control when each write
+    /// becomes visible to the recorder without depending on that coalescing.
+    struct WatchLoopTest {
+        db: Database,
+        project: WatchedProject,
+        root: PathBuf,
+        sender: Option<mpsc::Sender<notify::Result<Event>>>,
+        shutdown: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        _data: tempfile::TempDir,
+        _tree: tempfile::TempDir,
+    }
+
+    impl WatchLoopTest {
+        fn new() -> Self {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let root = tree.path().canonicalize().unwrap();
+            let db = Database::open().unwrap();
+            let project = db.get_or_create_project(&root).unwrap();
+            let (sender, rx) = mpsc::channel();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let thread_shutdown = shutdown.clone();
+            let thread_root = root.clone();
+            let thread_data = data.path().to_path_buf();
+            let thread = std::thread::spawn(move || {
+                crate::set_test_data_dir(thread_data);
+                crate::ignore::init(&thread_root);
+                let db = Database::open().unwrap();
+                let project = db.get_or_create_project(&thread_root).unwrap();
+                watch_events(&db, &project, &thread_root, rx, thread_shutdown, false).unwrap();
+            });
+            Self {
+                db,
+                project,
+                root,
+                sender: Some(sender),
+                shutdown,
+                thread: Some(thread),
+                _data: data,
+                _tree: tree,
+            }
+        }
+
+        fn send(&self, event: Event) {
+            self.sender.as_ref().unwrap().send(Ok(event)).unwrap();
+        }
+
+        fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+            let path = self.root.join(name);
+            std::fs::write(&path, contents).unwrap();
+            self.send(Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.clone()));
+            path
+        }
+
+        fn wait_for_contents(&self, path: &Path, contents: &[u8], keep_busy: bool) {
+            let expected = compute_hash(contents);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let state = self
+                    .db
+                    .get_file_state(self.project.id, path.to_str().unwrap())
+                    .unwrap();
+                if state.as_ref().and_then(|s| s.latest_hash.as_deref()) == Some(&expected) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "final contents were not recorded: {state:?}"
+                );
+                if keep_busy {
+                    // The receive channel never gets a 500 ms idle period.
+                    self.send(Event::new(EventKind::Other));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn finish(&mut self, disconnect: bool) {
+            if disconnect {
+                self.sender.take();
+            } else {
+                self.shutdown.store(true, Ordering::Relaxed);
+                self.send(Event::new(EventKind::Other));
+            }
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for WatchLoopTest {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.sender.take();
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn check_final_write_is_recorded(keep_busy: bool) {
+        let fixture = WatchLoopTest::new();
+        let path = fixture.write("paced.txt", b"first chunk");
+        fixture.wait_for_contents(&path, b"first chunk", false);
+        fixture.write("paced.txt", b"first chunk plus final chunk");
+        fixture.wait_for_contents(&path, b"first chunk plus final chunk", keep_busy);
+        let source = crate::restore::resolve_restore_source(
+            &fixture.db,
+            fixture.project.id,
+            path.to_str().unwrap(),
+            chrono::Utc::now().timestamp() + 1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            snapshots::load(fixture.project.id, &source.hash).unwrap(),
+            b"first chunk plus final chunk"
+        );
+        assert_eq!(
+            fixture
+                .db
+                .get_timeline(fixture.project.id, 20)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A completed paced write must be recoverable without another file event
+    /// or a restart (#100).
+    #[test]
+    fn watch_loop_records_final_write_after_quiet() {
+        check_final_write_is_recorded(false);
+    }
+
+    /// Unrelated traffic must not postpone a pending file's final snapshot.
+    #[test]
+    fn watch_loop_records_final_write_while_channel_is_busy() {
+        check_final_write_is_recorded(true);
+    }
+
+    /// Graceful shutdown and channel disconnection must flush known pending
+    /// writes even if their quiet-period deadlines have not arrived yet.
+    #[test]
+    fn watch_loop_flushes_pending_writes_on_exit() {
+        for disconnect in [false, true] {
+            let mut fixture = WatchLoopTest::new();
+            let path = fixture.write("paced.txt", b"first");
+            fixture.wait_for_contents(&path, b"first", false);
+            fixture.write("paced.txt", b"final contents");
+            // This later event proves the loop consumed the suppressed write.
+            let barrier = fixture.write("barrier.txt", b"ready");
+            fixture.wait_for_contents(&barrier, b"ready", false);
+            assert_eq!(
+                fixture
+                    .db
+                    .get_file_state(fixture.project.id, path.to_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .latest_hash,
+                Some(compute_hash(b"first"))
+            );
+            fixture.finish(disconnect);
+            assert_eq!(
+                fixture
+                    .db
+                    .get_file_state(fixture.project.id, path.to_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .latest_hash,
+                Some(compute_hash(b"final contents"))
+            );
+        }
+    }
+
+    /// A delete or rename immediately following a write must not be discarded
+    /// by the write throttle. The overwritten destination must stay recoverable.
+    #[test]
+    fn rapid_delete_and_rename_preserve_file_history() {
+        use notify::event::{CreateKind, RemoveKind, RenameMode};
+        for rename in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let root = tree.path().canonicalize().unwrap();
+            crate::ignore::init(&root);
+            let db = Database::open_in_memory().unwrap();
+            let project = db.get_or_create_project(&root).unwrap();
+            let path = root.join("target.txt");
+            let old = root.join("incoming.txt");
+            let mut debouncer = Debouncer::new();
+            for (file, content) in [
+                (&path, b"before".as_slice()),
+                (&old, b"replacement".as_slice()),
+            ] {
+                std::fs::write(file, content).unwrap();
+                process_event(
+                    &db,
+                    &project,
+                    &root,
+                    Event::new(EventKind::Create(CreateKind::File)).add_path(file.clone()),
+                    &mut debouncer,
+                    false,
+                )
+                .unwrap();
+                // A duplicate write notification leaves a pending reread.
+                process_event(
+                    &db,
+                    &project,
+                    &root,
+                    Event::new(EventKind::Modify(ModifyKind::Any)).add_path(file.clone()),
+                    &mut debouncer,
+                    false,
+                )
+                .unwrap();
+            }
+            let event = if rename {
+                std::fs::rename(&old, &path).unwrap();
+                Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(old.clone())
+                    .add_path(path.clone())
+            } else {
+                std::fs::remove_file(&path).unwrap();
+                Event::new(EventKind::Remove(RemoveKind::File)).add_path(path.clone())
+            };
+            process_event(&db, &project, &root, event.clone(), &mut debouncer, false).unwrap();
+            let event_count = db.get_timeline(project.id, 20).unwrap().len();
+            process_event(&db, &project, &root, event.clone(), &mut debouncer, false).unwrap();
+            flush_pending(&db, &project, &root, &mut debouncer, true, false);
+            assert_eq!(db.get_timeline(project.id, 20).unwrap().len(), event_count);
+            let state = db
+                .get_file_state(project.id, path.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.exists_now, rename);
+            if rename {
+                assert_eq!(state.latest_hash, Some(compute_hash(b"replacement")));
+                assert!(
+                    !db.get_file_state(project.id, old.to_str().unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .exists_now
+                );
+                let latest = db
+                    .get_latest_event(project.id, path.to_str().unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(latest.event_type, "RENAMED");
+                assert_eq!(latest.old_path.as_deref(), old.to_str());
+            }
+            let deleted = db
+                .get_latest_deleted_event(project.id, path.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(deleted.previous_hash, Some(compute_hash(b"before")));
+            if rename {
+                // A distinct rename with identical bytes is still a real
+                // rename when its source has been recreated in the meantime.
+                std::fs::write(&old, b"replacement").unwrap();
+                process_event(
+                    &db,
+                    &project,
+                    &root,
+                    Event::new(EventKind::Create(CreateKind::File)).add_path(old.clone()),
+                    &mut debouncer,
+                    false,
+                )
+                .unwrap();
+                std::fs::rename(&old, &path).unwrap();
+                process_event(&db, &project, &root, event, &mut debouncer, false).unwrap();
+                assert_eq!(
+                    db.get_timeline(project.id, 20)
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e.event_type == "RENAMED")
+                        .count(),
+                    2
+                );
+            }
+        }
+    }
+
+    /// Each path's last suppressed event controls its quiet deadline; another
+    /// path's events must neither postpone it nor make it fire prematurely.
+    #[test]
+    fn debounce_deadlines_follow_the_last_suppressed_write() {
+        let mut debouncer = Debouncer::new();
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let first = Path::new("first.txt");
+        let second = Path::new("second.txt");
+        assert!(debouncer.should_process_at(first, at(0)));
+        assert!(debouncer.should_process_at(second, at(0)));
+        assert!(!debouncer.should_process_at(first, at(100)));
+        assert!(!debouncer.should_process_at(second, at(150)));
+        assert!(!debouncer.should_process_at(first, at(400)));
+        assert!(debouncer.take_pending(at(600), false).is_empty());
+        assert_eq!(debouncer.wait_duration(at(600)), Duration::from_millis(50));
+        assert_eq!(
+            debouncer.take_pending(at(650), false),
+            vec![second.to_path_buf()]
+        );
+        assert_eq!(debouncer.wait_duration(at(899)), Duration::from_millis(1));
+        assert_eq!(
+            debouncer.take_pending(at(900), false),
+            vec![first.to_path_buf()]
+        );
+        assert!(debouncer.take_pending(at(901), false).is_empty());
+
+        // A long burst still records periodic leading snapshots; a newly
+        // admitted write supersedes the pending read of the same path.
+        assert!(debouncer.should_process_at(first, at(1000)));
+        assert!(!debouncer.should_process_at(first, at(1400)));
+        assert!(debouncer.should_process_at(first, at(1500)));
+        assert!(debouncer.take_pending(at(1900), false).is_empty());
+    }
+
+    /// A queued reread must still enforce the file guards, and must not infer
+    /// a deletion before an outstanding rename can consume its source state.
+    #[test]
+    fn deferred_rereads_recheck_file_type_and_size() {
+        use notify::event::CreateKind;
+        use std::os::unix::fs::symlink;
+        for change in ["symlink", "directory", "oversized", "missing"] {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let root = tree.path().canonicalize().unwrap();
+            crate::ignore::init(&root);
+            let db = Database::open_in_memory().unwrap();
+            let project = db.get_or_create_project(&root).unwrap();
+            let path = root.join("file.txt");
+            std::fs::write(&path, b"before").unwrap();
+            let mut debouncer = Debouncer::new();
+            let event = Event::new(EventKind::Create(CreateKind::File)).add_path(path.clone());
+            process_event(&db, &project, &root, event.clone(), &mut debouncer, false).unwrap();
+            process_event(&db, &project, &root, event, &mut debouncer, false).unwrap();
+            assert!(debouncer.pending.contains_key(&path));
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(outside.path(), b"outside bytes").unwrap();
+            if change == "oversized" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(snapshots::MAX_SNAPSHOT_SIZE as u64 + 1)
+                    .unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+                match change {
+                    "symlink" => symlink(outside.path(), &path).unwrap(),
+                    "directory" => std::fs::create_dir(&path).unwrap(),
+                    "missing" => {}
+                    _ => unreachable!(),
+                }
+            }
+            flush_pending(&db, &project, &root, &mut debouncer, true, false);
+            assert!(debouncer.pending.is_empty());
+            assert_eq!(
+                db.get_timeline(project.id, 20).unwrap().len(),
+                1,
+                "{change}"
+            );
+            let state = db
+                .get_file_state(project.id, path.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert!(state.exists_now, "{change}");
+            assert_eq!(state.latest_hash, Some(compute_hash(b"before")), "{change}");
+            assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside bytes");
+        }
+    }
+
+    /// notify's Linux backend emits From, To, then Both. State updates from the
+    /// single-path notifications must not suppress the final paired rename.
+    #[test]
+    fn split_rename_notifications_preserve_the_pair() {
+        use notify::event::{CreateKind, RenameMode};
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        crate::ignore::init(&root);
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let old = root.join("old.txt");
+        let new = root.join("new.txt");
+        let mut debouncer = Debouncer::new();
+        std::fs::write(&old, b"contents").unwrap();
+        let created = Event::new(EventKind::Create(CreateKind::File)).add_path(old.clone());
+        process_event(&db, &project, &root, created.clone(), &mut debouncer, false).unwrap();
+        process_event(&db, &project, &root, created, &mut debouncer, false).unwrap();
+        std::fs::rename(&old, &new).unwrap();
+        flush_pending(&db, &project, &root, &mut debouncer, true, false);
+        assert!(
+            db.get_file_state(project.id, old.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .exists_now
+        );
+        let both = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(old.clone())
+            .add_path(new.clone());
+        for event in [
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From))).add_path(old.clone()),
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(new.clone()),
+            both.clone(),
+            both,
+        ] {
+            process_event(&db, &project, &root, event, &mut debouncer, false).unwrap();
+        }
+        let events = db.get_timeline(project.id, 20).unwrap();
+        let renames = events
+            .iter()
+            .filter(|e| e.event_type == "RENAMED")
+            .collect::<Vec<_>>();
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames[0].path, new.to_str().unwrap());
+        assert_eq!(renames[0].old_path.as_deref(), old.to_str());
+        assert_eq!(renames[0].current_hash, Some(compute_hash(b"contents")));
+        assert!(
+            !db.get_file_state(project.id, old.to_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .exists_now
+        );
+    }
 
     /// guard_event maps a successful handler to Ok.
     #[test]

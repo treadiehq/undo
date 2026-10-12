@@ -10,6 +10,60 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-10-12
+
+- Diff headers separate version labels from filenames with an explicit space,
+  fixing the joined `selected saved` label in `undo diff` (#105).
+- `undo session stop` synchronizes the active Run's stored project before closing
+  its event boundary, including when recording has moved between parent and
+  nested projects. Pending file changes remain available to Run recovery (#104).
+- Agent hooks fall back to a valid session ID when the conversation ID is empty
+  or whitespace-only, preserving recorder startup and reported Run attribution
+  for Claude Code, Cursor, and Codex (#103).
+- Selected-file recovery accepts equivalent path spellings such as `./src/main.rs`
+  and `src/main.rs` in both Run and before-change recovery. Duplicate selections
+  produce one entry regardless of order, including for deleted files (#102).
+- `undo timeline --deleted` filters deletion activity before applying `--limit`,
+  including with `--since`, so newer edits no longer hide older deletions.
+  Empty timeline messages describe the selected filters (#101).
+- The recorder rereads files after rapid writes settle, retaining final contents
+  even during continuous activity elsewhere. Graceful shutdown flushes pending
+  rereads, and rapid deletes and renames bypass the write throttle (#100).
+- Time-based single-file restore recovers the last contents before the deletion
+  at the requested time instead of the oldest snapshot, including paths later
+  recreated and deleted again (#99).
+- `undo run show` displays the group IDs accepted by `undo recover --group`.
+  Its JSON output includes `change_groups` with IDs, labels, paths, and change
+  statistics, including an empty array for Runs without changes (#98).
+- `undo ask` matches plural requests such as "undo the fixes" to completed
+  intents named "fix", preserving task scope instead of falling back to whole
+  file groups. Compound targets such as "bugfixes" retain their full name,
+  while existing plural matches remain unchanged (#97).
+- Window Runs use event-ID boundaries so clock changes cannot omit recorded
+  changes from inspection or recovery. Existing incomplete event links are
+  repaired on upgrade, and Timeline Run diffs follow event order (#96).
+- Upgrades recognize potentially live legacy recorders in both PID-file
+  layouts, preserve their markers, and block overlapping starts. `status`
+  and `stop` provide manual shutdown guidance without signaling an unverified
+  PID; `stop --all` reports unresolved recorders instead of hiding errors (#95).
+- Recorder liveness probes use shared locks so simultaneous observers do not
+  mistake another probe for a running recorder.
+- Run recovery rejects selected paths without recorded changes in that Run,
+  preventing unrelated files from being deleted or overwritten. Recovery
+  planning also leaves paths with unknown history untouched (#94).
+
+### Upgrade notes
+
+Opening the database upgrades it to schema version 5 and repairs retained
+window-Run membership. Versions supporting only schema 4 or earlier, including
+v0.2.12, cannot reopen the upgraded database. Downgrading requires a database
+backup from before the upgrade. Saved Recovery plans are not expanded by the
+repair; create a new preview to include repaired membership.
+
+Restart running recorders after upgrading to activate the recording fixes.
+For recorders older than v0.1.9, follow the manual shutdown guidance in
+[Storage and operations](docs/storage.md#upgrading-with-a-legacy-recorder).
+
 ## [0.2.12] — 2026-10-12
 
 - Linux releases now build against Debian 12's glibc 2.36 baseline and must

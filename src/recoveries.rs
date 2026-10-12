@@ -78,6 +78,7 @@ pub(crate) fn create_run_recovery_in(
         );
     }
     ensure_run_project(run, project)?;
+    ensure_run_paths_recorded(db, project, base_dir, run, paths)?;
     ensure_reported_paths_recoverable(db, project, base_dir, run, paths)?;
     let plan = restore::plan_paths_restore_at_session_start(db, project, base_dir, paths, run)?;
     persist_restore_plan(
@@ -847,6 +848,38 @@ fn ensure_run_project(run: &Session, project: &WatchedProject) -> Result<()> {
     Ok(())
 }
 
+/// Run membership is independent of reported ownership: window-attributed
+/// Runs may rewind later edits, but only on paths recorded as part of the Run.
+fn ensure_run_paths_recorded(
+    db: &Database,
+    project: &WatchedProject,
+    base_dir: &std::path::Path,
+    run: &Session,
+    paths: &[String],
+) -> Result<()> {
+    let events = db.get_session_events(run)?;
+    let recorded_paths = events
+        .iter()
+        .flat_map(|event| std::iter::once(event.path.as_str()).chain(event.old_path.as_deref()))
+        .collect::<BTreeSet<_>>();
+    let mut blocked = Vec::new();
+    for path in paths {
+        let absolute = crate::safe_resolve_path(base_dir, path, &project.root_path)?;
+        let absolute = absolute.to_string_lossy();
+        if !recorded_paths.contains(absolute.as_ref()) {
+            blocked.push(crate::relative_path(&absolute, &project.root_path).to_string());
+        }
+    }
+    if !blocked.is_empty() {
+        anyhow::bail!(
+            "No recovery plan was created because these paths have no recorded changes in Run {}: {}.",
+            run.public_id(),
+            blocked.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn ensure_reported_paths_recoverable(
     db: &Database,
     project: &WatchedProject,
@@ -883,6 +916,431 @@ fn ensure_reported_paths_recoverable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Common path spellings must produce the same saved plan and restore the
+    /// same bytes, including missing files and duplicate selections (#102).
+    #[test]
+    fn event_boundary_recovery_normalizes_selected_paths() {
+        assert_selected_path_spellings_recover(false);
+    }
+
+    /// Run membership and baseline planning must agree on normalized paths.
+    #[test]
+    fn run_recovery_normalizes_selected_paths() {
+        assert_selected_path_spellings_recover(true);
+    }
+
+    fn assert_selected_path_spellings_recover(from_run: bool) {
+        for event_type in ["MODIFIED", "DELETED", "CREATED"] {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let root = tree.path().canonicalize().unwrap();
+            std::fs::create_dir(root.join("src")).unwrap();
+            let file = root.join("src/main.rs");
+            let path = file.to_string_lossy().into_owned();
+            let db = Database::open_in_memory().unwrap();
+            let project = db.get_or_create_project(&root).unwrap();
+            let before = b"original content";
+            let after = b"changed content";
+            let before_hash = snapshots::hash_bytes(before);
+            let after_hash = snapshots::hash_bytes(after);
+            let guard = snapshots::acquire_publish_guard().unwrap();
+            snapshots::save_durable(&guard, project.id, &before_hash, before).unwrap();
+            snapshots::save_durable(&guard, project.id, &after_hash, after).unwrap();
+            drop(guard);
+            if event_type != "CREATED" {
+                db.insert_event(
+                    project.id,
+                    &path,
+                    "CREATED",
+                    Some(&before_hash),
+                    None,
+                    None,
+                    None,
+                    Some(before.len() as i64),
+                )
+                .unwrap();
+            }
+            let boundary = db.max_event_id(project.id).unwrap();
+            db.start_session(project.id, "selected-paths", "manual")
+                .unwrap();
+            db.insert_event(
+                project.id,
+                &path,
+                event_type,
+                (event_type != "DELETED").then_some(after_hash.as_str()),
+                (event_type != "CREATED").then_some(before_hash.as_str()),
+                None,
+                None,
+                Some(after.len() as i64),
+            )
+            .unwrap();
+            let run = db.stop_active_session(project.id).unwrap().unwrap();
+
+            let selections = [
+                (root.clone(), vec!["src/main.rs".to_string()]),
+                (root.clone(), vec!["./src/main.rs".to_string()]),
+                (root.clone(), vec![path.clone()]),
+                (
+                    root.clone(),
+                    vec![format!("{}/./src/main.rs", root.display())],
+                ),
+                (root.clone(), vec!["src/./main.rs".to_string()]),
+                (root.clone(), vec!["src//main.rs".to_string()]),
+                (
+                    root.clone(),
+                    vec!["./src/main.rs".to_string(), "src/main.rs".to_string()],
+                ),
+                (
+                    root.clone(),
+                    vec!["src/main.rs".to_string(), "./src/main.rs".to_string()],
+                ),
+                (root.join("src"), vec!["./main.rs".to_string()]),
+            ];
+            for (base, paths) in selections {
+                // Reset only the working file; each saved plan sees the same
+                // recorded history and is applied once against its own preview.
+                if event_type == "DELETED" {
+                    if file.exists() {
+                        std::fs::remove_file(&file).unwrap();
+                    }
+                } else {
+                    std::fs::write(&file, after).unwrap();
+                }
+                let recovery = if from_run {
+                    create_run_recovery_in(
+                        &db,
+                        &project,
+                        &base,
+                        &run,
+                        &paths,
+                        "selected files",
+                        "files",
+                        "exact-paths",
+                        None,
+                    )
+                } else {
+                    create_event_boundary_recovery_in(
+                        &db,
+                        &project,
+                        &base,
+                        &paths,
+                        boundary,
+                        "selected files",
+                        "files",
+                    )
+                }
+                .unwrap();
+                let entries = db.get_recovery_entries(recovery.id).unwrap();
+                assert_eq!(entries.len(), 1, "{event_type}: {paths:?}");
+                assert_eq!(entries[0].path, path);
+                assert_eq!(
+                    std::fs::read(&file).ok().as_deref(),
+                    (event_type != "DELETED").then_some(after.as_slice()),
+                    "preview must not change the file",
+                );
+                let outcome = apply_recovery_in(&db, &project, &recovery.public_id()).unwrap();
+                assert_eq!(outcome.files_changed, 1, "{event_type}: {paths:?}");
+                assert_eq!(
+                    std::fs::read(&file).ok().as_deref(),
+                    (event_type != "CREATED").then_some(before.as_slice()),
+                    "{event_type}: {paths:?}",
+                );
+            }
+        }
+    }
+
+    /// Normalize spelling without following a leaf symlink or relaxing the
+    /// planner's confinement rules. Canonicalizing first would hide the link.
+    #[test]
+    fn selected_path_plan_preserves_path_guards() {
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let file = root.join("actual.txt");
+        std::fs::write(&file, "current").unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::os::unix::fs::symlink("actual.txt", root.join("alias.txt")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("sentinel.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("linked")).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        for path in [
+            "./alias.txt".to_string(),
+            "nested/../actual.txt".to_string(),
+            "./linked/sentinel.txt".to_string(),
+            outside_file.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                restore::plan_paths_restore_at_event_id(
+                    &db,
+                    &project,
+                    &root,
+                    std::slice::from_ref(&path),
+                    0,
+                )
+                .is_err(),
+                "unsafe path accepted: {path}",
+            );
+        }
+        assert_eq!(std::fs::read(file).unwrap(), b"current");
+        assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+    }
+
+    /// Selecting an unrelated path must reject the whole request before a
+    /// recovery is saved, even if that path has history outside the Run.
+    #[test]
+    fn run_recovery_rejects_paths_without_run_changes() {
+        for history in ["unrecorded", "created-later", "modified-later"] {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let root = tree.path().canonicalize().unwrap();
+            let touched = root.join("touched.txt");
+            let unrelated = root.join("notes.txt");
+            std::fs::write(&touched, "run content").unwrap();
+            std::fs::write(&unrelated, "precious unrelated notes").unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let project = db.get_or_create_project(&root).unwrap();
+            if history == "modified-later" {
+                db.insert_event(
+                    project.id,
+                    &unrelated.to_string_lossy(),
+                    "CREATED",
+                    Some("baseline"),
+                    None,
+                    None,
+                    None,
+                    Some(8),
+                )
+                .unwrap();
+            }
+            db.start_session(project.id, "selected-run", "manual")
+                .unwrap();
+            db.insert_event(
+                project.id,
+                &touched.to_string_lossy(),
+                "CREATED",
+                Some("run-hash"),
+                None,
+                None,
+                None,
+                Some(11),
+            )
+            .unwrap();
+            let run = db.stop_active_session(project.id).unwrap().unwrap();
+            if history != "unrecorded" {
+                db.insert_event(
+                    project.id,
+                    &unrelated.to_string_lossy(),
+                    if history == "created-later" {
+                        "CREATED"
+                    } else {
+                        "MODIFIED"
+                    },
+                    Some("later-hash"),
+                    if history == "modified-later" {
+                        Some("baseline")
+                    } else {
+                        None
+                    },
+                    None,
+                    None,
+                    Some(24),
+                )
+                .unwrap();
+            }
+
+            let error = create_run_recovery_in(
+                &db,
+                &project,
+                &root,
+                &run,
+                &["touched.txt".to_string(), "notes.txt".to_string()],
+                "selected files",
+                "files",
+                "exact-paths",
+                None,
+            )
+            .expect_err(history)
+            .to_string();
+
+            assert!(
+                error.contains("no recorded changes in Run"),
+                "{history}: {error}"
+            );
+            assert!(error.contains("notes.txt"), "{history}: {error}");
+            assert!(
+                db.get_recovery_by_ref(project.id, "rec_1")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(std::fs::read(&touched).unwrap(), b"run content");
+            assert_eq!(
+                std::fs::read(&unrelated).unwrap(),
+                b"precious unrelated notes"
+            );
+        }
+    }
+
+    /// Membership includes rename sources, and must still permit real Run
+    /// creations to be deleted and modified/deleted files to be restored.
+    #[test]
+    fn run_recovery_applies_recorded_changes_including_rename_sources() {
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let base = root.join("src");
+        std::fs::create_dir(&base).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let before = b"original content";
+        let after = b"run content";
+        let before_hash = snapshots::hash_bytes(before);
+        let after_hash = snapshots::hash_bytes(after);
+        let publish_guard = snapshots::acquire_publish_guard().unwrap();
+        snapshots::save_durable(&publish_guard, project.id, &before_hash, before).unwrap();
+        snapshots::save_durable(&publish_guard, project.id, &after_hash, after).unwrap();
+        drop(publish_guard);
+        db.start_session(project.id, "selected-run", "manual")
+            .unwrap();
+        for (name, kind, previous) in [
+            ("created.txt", "CREATED", None),
+            ("modified.txt", "MODIFIED", Some(before_hash.as_str())),
+            ("deleted.txt", "DELETED", Some(before_hash.as_str())),
+        ] {
+            let path = base.join(name);
+            if kind != "DELETED" {
+                std::fs::write(&path, after).unwrap();
+            }
+            db.insert_event(
+                project.id,
+                &path.to_string_lossy(),
+                kind,
+                if kind == "DELETED" {
+                    None
+                } else {
+                    Some(&after_hash)
+                },
+                previous,
+                None,
+                None,
+                Some(after.len() as i64),
+            )
+            .unwrap();
+        }
+        let old = base.join("old.txt");
+        let new = base.join("new.txt");
+        std::fs::write(&new, before).unwrap();
+        db.insert_event(
+            project.id,
+            &new.to_string_lossy(),
+            "RENAMED",
+            Some(&before_hash),
+            Some(&before_hash),
+            None,
+            Some(&old.to_string_lossy()),
+            Some(before.len() as i64),
+        )
+        .unwrap();
+        let run = db.stop_active_session(project.id).unwrap().unwrap();
+        // Whole-file recovery of a window Run may still rewind later edits
+        // to a path that the Run did change; membership is not exclusivity.
+        let modified = base.join("modified.txt");
+        std::fs::write(&modified, "later content").unwrap();
+        db.insert_event(
+            project.id,
+            &modified.to_string_lossy(),
+            "MODIFIED",
+            Some("later-hash"),
+            Some(&after_hash),
+            None,
+            None,
+            Some(13),
+        )
+        .unwrap();
+        let unrelated = root.join("notes.txt");
+        std::fs::write(&unrelated, "keep me").unwrap();
+        let recovery = create_run_recovery_in(
+            &db,
+            &project,
+            &base,
+            &run,
+            &[
+                "created.txt".to_string(),
+                "modified.txt".to_string(),
+                "deleted.txt".to_string(),
+                old.to_string_lossy().into_owned(),
+                "new.txt".to_string(),
+            ],
+            "selected files",
+            "files",
+            "exact-paths",
+            None,
+        )
+        .unwrap();
+        let outcome = apply_recovery_in(&db, &project, &recovery.public_id()).unwrap();
+
+        assert_eq!(outcome.files_changed, 5);
+        assert!(!base.join("created.txt").exists());
+        assert!(!new.exists());
+        for path in [base.join("modified.txt"), base.join("deleted.txt"), old] {
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"keep me");
+    }
+
+    /// A clock step must not make the membership guard reject a file actually
+    /// created in the Run, or expand selective recovery to unrelated files.
+    #[test]
+    fn run_recovery_applies_selected_path_after_clock_step() {
+        for offset in [-5, 1000] {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let root = tree.path().canonicalize().unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let project = db.get_or_create_project(&root).unwrap();
+            let run = db
+                .start_session(project.id, "clock-step", "manual")
+                .unwrap();
+            for (name, timestamp) in [
+                ("normal.txt", run.started_at),
+                ("skewed.txt", run.started_at + offset),
+            ] {
+                let path = root.join(name);
+                std::fs::write(&path, "run content").unwrap();
+                db.insert_event_at(project.id, &path.to_string_lossy(), "CREATED", timestamp)
+                    .unwrap();
+            }
+            let unrelated = root.join("notes.txt");
+            std::fs::write(&unrelated, "keep me").unwrap();
+            let run = db.complete_run(run.id, "completed").unwrap();
+            let recovery = create_run_recovery_in(
+                &db,
+                &project,
+                &root,
+                &run,
+                &["skewed.txt".to_string()],
+                "selected file",
+                "files",
+                "exact-paths",
+                None,
+            )
+            .unwrap();
+            let outcome = apply_recovery_in(&db, &project, &recovery.public_id()).unwrap();
+            assert_eq!(outcome.files_changed, 1);
+            assert!(!root.join("skewed.txt").exists());
+            assert_eq!(
+                std::fs::read(root.join("normal.txt")).unwrap(),
+                b"run content"
+            );
+            assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep me");
+        }
+    }
 
     #[test]
     fn recovery_presentation_matches_the_callers_next_action() {

@@ -92,6 +92,7 @@ An empty list is `[]`.
   "run_id": "r_421",
   "run": {"id": 421, "project_id": 7, "name": "auth-work", "kind": "run", "actor": "agent", "agent": "My Agent", "command": null, "intent": null, "external_id": null, "status": "completed", "started_at": 1784000000, "ended_at": 1784000120, "start_event_id": 100, "end_event_id": 118, "created_at": 1784000000},
   "changes": [],
+  "change_groups": [],
   "intents": [],
   "checkpoints": []
 }
@@ -119,6 +120,28 @@ An intent record contains `id`, `run_id`, `label`, `status`,
 
 A checkpoint record contains `id`, `project_id`, `run_id`, `name`, `timestamp`,
 `event_id`, `intent`, and `created_at`.
+
+`change_groups` contains the file groups accepted by `undo recover --group`:
+
+```json
+{
+  "id": "auth",
+  "label": "src/auth",
+  "paths": ["/absolute/project/path/src/auth/login.rs"],
+  "event_count": 2,
+  "inserted": 12,
+  "deleted": 3
+}
+```
+
+Pass `id` unchanged to `undo recover --run <RUN> --group <ID> --preview`.
+`label` is for display. IDs may include a hash suffix to distinguish groups
+whose names produce the same slug; use the returned value instead of deriving
+one from the label. `paths` contains distinct absolute paths, including both
+ends of recorded renames. Its length is the group's file count. `event_count`
+counts recorded changes; `inserted` and `deleted` are summed line counts for
+those changes, not a net diff. Runs without recorded changes return
+`"change_groups": []`.
 
 ## Create a checkpoint from a script
 

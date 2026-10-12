@@ -49,8 +49,8 @@ fn handle_payload(agent: Agent, payload: &HookPayload, process_cwd: &Path) -> Re
         return Ok(());
     };
     let Some(external_run_id) = stable_external_run_id(agent, payload) else {
-        // Some host versions omit both stable identifiers. Starting an
-        // unresolvable Run would be worse than leaving history unattributed.
+        // Without a usable stable identifier, starting an unresolvable Run
+        // would be worse than leaving history unattributed.
         return Ok(());
     };
 
@@ -152,13 +152,15 @@ fn usable_directory(value: &str, process_cwd: &Path) -> Option<PathBuf> {
 }
 
 fn stable_external_run_id(agent: Agent, payload: &HookPayload) -> Option<String> {
-    payload
-        .conversation_id
-        .as_deref()
-        .or(payload.session_id.as_deref())
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(|id| format!("{}:{}", agent.as_str(), id))
+    [
+        payload.conversation_id.as_deref(),
+        payload.session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|id| !id.is_empty())
+    .map(|id| format!("{}:{}", agent.as_str(), id))
 }
 
 fn agent_label(agent: Agent) -> &'static str {
@@ -513,23 +515,131 @@ mod tests {
         );
     }
 
+    /// Blank conversation IDs must not mask usable session IDs. Parse actual
+    /// JSON so omitted, null, empty, and whitespace values are all covered.
     #[test]
-    fn stable_run_identity_prefers_conversation_and_namespaces_agent() {
-        let payload = HookPayload {
-            cwd: None,
-            workspace_roots: Vec::new(),
-            session_id: Some("session-1".to_string()),
-            conversation_id: Some("conversation-2".to_string()),
-            hook_event_name: None,
-            tool_name: None,
-            tool_use_id: None,
-            tool_input: None,
-            reason: None,
-        };
-        assert_eq!(
-            stable_external_run_id(Agent::Cursor, &payload).as_deref(),
-            Some("cursor:conversation-2")
-        );
+    fn stable_run_identity_uses_first_nonempty_identifier() {
+        let cases = [
+            (r#"{"session_id":"s1"}"#, Some("s1")),
+            (r#"{"conversation_id":null,"session_id":"s1"}"#, Some("s1")),
+            (r#"{"conversation_id":"","session_id":"s1"}"#, Some("s1")),
+            (
+                r#"{"conversation_id":" \t\n ","session_id":" s1 "}"#,
+                Some("s1"),
+            ),
+            (
+                r#"{"conversation_id":" c1 ","session_id":"s1"}"#,
+                Some("c1"),
+            ),
+            (r#"{"conversation_id":"c1"}"#, Some("c1")),
+            (r#"{"conversation_id":"c1","session_id":" "}"#, Some("c1")),
+            (r#"{}"#, None),
+            (r#"{"session_id":null,"conversation_id":null}"#, None),
+            (r#"{"session_id":" \t "}"#, None),
+            (r#"{"conversation_id":"","session_id":" "}"#, None),
+            (r#"{"conversation_id":" "}"#, None),
+        ];
+        for agent in [Agent::Claude, Agent::Cursor, Agent::Codex] {
+            for (json, expected_id) in cases {
+                let payload = parse_payload(json).unwrap();
+                assert_eq!(
+                    stable_external_run_id(agent, &payload),
+                    expected_id.map(|id| format!("{}:{id}", agent.as_str())),
+                    "{agent:?}: {json}",
+                );
+            }
+        }
+    }
+
+    /// The fallback must work throughout the hook lifecycle, creating a
+    /// reported Run, claiming the tool's edit, and completing the same Run.
+    #[test]
+    fn blank_conversation_id_preserves_hook_attribution() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        for agent in [Agent::Claude, Agent::Cursor, Agent::Codex] {
+            for conversation_id in ["", " \t\n "] {
+                let data = tempfile::tempdir().unwrap();
+                crate::set_test_data_dir(data.path().to_path_buf());
+                let tree = tempfile::tempdir().unwrap();
+                let root = tree.path().canonicalize().unwrap();
+                std::fs::create_dir(root.join(".git")).unwrap();
+                let file = root.join("file.txt");
+                std::fs::write(&file, "original").unwrap();
+                let db = Database::open().unwrap();
+                let project = db.get_or_create_project(&root).unwrap();
+
+                // Hold a recorder ownership marker in the isolated data dir
+                // so the real hook handler does not launch a daemon.
+                std::fs::create_dir_all(data.path().join("pids")).unwrap();
+                let mut recorder =
+                    std::fs::File::create(data.path().join("pids/hook-test.pid")).unwrap();
+                assert_eq!(
+                    unsafe { libc::flock(recorder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0,
+                );
+                writeln!(
+                    recorder,
+                    "{}\n{}\nready",
+                    std::process::id(),
+                    root.display()
+                )
+                .unwrap();
+
+                let mut json = serde_json::json!({
+                    "session_id": " s1 ",
+                    "conversation_id": conversation_id,
+                    "cwd": root.to_string_lossy(),
+                    "hook_event_name": "SessionStart",
+                    "tool_name": "Write",
+                    "tool_use_id": "change-1",
+                    "tool_input": {"file_path": "file.txt"},
+                });
+                handle_payload(agent, &parse_payload(&json.to_string()).unwrap(), &root).unwrap();
+                let external_id = format!("{}:s1", agent.as_str());
+                let run = db
+                    .get_run_by_external_id(project.id, &external_id)
+                    .unwrap()
+                    .expect("SessionStart should create the fallback Run");
+                assert!(run.is_reported());
+                assert!(run.is_active());
+
+                json["hook_event_name"] = Value::String("PreToolUse".into());
+                handle_payload(agent, &parse_payload(&json.to_string()).unwrap(), &root).unwrap();
+                let boundary = db
+                    .get_run_boundary_by_external_id(run.id, "change-1")
+                    .unwrap()
+                    .expect("PreToolUse should open a boundary");
+                assert_eq!(boundary.status, "open");
+
+                std::fs::write(&file, "agent changed this").unwrap();
+                json["hook_event_name"] = Value::String("PostToolUse".into());
+                handle_payload(agent, &parse_payload(&json.to_string()).unwrap(), &root).unwrap();
+                let boundary = db
+                    .get_run_boundary_by_external_id(run.id, "change-1")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(boundary.status, "closed");
+
+                json["hook_event_name"] = Value::String("SessionEnd".into());
+                handle_payload(agent, &parse_payload(&json.to_string()).unwrap(), &root).unwrap();
+                let completed = db
+                    .get_run_by_external_id(project.id, &external_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(completed.id, run.id);
+                assert_eq!(completed.status, "completed");
+                let events = db.get_session_events(&completed).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].path, file.to_string_lossy());
+                assert_eq!(events[0].event_type, "MODIFIED");
+                assert_eq!(
+                    events[0].current_hash.as_deref(),
+                    Some(crate::snapshots::hash_bytes(b"agent changed this").as_str()),
+                );
+            }
+        }
     }
 
     #[test]

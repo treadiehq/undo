@@ -24,6 +24,13 @@ Undo snapshots regular files up to and including 100 MiB
 non-UTF-8 paths are skipped instead of being captured incompletely or keyed
 incorrectly. Undo cannot recover bytes it did not capture.
 
+The recorder captures the first write immediately. Writes suppressed within its
+500 ms throttle window schedule a final reread after 500 ms of quiet on that
+path. Other file activity does not postpone the reread, and graceful shutdown
+flushes known pending rereads. Deletes and renames are processed immediately.
+Intermediate writes may be coalesced; event timestamps reflect when contents
+were recorded, not necessarily when a writer finished.
+
 Binary files within the limit are stored and restored byte-for-byte. Text diff
 is unavailable when a NUL byte appears in the first 8 KiB.
 
@@ -182,12 +189,38 @@ This section describes low-level storage details. The database includes:
 - persisted Recoveries and their per-path expected/target hashes;
 - integration idempotency keys and stored JSON responses.
 
-The current schema version is 3. Opening the database applies additive migration
+The current schema version is 5. Opening the database applies additive migration
 for Run metadata, intent and Recovery tables, integration events, and event-ID
 checkpoint fields. The checkpoint table is rebuilt when necessary to support
 names scoped per Run while retaining legacy project-level rows. Existing history
 is preserved. A binary refuses to open a database whose schema version is newer
 than it supports.
+
+Version 5 also repairs missing event links in completed window Runs using their
+stored start and end event IDs. Earlier versions could omit these links after a
+system clock change. The repair runs once, atomically, and includes only events
+still retained in that Run's project. It preserves reported Run claims and saved
+Recovery plans. Preview a new Recovery to include any repaired Run membership;
+the repair cannot recover history already removed by retention. Binaries that
+support only schema version 4 or earlier cannot reopen the upgraded database.
+
+## Upgrading with a legacy recorder
+
+Recorders from versions before v0.1.9 do not hold the locks used by current
+releases. If one remains running during an upgrade, Undo preserves its marker
+and blocks new recorders on overlapping folders, including with `--force`.
+Both the original `~/.undo/pid` and old per-project markers are recognized.
+
+`undo status` identifies the affected folder and marker. `undo stop` and
+`undo stop --all` explain how to stop the old recorder with Ctrl-C in its
+original terminal. Undo does not automatically signal a process identified
+only by a legacy PID. `--all` still stops other verified recorders and reports
+an error while any recorders need manual attention.
+
+The same guidance can appear if the old recorder exited and its PID was reused.
+Verify that the old recorder is gone and the PID belongs to another process
+or no longer exists before removing the stale marker named in the message.
+Then retry the command.
 
 ## Troubleshoot missing or unusable history
 

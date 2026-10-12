@@ -491,7 +491,12 @@ fn normalize(input: &str) -> String {
 }
 
 fn stem(word: &str) -> String {
-    for suffix in ["ing", "ments", "ment", " fixes", "fixes", "s"] {
+    // fixes -> fix, bugfixes -> bugfix. Limit -es removal to -xes and
+    // retain at least three characters; broader rules truncate cases/caches.
+    if word.len() > 4 && word.ends_with("xes") {
+        return word[..word.len() - 2].to_string();
+    }
+    for suffix in ["ing", "ments", "ment", "s"] {
         if word.len() > suffix.len() + 2 && word.ends_with(suffix) {
             return word.trim_end_matches(suffix).to_string();
         }
@@ -920,5 +925,199 @@ mod tests {
             Some(4),
             "an exact short pronoun task label must remain targetable"
         );
+    }
+
+    /// Plural wording must reach the same task boundary as singular/gerund
+    /// wording, including when the task label is a longer description.
+    #[test]
+    fn plural_fix_queries_match_completed_intents() {
+        for label in ["fix", "fix login bug", "fix error", "bug fixes"] {
+            let intents = [run_intent(1, label)];
+            for query in [
+                "undo the fix",
+                "undo the fixing",
+                "undo the fixes",
+                "UNDO the FIXES!",
+            ] {
+                assert_eq!(
+                    match_explicit_intent(query, &intents).map(|intent| intent.id),
+                    Some(1),
+                    "{query:?} should match {label:?}"
+                );
+            }
+        }
+    }
+
+    /// Correct plural normalization must not let a tied or unfinished task
+    /// bypass the explicit-intent selection rules.
+    #[test]
+    fn plural_fix_queries_preserve_ambiguity_and_completion_checks() {
+        let tied = [run_intent(1, "fix login"), run_intent(2, "fix logout")];
+        let mut active = run_intent(3, "fix");
+        active.status = "active".to_string();
+        active.end_event_id = None;
+        active.ended_at = None;
+        for query in ["undo the fix", "undo the fixing", "undo the fixes"] {
+            assert!(match_explicit_intent(query, &tied).is_none(), "{query}");
+            assert!(
+                match_explicit_intent(query, std::slice::from_ref(&active)).is_none(),
+                "{query}"
+            );
+            let candidates = [active.clone(), run_intent(4, "fix")];
+            assert_eq!(
+                match_explicit_intent(query, &candidates).map(|intent| intent.id),
+                Some(4),
+                "{query}"
+            );
+        }
+    }
+
+    /// Broad -es stripping changes exact matches into fuzzy ties (case/cast,
+    /// cache/caching, size/sizing). Existing plurals must retain their precision.
+    #[test]
+    fn plural_query_matching_preserves_existing_intent_precision() {
+        for (plural, target, distractor) in [
+            ("cases", "case", "cast"),
+            ("caches", "cache", "caching"),
+            ("sizes", "size", "sizing"),
+            ("files", "file", "filter"),
+            ("names", "name", "naming"),
+            ("tables", "table", "tableau"),
+            ("trees", "tree", "treetop"),
+        ] {
+            let intents = [run_intent(1, target), run_intent(2, distractor)];
+            let query = format!("undo the {plural}");
+            assert_eq!(
+                match_explicit_intent(&query, &intents).map(|intent| intent.id),
+                Some(1),
+                "{query}"
+            );
+        }
+        // "changes" is normally removed as a stopword before stemming, but
+        // its singular still retains the e under the existing suffix rule.
+        assert_eq!(stem("changes"), "change");
+    }
+
+    /// The old "fixes" suffix erased part of longer words: bugfixes became
+    /// bug, and prefixes became pre, selecting a different task boundary.
+    #[test]
+    fn plural_fix_compounds_keep_their_full_target() {
+        for (plural, target, distractor) in [
+            ("bugfixes", "bugfix", "bug"),
+            ("prefixes", "prefix", "pre"),
+            ("suffixes", "suffix", "suf"),
+            ("boxes", "box", "boxer"),
+        ] {
+            let intents = [run_intent(1, target), run_intent(2, distractor)];
+            let query = format!("undo the {plural}");
+            assert_eq!(
+                match_explicit_intent(&query, &intents).map(|intent| intent.id),
+                Some(1),
+                "{query}"
+            );
+        }
+    }
+
+    /// Exercise the real command: "fixes" must save an intent Recovery for
+    /// auth work, even when the Run also contains a misleading src/fix group.
+    #[test]
+    fn plural_fix_query_previews_and_applies_only_the_intent() {
+        use crate::snapshots;
+
+        let data = tempfile::tempdir().unwrap();
+        crate::set_test_data_dir(data.path().to_path_buf());
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path().canonicalize().unwrap();
+        let db = Database::open().unwrap();
+        // Give cmd_ask a known caller project without changing the process cwd.
+        // The public Run ID resolves the separate temporary project explicitly.
+        db.get_or_create_project(&std::env::current_dir().unwrap().canonicalize().unwrap())
+            .unwrap();
+        let project = db.get_or_create_project(&root).unwrap();
+        let target = root.join("src/auth/login.rs");
+        let unrelated = root.join("src/fix/other.rs");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        let before = b"original auth\n";
+        let after = b"fixed auth\n";
+        let other = b"separate work\n";
+        let before_hash = snapshots::hash_bytes(before);
+        let after_hash = snapshots::hash_bytes(after);
+        let other_hash = snapshots::hash_bytes(other);
+        let guard = snapshots::acquire_publish_guard().unwrap();
+        for (hash, bytes) in [
+            (&before_hash, before.as_slice()),
+            (&after_hash, after.as_slice()),
+            (&other_hash, other.as_slice()),
+        ] {
+            snapshots::save_durable(&guard, project.id, hash, bytes).unwrap();
+        }
+        drop(guard);
+        db.insert_event(
+            project.id,
+            &target.to_string_lossy(),
+            "CREATED",
+            Some(&before_hash),
+            None,
+            None,
+            None,
+            Some(before.len() as i64),
+        )
+        .unwrap();
+        let run = db.start_session(project.id, "fix-work", "manual").unwrap();
+        db.start_run_intent(run.id, "fix").unwrap();
+        std::fs::write(&target, after).unwrap();
+        db.insert_event(
+            project.id,
+            &target.to_string_lossy(),
+            "MODIFIED",
+            Some(&after_hash),
+            Some(&before_hash),
+            None,
+            None,
+            Some(after.len() as i64),
+        )
+        .unwrap();
+        db.complete_run_intent(run.id, Some("fix")).unwrap();
+        std::fs::write(&unrelated, other).unwrap();
+        db.insert_event(
+            project.id,
+            &unrelated.to_string_lossy(),
+            "CREATED",
+            Some(&other_hash),
+            None,
+            None,
+            None,
+            Some(other.len() as i64),
+        )
+        .unwrap();
+        let run = db.complete_run(run.id, "completed").unwrap();
+
+        cmd_ask("undo the fixes", Some(&run.public_id()), false, false).unwrap();
+        let recovery = db
+            .get_recovery_by_ref(project.id, "rec_1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.kind, "intent");
+        assert_eq!(recovery.confidence, "explicit-intent");
+        assert!(recovery.ambiguity.is_none());
+        let entries = db.get_recovery_entries(recovery.id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, target.to_string_lossy());
+        assert_eq!(
+            entries[0].target_hash.as_deref(),
+            Some(before_hash.as_str())
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            after,
+            "preview must not write"
+        );
+        assert_eq!(std::fs::read(&unrelated).unwrap(), other);
+
+        let applied = recoveries::apply_recovery_in(&db, &project, &recovery.public_id()).unwrap();
+        assert_eq!(applied.files_changed, 1);
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(std::fs::read(&unrelated).unwrap(), other);
     }
 }

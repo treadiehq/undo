@@ -27,7 +27,10 @@ apply instead of risking the later work.
 
 The exact selection is deterministic: Undo normalizes significant request terms
 and scores completed intent labels. One intent must have the highest positive
-score.
+score. For example, "undo the fix", "undo the fixes", and "undo the fixing"
+all match a task named "fix". Compound requests such as "undo the bugfixes"
+match "bugfix" without shortening the target to "bug". Tied scores do not
+select an intent; selection falls back to whole-file groups below.
 
 For each path touched between that intent's event-ID boundaries, Undo finds the
 state before and after the intent:
@@ -108,13 +111,35 @@ undo recover --run r_421 --group auth --preview
 undo recover --run r_421 --group auth --yes
 ```
 
-Use the group IDs printed by `undo run show`. IDs retain enough path context to
-stay distinct: for example, `app/auth` and `lib/auth` are `app-auth` and
-`lib-auth`. If different paths still produce the same slug, Undo adds stable
+Use the group IDs printed in parentheses by `undo run show`: for example,
+`src/auth ... (auth)` means `--group auth`. Scripts can read these IDs from
+`change_groups[].id` in `undo run show <RUN> --json`.
+
+IDs retain enough path context to stay distinct: for example, `app/auth` and
+`lib/auth` are `app-auth` and `lib-auth`. If different paths still produce the
+same slug, Undo adds stable
 hash suffixes rather than merging their files.
 
 `--session` is an alias for `--run`. This path uses whole-file Run baselines; it
 does not use explicit intent inverse patches.
+
+For selected files, use `undo recover --run r_421 --path src/auth.rs --preview`.
+Every selected path must have recorded changes in that Run; both the old and
+new paths of a rename qualify. If any path has no recorded changes in the Run,
+Undo rejects the entire request without saving a Recovery or changing files.
+This includes never-recorded files, files whose Run events have all been pruned,
+and files changed only outside the Run.
+
+For both Run and `--before-change` recovery, `--path ./src/auth.rs` and
+`--path src/auth.rs` select the same file, including when it has been deleted.
+Repeated selections of that file produce one plan entry. If an older version
+saved an empty preview because of a path spelling, create a new preview.
+
+Window Runs include events between their start and end event IDs, even if a
+system clock change puts an event's timestamp outside the displayed Run times.
+Upgrading repairs missing Run links for retained history. If an older version
+saved an incomplete Recovery preview, create a new preview: saved plans are not
+expanded by the repair. Reported Runs still require explicit change claims.
 
 ## Recover from continuous history
 
@@ -131,6 +156,12 @@ undo restore src/server.rs 30m
 
 Directories are planned as a set of writes and deletions. Multi-file direct
 restores require `--yes`.
+
+For a single file, a time target during a deleted period restores the last
+captured contents before that deletion. Later recreation or deletion of the
+same path does not change which deleted version is selected. A target before
+recorded creation still falls back to the earliest available snapshot.
+Directory and event-ID restores preserve the file's absence at the boundary.
 
 Relative durations are evaluated separately by each command. For a stable
 boundary between preview and restore, use the same Unix timestamp:

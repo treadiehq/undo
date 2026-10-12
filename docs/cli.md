@@ -7,6 +7,23 @@ inspect it with `undo run show`, then use `undo ask` and `undo apply`.
 Run `undo <command> --help` for exact syntax. `--verbose` is a global flag; it
 currently shows each recorded change when used with `undo start`.
 
+## Install agent hooks
+
+### `undo setup --agent <claude|cursor|codex>`
+
+Install lifecycle hooks into the agent's user configuration, then start a new
+agent session normally. The hooks start recording as needed and attribute
+reported file changes to a Run.
+
+Hooks use the first nonempty identifier after trimming whitespace: they prefer
+`conversation_id`, then fall back to `session_id`. Missing, null, empty, or
+whitespace-only conversation IDs all allow the session-ID fallback. IDs are
+namespaced by agent so different agents do not share a Run accidentally.
+
+If neither identifier is usable, the hook is ignored and does not start the
+recorder. A recorder already running continues to record filesystem edits;
+those hook events do not claim them for a Run.
+
 ## Run an agent or command
 
 ### `undo run <command> [args...]`
@@ -76,8 +93,11 @@ Options:
 
 ### `undo run show <RUN> [--json]`
 
-Inspect Run metadata, changes, checkpoints, and explicit intents. A reference
-may be an `r_...` ID or an older Run/session name.
+Inspect Run metadata, changes, checkpoints, explicit intents, and file groups.
+Each file group shows its label and its ID in parentheses; pass that ID to
+`undo recover --group`. With `--json`, groups are available in `change_groups`
+(see [Machine output](machine-output.md#inspect-one-run-from-a-script)). A
+reference may be an `r_...` ID or an older Run/session name.
 
 ### `undo run list [--json]` and `undo runs [--json]`
 
@@ -123,10 +143,16 @@ undo recover --before-change 1042 --path src/auth.rs --yes
 
 - `--path <PATH>` (repeatable) limits a Run recovery to exact files —
   "undo these files from the Run, keep the rest". The same selective undo the
-  web UI offers with checkboxes.
+  web UI offers with checkboxes. Every selected path must have recorded changes
+  in that Run (including rename sources); otherwise the entire request is
+  rejected without saving a Recovery or changing files.
 - `--before-change <CHANGE_ID>` restores the `--path` files to their state
   just before that recorded change (change ids are shown by
   `undo run show`). Use it to undo un-attributed edits that belong to no Run.
+- In both modes, paths are relative to the current directory or absolute within
+  the project. Equivalent spellings such as `./src/auth.rs`, `src/./auth.rs`,
+  and `src//auth.rs` select the same file, even after deletion. Repeated
+  selections produce one plan entry regardless of their spelling or order.
 - `--session` aliases `--run`. `--preview` writes nothing. Without
   `--preview`, `--yes` is required.
 
@@ -180,6 +206,8 @@ undo start &
 
 `--force` bypasses root/ownership, overlap, and 50,000-file startup guards. Run
 wrappers start this recorder automatically when needed, without `--force`.
+Potentially live legacy recorders still block overlapping starts, including
+with `--force`; stop them from their original terminal first.
 
 ### `undo timeline [options]`
 
@@ -189,6 +217,11 @@ Show recent filesystem events.
 - `--since <duration>`, such as `30m`, `2h`, or `1d`.
 - `--bursts` to summarize rapid large changes.
 - `--deleted` to show only deletion events.
+
+Filters apply before `--limit`: `undo timeline --deleted --since 1h --limit 20`
+shows up to 20 deletion events from the last hour. This includes deletion
+activity without a saved snapshot; `undo deleted` lists recoverable deletions.
+Empty results describe the selected event type and time range.
 
 ### `undo what-changed <duration>`
 
@@ -203,6 +236,16 @@ uses the latest recorded version.
   timestamp and cannot be combined with a duration.
 - `--summary` prints only line counts.
 - `--stat` prints line counts before the unified diff.
+
+Diff headers separate each version label from the path with a space:
+
+```text
+--- selected saved src/server.rs
++++ current src/server.rs
+```
+
+Restore previews use the same format with `current` and `restored` or `deleted`
+labels.
 
 ### `undo preview <PATH> <duration>`
 
@@ -221,6 +264,10 @@ Other options:
 
 - `--preview` writes nothing.
 - `--yes` is required when a plan changes more than one file.
+
+For a single-file duration or timestamp target during a deleted period, restore
+uses the last captured contents before that deletion. Targets before recorded
+creation still fall back to the earliest available snapshot.
 
 For modern checkpoints, restore uses the event-ID anchor. Older checkpoints
 without an event anchor fall back to their timestamp. This differs from
@@ -285,12 +332,16 @@ shows whether each one is currently recording.
 
 Show the matching watched project, recorder liveness, database and snapshot
 counts, deep snapshot integrity result, retention settings, disk use, and log
-path.
+path. Potentially live legacy recorders are identified with manual shutdown
+guidance rather than reported as not running.
 
 ### `undo stop [--all]`
 
 Stop the recorder for the current project. `--all` stops every live recorder
-known under `~/.undo/pids/`.
+verified by its lock under `~/.undo/pids/`. Legacy recorders without locks are
+left untouched, with guidance to stop them from their original terminal.
+`--all` checks both legacy marker layouts, continues stopping verified
+recorders, and returns an error if any recorders still need attention.
 
 ### `undo prune [options]`
 
@@ -321,3 +372,15 @@ undo sessions
 These commands use the same `sessions` table as Runs. `undo sessions` lists Runs.
 The older session start/show output remains for compatibility; prefer
 `undo run ...`, `undo runs`, and `undo run show ...` in new integrations.
+
+`undo session stop` synchronizes files in the active Run's stored project before
+saving its end boundary. This includes pending creations, edits, and deletions
+that the recorder has not yet processed, even if recording has moved between
+parent and nested projects. It uses the existing recording filters and scan
+safeguards. Finish file writes before stopping; synchronization is not an atomic
+snapshot of files that other processes are still changing.
+
+Stopping does not start a recorder. With no active Run, it prints `No active
+Run.` and succeeds. Multiple active Runs require an explicit choice through
+`undo run stop <RUN>`. If synchronization returns an error, the Run remains
+active so you can correct the problem and retry.

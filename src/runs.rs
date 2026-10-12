@@ -197,6 +197,7 @@ pub fn cmd_run_show(reference: &str, output: Output) -> Result<()> {
                 "run_id": run.public_id(),
                 "run": run,
                 "changes": events,
+                "change_groups": change_groups,
                 "intents": intents,
                 "checkpoints": checkpoints,
             }))?
@@ -316,12 +317,15 @@ pub fn cmd_run_show(reference: &str, output: Output) -> Result<()> {
         println!("{}File groups{}", BOLD, RESET);
         for group in change_groups {
             println!(
-                "  {:<18} {} files, {} recorded changes, +{} -{}",
+                "  {:<18} {} files, {} recorded changes, +{} -{} {}({}){}",
                 group.label,
                 group.paths.len(),
                 group.event_count,
                 group.inserted,
-                group.deleted
+                group.deleted,
+                DIM,
+                group.id,
+                RESET
             );
         }
     }
