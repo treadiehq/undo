@@ -105,8 +105,7 @@ pub struct TimelineItem {
     pub id: String,
     /// "run", "collision", or "edits".
     pub kind: String,
-    /// Display label: agent name, "Unattributed edits", or
-    /// "Rapid unattributed changes".
+    /// Display label: agent name or "Unattributed changes".
     pub label: String,
     pub actor: String,
     pub agent: Option<String>,
@@ -368,11 +367,7 @@ fn edits_item(
     TimelineItem {
         id: format!("g_{}", first.id),
         kind: "edits".to_string(),
-        label: if pace == "machine" {
-            "Rapid unattributed changes".to_string()
-        } else {
-            "Unattributed edits".to_string()
-        },
+        label: "Unattributed changes".to_string(),
         actor: "unattributed".to_string(),
         agent: None,
         command: None,
@@ -474,7 +469,7 @@ fn classify_pace(events: &[FileEvent]) -> &'static str {
 
 /// Dominant directory of an item's files (up to two leading components),
 /// reported when at least 60% of the files live under it. Gives un-attributed
-/// groups a scannable identity: "Unattributed edits · src/auth".
+/// groups a scannable identity: "Unattributed changes · src/auth".
 fn scope_hint(files: &[FileChange]) -> Option<String> {
     if files.len() < 2 {
         return None;
@@ -692,21 +687,38 @@ pub fn diff_payload(
             .unwrap_or_default(),
     };
 
-    let change = net_change(first, last);
-    if crate::diff::is_binary(&old) || crate::diff::is_binary(&new) {
+    diff_from_contents(
+        rel_path,
+        &net_change(first, last),
+        &old,
+        &new,
+        Some(first.timestamp),
+        Some(last.timestamp),
+    )
+}
+
+fn diff_from_contents(
+    rel_path: &str,
+    change: &str,
+    old: &[u8],
+    new: &[u8],
+    old_timestamp: Option<i64>,
+    new_timestamp: Option<i64>,
+) -> Result<DiffPayload> {
+    if crate::diff::is_binary(old) || crate::diff::is_binary(new) {
         return Ok(DiffPayload {
             path: rel_path.to_string(),
-            change,
+            change: change.to_string(),
             binary: true,
             inserted: 0,
             deleted: 0,
-            old_timestamp: Some(first.timestamp),
-            new_timestamp: Some(last.timestamp),
+            old_timestamp,
+            new_timestamp,
             hunks: Vec::new(),
         });
     }
 
-    let (old_text, new_text) = crate::diff::render_bytes_for_diff(&old, &new);
+    let (old_text, new_text) = crate::diff::render_bytes_for_diff(old, new);
     let text_diff = TextDiff::from_lines(old_text.as_ref(), new_text.as_ref());
     let mut inserted = 0usize;
     let mut deleted = 0usize;
@@ -755,13 +767,95 @@ pub fn diff_payload(
 
     Ok(DiffPayload {
         path: rel_path.to_string(),
-        change,
+        change: change.to_string(),
         binary: false,
         inserted,
         deleted,
-        old_timestamp: Some(first.timestamp),
-        new_timestamp: Some(last.timestamp),
+        old_timestamp,
+        new_timestamp,
         hunks,
+    })
+}
+
+/// A transient preview: calculating this never saves a recovery or writes files.
+#[derive(Serialize)]
+pub struct RestorePreviewPayload {
+    pub timestamp: i64,
+    pub entries: Vec<RecoveryEntryView>,
+    pub diff: Option<DiffPayload>,
+}
+
+pub fn restore_preview_payload(
+    db: &Database,
+    project: &WatchedProject,
+    timestamp: i64,
+    rel_path: Option<&str>,
+) -> Result<RestorePreviewPayload> {
+    use crate::restore_fs::{CappedRead, ProjectPath, RestoreFs};
+
+    let selected = rel_path
+        .map(|path| ProjectPath::from_relative(Path::new(path)))
+        .transpose()?;
+    // Use the whole-project planner even for the selected file. Single-file
+    // CLI recovery has different fallback semantics for absent/deleted paths.
+    let plan = crate::restore::plan_restore(
+        db,
+        project,
+        Path::new(&project.root_path),
+        ".",
+        timestamp,
+        false,
+    )?;
+    let entries = crate::recoveries::prepare_restore_entries(project, &plan)?;
+    let diff = if let Some(path) = selected {
+        let display = path.display();
+        let absolute = path.absolute(project);
+        let entry = entries
+            .iter()
+            .find(|entry| Path::new(&entry.path) == absolute);
+        let payload = if let Some(entry) = entry {
+            let fs = RestoreFs::open(project)?;
+            let (exists, current) = match fs.read_capped(&path, snapshots::MAX_SNAPSHOT_SIZE)? {
+                CappedRead::Missing => (false, Vec::new()),
+                CappedRead::Content(bytes) => (true, bytes),
+                CappedRead::TooLarge => anyhow::bail!("{} is too large to preview", display),
+            };
+            let hash = exists.then(|| snapshots::hash_bytes(&current));
+            if exists != entry.expected_exists || hash != entry.expected_hash {
+                anyhow::bail!("{} changed while reading its preview. Try again.", display);
+            }
+            let restored = entry
+                .target_hash
+                .as_deref()
+                .map(|hash| snapshots::load(project.id, hash))
+                .transpose()?
+                .unwrap_or_default();
+            let change = if entry.action == "DELETE" {
+                "deleted"
+            } else if !exists {
+                "created"
+            } else {
+                "modified"
+            };
+            diff_from_contents(&display, change, &current, &restored, None, Some(timestamp))?
+        } else {
+            diff_from_contents(&display, "unchanged", b"", b"", None, Some(timestamp))?
+        };
+        Some(payload)
+    } else {
+        None
+    };
+    Ok(RestorePreviewPayload {
+        timestamp,
+        entries: entries
+            .iter()
+            .map(|entry| RecoveryEntryView {
+                path: relative_path(&entry.path, &project.root_path).to_string(),
+                action: entry.action.clone(),
+                source_timestamp: entry.source_timestamp,
+            })
+            .collect(),
+        diff,
     })
 }
 
@@ -1297,5 +1391,231 @@ mod tests {
         assert_eq!(lines, vec!["ctx", "del", "add", "ctx"]);
         assert_eq!(payload.hunks[0].lines[1].text, "line two");
         assert_eq!(payload.hunks[0].lines[2].text, "line 2");
+    }
+
+    struct PreviewFixture {
+        _data: tempfile::TempDir,
+        _tree: tempfile::TempDir,
+        db: Database,
+        project: WatchedProject,
+    }
+
+    impl PreviewFixture {
+        fn new() -> Self {
+            let data = tempfile::tempdir().unwrap();
+            crate::set_test_data_dir(data.path().to_path_buf());
+            let tree = tempfile::tempdir().unwrap();
+            let db = Database::open().unwrap();
+            let project = db
+                .get_or_create_project(&tree.path().canonicalize().unwrap())
+                .unwrap();
+            Self {
+                _data: data,
+                _tree: tree,
+                db,
+                project,
+            }
+        }
+
+        fn record(&self, path: &str, at: i64, before: Option<&[u8]>, after: Option<&[u8]>) {
+            let guard = snapshots::acquire_publish_guard().unwrap();
+            let save = |content: &[u8]| {
+                let hash = snapshots::hash_bytes(content);
+                snapshots::save_durable(&guard, self.project.id, &hash, content).unwrap();
+                hash
+            };
+            let previous = before.map(save);
+            let current = after.map(save);
+            let absolute = Path::new(&self.project.root_path).join(path);
+            self.db
+                .insert_event(
+                    self.project.id,
+                    absolute.to_str().unwrap(),
+                    if after.is_none() {
+                        "DELETED"
+                    } else if before.is_none() {
+                        "CREATED"
+                    } else {
+                        "MODIFIED"
+                    },
+                    current.as_deref(),
+                    previous.as_deref(),
+                    None,
+                    None,
+                    after.map(|value| value.len() as i64),
+                )
+                .unwrap();
+            self.db
+                .set_event_timestamp(self.db.max_event_id(self.project.id).unwrap(), at)
+                .unwrap();
+            if let Some(content) = after {
+                std::fs::write(absolute, content).unwrap();
+            } else {
+                let _ = std::fs::remove_file(absolute);
+            }
+        }
+
+        fn preview(&self, at: i64, path: &str) -> RestorePreviewPayload {
+            restore_preview_payload(&self.db, &self.project, at, Some(path)).unwrap()
+        }
+    }
+
+    #[test]
+    fn restore_preview_tracks_time_boundaries_and_current_to_target_direction() {
+        let f = PreviewFixture::new();
+        f.record("a.rs", 100, None, Some(b"one\n"));
+        f.record("a.rs", 200, Some(b"one\n"), Some(b"two\n"));
+        f.record("a.rs", 300, Some(b"two\n"), Some(b"three\n"));
+        for (at, expected) in [(150, "one"), (200, "two"), (299, "two")] {
+            let preview = f.preview(at, "a.rs");
+            assert_eq!(preview.entries.len(), 1);
+            let diff = preview.diff.unwrap();
+            let lines = &diff.hunks[0].lines;
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.kind == "del" && line.text == "three")
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.kind == "add" && line.text == expected)
+            );
+            assert_eq!(diff.new_timestamp, Some(at));
+        }
+        let now = f.preview(300, "a.rs");
+        assert!(now.entries.is_empty());
+        assert_eq!(now.diff.unwrap().change, "unchanged");
+        assert_eq!(
+            std::fs::read(Path::new(&f.project.root_path).join("a.rs")).unwrap(),
+            b"three\n"
+        );
+        let conn = rusqlite::Connection::open(f._data.path().join("database.db")).unwrap();
+        let saved: i64 = conn
+            .query_row("SELECT COUNT(*) FROM recoveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(saved, 0, "scrubbing must not persist recovery plans");
+    }
+
+    #[test]
+    fn restore_preview_matches_saved_plan_and_selected_file_deletion() {
+        let f = PreviewFixture::new();
+        f.record("created.txt", 200, None, Some(b"new\n"));
+        f.record("deleted.txt", 100, None, Some(b"bring back\n"));
+        f.record("deleted.txt", 200, Some(b"bring back\n"), None);
+        f.record("same.txt", 100, None, Some(b"same\n"));
+        f.record("same.txt", 200, Some(b"same\n"), Some(b"temporary\n"));
+        f.record("same.txt", 300, Some(b"temporary\n"), Some(b"same\n"));
+        let preview = f.preview(150, "created.txt");
+        assert_eq!(
+            preview.entries.len(),
+            2,
+            "exclude edits that already match the target"
+        );
+        assert_eq!(preview.diff.unwrap().change, "deleted");
+        assert_eq!(
+            f.preview(150, "deleted.txt").diff.unwrap().change,
+            "created"
+        );
+        assert_eq!(f.preview(150, "same.txt").diff.unwrap().change, "unchanged");
+        let recovery = crate::recoveries::create_timestamp_recovery_in(
+            &f.db,
+            &f.project,
+            Path::new(&f.project.root_path),
+            ".",
+            150,
+            "test",
+            "web",
+        )
+        .unwrap();
+        let saved = recovery_view(&f.db, &f.project, &recovery).unwrap();
+        assert_eq!(
+            serde_json::to_value(preview.entries).unwrap(),
+            serde_json::to_value(saved.entries).unwrap()
+        );
+        let selected = crate::recoveries::create_selected_timestamp_recovery_in(
+            &f.db,
+            &f.project,
+            150,
+            &["created.txt".into()],
+            "test",
+        )
+        .unwrap();
+        let selected = f.db.get_recovery_entries(selected.id).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].action, "DELETE");
+        assert!(Path::new(&f.project.root_path).join("created.txt").exists());
+        assert!(!Path::new(&f.project.root_path).join("deleted.txt").exists());
+    }
+
+    #[test]
+    fn restore_preview_covers_both_sides_of_rename() {
+        let f = PreviewFixture::new();
+        f.record("before.txt", 100, None, Some(b"contents\n"));
+        let root = Path::new(&f.project.root_path);
+        let old = root.join("before.txt");
+        let new = root.join("after.txt");
+        std::fs::rename(&old, &new).unwrap();
+        let hash = snapshots::hash_bytes(b"contents\n");
+        f.db.insert_event(
+            f.project.id,
+            new.to_str().unwrap(),
+            "RENAMED",
+            Some(&hash),
+            Some(&hash),
+            None,
+            old.to_str(),
+            Some(9),
+        )
+        .unwrap();
+        f.db.set_event_timestamp(f.db.max_event_id(f.project.id).unwrap(), 200)
+            .unwrap();
+        assert_eq!(f.preview(150, "before.txt").diff.unwrap().change, "created");
+        let preview = f.preview(150, "after.txt");
+        assert_eq!(preview.entries.len(), 2);
+        assert_eq!(preview.diff.unwrap().change, "deleted");
+        assert!(f.preview(200, "after.txt").entries.is_empty());
+    }
+
+    #[test]
+    fn restore_preview_handles_binary_empty_and_missing_snapshots_honestly() {
+        let f = PreviewFixture::new();
+        f.record("binary.dat", 100, None, Some(b"\0old"));
+        f.record("binary.dat", 200, Some(b"\0old"), Some(b"\0new"));
+        assert!(f.preview(150, "binary.dat").diff.unwrap().binary);
+        assert_eq!(
+            f.preview(200, "binary.dat").diff.unwrap().change,
+            "unchanged"
+        );
+        f.record("empty.txt", 200, None, Some(b""));
+        assert_eq!(f.preview(150, "empty.txt").diff.unwrap().change, "deleted");
+        let hash = snapshots::hash_bytes(b"\0old");
+        std::fs::remove_file(
+            f._data
+                .path()
+                .join("snapshots")
+                .join(f.project.id.to_string())
+                .join(format!("{hash}.gz")),
+        )
+        .unwrap();
+        assert!(restore_preview_payload(&f.db, &f.project, 150, Some("binary.dat")).is_err());
+    }
+
+    #[test]
+    fn restore_preview_rejects_paths_outside_project() {
+        let f = PreviewFixture::new();
+        for path in ["../outside", "/etc/passwd", "a/../../outside"] {
+            assert!(restore_preview_payload(&f.db, &f.project, 150, Some(path)).is_err());
+            assert!(
+                crate::recoveries::create_selected_timestamp_recovery_in(
+                    &f.db,
+                    &f.project,
+                    150,
+                    &[path.into()],
+                    "test",
+                )
+                .is_err()
+            );
+        }
     }
 }

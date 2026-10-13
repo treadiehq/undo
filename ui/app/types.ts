@@ -117,6 +117,12 @@ export interface RecoveryEntryView {
   source_timestamp: number | null
 }
 
+export interface RestorePreviewPayload {
+  timestamp: number
+  entries: RecoveryEntryView[]
+  diff: DiffPayload | null
+}
+
 export interface RecoveryView {
   id: string
   status: string

@@ -7,6 +7,9 @@ const props = defineProps<{
   itemId: string
   selected: boolean
   active: boolean
+  restoreAction?: 'WRITE' | 'DELETE' | null
+  timePreview?: boolean
+  pending?: boolean
 }>()
 
 const emit = defineEmits<{ toggle: []; open: [] }>()
@@ -14,15 +17,15 @@ const emit = defineEmits<{ toggle: []; open: [] }>()
 
 <template>
   <div
-    class="relative flex min-h-12 items-center gap-3 px-5 py-2 transition-colors"
-    :class="active ? 'bg-selected before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:bg-accent' : 'hover:bg-edge/40'"
+    class="file-row relative flex min-h-12 items-center gap-3 px-5 py-2 transition-colors"
+    :class="active ? 'bg-selected before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:bg-accent' : restoreAction ? 'bg-accent/5 hover:bg-accent/10' : 'hover:bg-edge/40'"
   >
     <input
       type="checkbox"
       class="ui-checkbox"
       :checked="selected"
-      :disabled="!props.file.recoverable"
-      :aria-label="`Include ${props.file.path} in run restore`"
+      :disabled="pending || (!timePreview && !props.file.recoverable)"
+      :aria-label="`Include ${props.file.path} in restore`"
       :title="props.file.warning ?? undefined"
       @change="emit('toggle')"
     />
@@ -39,19 +42,24 @@ const emit = defineEmits<{ toggle: []; open: [] }>()
           <template v-if="props.file.old_path">{{ props.file.old_path }} → </template>
           {{ splitPath(props.file.path).dir.replace(/\/$/, '') || 'Project root' }}
         </span>
-        <span v-if="!props.file.recoverable" class="block text-[11px] text-warn" :title="props.file.warning ?? undefined">
+        <span v-if="!timePreview && !props.file.recoverable" class="block text-[11px] text-warn" :title="props.file.warning ?? undefined">
           {{ props.file.ownership_status }} · whole-file restore unavailable
         </span>
       </span>
       <span class="flex shrink-0 flex-col items-end gap-0.5 text-[11px]">
-        <span v-if="props.file.change !== 'modified'" class="capitalize" :class="props.file.change === 'deleted' ? 'text-del' : 'text-mut'">
-          {{ props.file.change }}
+        <span v-if="timePreview" :class="restoreAction === 'DELETE' ? 'text-del' : restoreAction === 'WRITE' ? 'text-accent' : 'text-mut'">
+          {{ restoreAction === 'DELETE' ? 'Delete' : restoreAction === 'WRITE' ? 'Restore' : '…' }}
         </span>
-        <span v-if="props.file.binary" class="text-mut">Binary</span>
-        <span v-else class="flex gap-2 font-mono tabular-nums">
-          <span class="text-add">+{{ props.file.inserted }}</span>
-          <span class="text-del">−{{ props.file.deleted }}</span>
-        </span>
+        <template v-else>
+          <span v-if="props.file.change !== 'modified'" class="capitalize" :class="props.file.change === 'deleted' ? 'text-del' : 'text-mut'">
+            {{ props.file.change }}
+          </span>
+          <span v-if="props.file.binary" class="text-mut">Binary</span>
+          <span v-else class="flex gap-2 font-mono tabular-nums">
+            <span class="text-add">+{{ props.file.inserted }}</span>
+            <span class="text-del">−{{ props.file.deleted }}</span>
+          </span>
+        </template>
       </span>
     </button>
   </div>

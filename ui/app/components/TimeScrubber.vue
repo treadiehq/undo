@@ -75,16 +75,7 @@ const activityBuckets = computed(() => {
 const maxBucketCount = computed(() =>
   Math.max(1, ...activityBuckets.value.map((bucket) => bucket.count)),
 )
-const impact = computed(() => {
-  const paths = new Set<string>()
-  for (const item of state.timeline?.items ?? []) {
-    for (const file of item.files) {
-      if (file.last_timestamp <= selected.value) continue
-      paths.add(file.path)
-    }
-  }
-  return { files: paths.size }
-})
+const affectedFiles = computed(() => state.restorePreview?.entries.length ?? 0)
 
 function bucketHeight(count: number): string {
   if (count === 0) return '3px'
@@ -133,11 +124,13 @@ function previewSelected() {
         </label>
       </details>
       <div class="flex items-center gap-5">
-        <p class="text-right text-[12px] text-mut">
-          <span class="text-ink">{{ impact.files }} file{{ impact.files === 1 ? '' : 's' }}</span> after this point
-          <span class="mt-0.5 block text-[11px]">Review before restoring</span>
+        <p class="min-w-32 text-right text-[12px] tabular-nums text-mut" role="status">
+          <span v-if="state.restorePreviewError" class="text-warn">Preview unavailable</span>
+          <span v-else-if="!state.restorePreview">Reading changes…</span>
+          <template v-else><span class="text-ink">{{ affectedFiles }} file{{ affectedFiles === 1 ? '' : 's' }}</span> would change</template>
+          <span class="mt-0.5 block text-[11px]">{{ state.restorePreviewLoading ? 'Updating preview…' : 'Review before restoring' }}</span>
         </p>
-        <button class="ui-button ui-button-primary" :disabled="!hasHistory || state.recoveryBusy" aria-label="Preview time-based restore" @click="previewSelected">
+        <button class="ui-button ui-button-primary" :disabled="!hasHistory || state.recoveryBusy || state.restorePreviewLoading || !!state.restorePreviewError || affectedFiles === 0" aria-label="Preview time-based restore" @click="previewSelected">
           Preview
           <UiIcon name="chevron" :size="13" class="-rotate-90" />
         </button>
@@ -149,7 +142,7 @@ function previewSelected() {
         <span
           v-for="(bucket, index) in activityBuckets"
           :key="index"
-          class="min-w-0 flex-1 rounded-t-[1px]"
+          class="min-w-0 flex-1 rounded-t-[1px] transition-colors duration-150"
           :class="bucket.timestamp > selected ? 'bg-accent/45' : 'bg-edge-strong/60'"
           :style="{ height: bucketHeight(bucket.count) }"
           :title="`${bucket.count} recorded change${bucket.count === 1 ? '' : 's'}`"
@@ -160,7 +153,7 @@ function previewSelected() {
         type="range"
         :min="historyStart"
         :max="serverNow"
-        :step="60"
+        :step="1"
         :disabled="!hasHistory"
         :aria-valuetext="`${fmtDay(selected)} at ${fmtClock(selected)}`"
         class="restore-range absolute inset-x-0 bottom-0 z-10 h-4 w-full disabled:cursor-not-allowed disabled:opacity-40"

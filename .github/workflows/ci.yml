@@ -49,8 +49,9 @@ jobs:
         with:
           node-version: 24
 
-      - name: Build web UI
+      - name: Test and build web UI
         run: |
           cd ui
           npm ci
+          npm test
           npm run build

@@ -123,6 +123,40 @@ pub(crate) fn create_timestamp_recovery_in(
     kind: &str,
 ) -> Result<Recovery> {
     let plan = restore::plan_restore(db, project, base_dir, path, target_timestamp, false)?;
+    save_timestamp_recovery(db, project, &plan, request, kind)
+}
+
+/// Select files from the same whole-project timestamp plan shown by the UI.
+pub(crate) fn create_selected_timestamp_recovery_in(
+    db: &Database,
+    project: &WatchedProject,
+    target_timestamp: i64,
+    paths: &[String],
+    request: &str,
+) -> Result<Recovery> {
+    let selected = paths
+        .iter()
+        .map(|path| ProjectPath::from_relative(std::path::Path::new(path)))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut plan = restore::plan_restore(
+        db,
+        project,
+        std::path::Path::new(&project.root_path),
+        ".",
+        target_timestamp,
+        false,
+    )?;
+    plan.entries.retain(|entry| selected.contains(&entry.path));
+    save_timestamp_recovery(db, project, &plan, request, "web")
+}
+
+fn save_timestamp_recovery(
+    db: &Database,
+    project: &WatchedProject,
+    plan: &RestorePlan,
+    request: &str,
+    kind: &str,
+) -> Result<Recovery> {
     persist_restore_plan(
         db,
         project,
@@ -133,7 +167,7 @@ pub(crate) fn create_timestamp_recovery_in(
             confidence: "exact-timestamp",
             ambiguity: None,
         },
-        &plan,
+        plan,
     )
 }
 
@@ -530,6 +564,24 @@ fn persist_restore_plan(
     spec: RecoverySpec<'_>,
     plan: &RestorePlan,
 ) -> Result<Recovery> {
+    let entries = prepare_restore_entries(project, plan)?;
+    db.create_recovery(
+        project.id,
+        spec.run_id,
+        spec.request,
+        spec.kind,
+        spec.confidence,
+        spec.ambiguity,
+        &entries,
+    )
+}
+
+/// Read-only preparation shared by live UI previews and saved recoveries.
+/// In particular, both omit files already matching the requested state.
+pub(crate) fn prepare_restore_entries(
+    project: &WatchedProject,
+    plan: &RestorePlan,
+) -> Result<Vec<RecoveryEntry>> {
     let fs = RestoreFs::open(project)?;
     let mut entries = Vec::new();
     for entry in &plan.entries {
@@ -576,15 +628,7 @@ fn persist_restore_plan(
             expected_exists: expected.exists,
         });
     }
-    db.create_recovery(
-        project.id,
-        spec.run_id,
-        spec.request,
-        spec.kind,
-        spec.confidence,
-        spec.ambiguity,
-        &entries,
-    )
+    Ok(entries)
 }
 
 fn preflight_entries(
