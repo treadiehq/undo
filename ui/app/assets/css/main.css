@@ -1,24 +1,23 @@
 @import "tailwindcss";
 
-/* Design tokens lifted from useundo.co: dark zinc, monochrome chrome, system
-   fonts, restrained accent colors reserved for meaning (adds, deletes,
-   recording state). */
+/* useundo.co palette; soft fills derive from the same semantic colors. */
 @theme {
   --color-bg: #09090b;
-  --color-panel: #111113;
-  --color-well: #0c0c0e;
-  --color-edge: #232326;
-  --color-edge-strong: #34343a;
+  --color-panel: #18181b;
+  --color-well: #111113;
+  --color-edge: #27272a;
+  --color-edge-strong: #3f3f46;
   --color-ink: #e4e4e7;
   --color-mut: #a1a1aa;
-  --color-dim: #63636b;
-  --color-add: #4ade80;
-  --color-add-soft: rgba(74, 222, 128, 0.09);
+  --color-dim: var(--color-mut);
+  --color-add: #34d399;
+  --color-add-soft: color-mix(in srgb, var(--color-add) 12%, var(--color-bg));
   --color-del: #f87171;
-  --color-del-soft: rgba(248, 113, 113, 0.09);
-  --color-warn: #fbbf24;
-  --color-live: #34d399;
+  --color-del-soft: color-mix(in srgb, var(--color-del) 12%, var(--color-bg));
+  --color-warn: #fcd34d;
+  --color-live: var(--color-add);
   --color-accent: #93c5fd;
+  --color-selected: color-mix(in srgb, var(--color-accent) 14%, var(--color-panel));
 
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
@@ -38,40 +37,71 @@ body {
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   overscroll-behavior: none;
+  color-scheme: dark;
 }
 
 ::selection {
-  background: rgba(167, 139, 250, 0.28);
+  background: color-mix(in srgb, var(--color-accent) 30%, var(--color-bg));
+}
+
+button:not(:disabled), summary, input[type="checkbox"]:not(:disabled) {
+  cursor: pointer;
+}
+
+:is(button, input, summary):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 7px 13px;
+  border: 1px solid var(--color-edge-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-ink);
+  font-size: 12px;
+  font-weight: 500;
+  transition: background-color 120ms ease;
+}
+.ui-button:hover:not(:disabled) { background: var(--color-edge); }
+.ui-button-primary { background: var(--color-ink); border-color: transparent; color: var(--color-bg); }
+.ui-button-primary:hover:not(:disabled) { background: #fff; }
+.ui-button:disabled { opacity: .4; cursor: not-allowed; }
+.ui-checkbox { width: 14px; height: 14px; flex-shrink: 0; accent-color: var(--color-accent); }
+.ui-checkbox:disabled { opacity: .4; cursor: not-allowed; }
+
+.app-workspace { display: grid; grid-template-columns: minmax(19rem, 35%) minmax(0, 1fr); }
+@media (max-width: 760px) {
+  .app-shell { height: auto; min-height: 100%; overflow: visible; }
+  .app-workspace { display: flex; flex-direction: column; }
+  .timeline-feed { overflow: visible; }
+  .diff-panel { min-height: 28rem; border-left: 0; border-top: 1px solid var(--color-edge); }
+  .diff-body { max-height: 65vh; }
+}
+@media (pointer: coarse) {
+  .ui-button { min-height: 44px; }
 }
 
 /* Slim, unobtrusive scrollbars everywhere. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #2c2c31 transparent;
+  scrollbar-color: var(--color-edge-strong) transparent;
 }
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 *::-webkit-scrollbar-thumb {
-  background: #2c2c31;
+  background: var(--color-edge-strong);
   border-radius: 8px;
 }
 *::-webkit-scrollbar-track {
   background: transparent;
-}
-
-@keyframes pulse-dot {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45);
-  }
-  55% {
-    box-shadow: 0 0 0 5px rgba(52, 211, 153, 0);
-  }
-}
-.live-dot {
-  animation: pulse-dot 2.2s ease-out infinite;
 }
 
 @keyframes rise-in {
@@ -86,4 +116,8 @@ body {
 }
 .rise-in {
   animation: rise-in 180ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }

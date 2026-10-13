@@ -10,6 +10,14 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-10-13
+
+- Refined the local UI with a wider diff pane, clearer text contrast, compact
+  time controls, and a quieter file list. Restore previews keep ownership
+  warnings and deletion details visible, with native keyboard-accessible
+  selection controls and a focused review dialog. The neutral and semantic
+  colors match useundo.co, with subtle fills derived from the same palette.
+
 ## [0.2.13] — 2026-10-12
 
 - Diff headers separate version labels from filenames with an explicit space,
@@ -380,7 +388,8 @@ For recorders older than v0.1.9, follow the manual shutdown guidance in
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.13...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.14...HEAD
+[0.2.14]: https://github.com/treadiehq/undo/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/treadiehq/undo/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/treadiehq/undo/compare/v0.2.11...v0.2.12
 [0.2.9]: https://github.com/treadiehq/undo/compare/v0.2.8...v0.2.9

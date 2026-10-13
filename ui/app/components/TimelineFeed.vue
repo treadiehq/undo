@@ -35,14 +35,14 @@ const dayGroups = computed(() => {
 </script>
 
 <template>
-  <section class="min-h-0 overflow-y-auto px-5 py-4">
+  <section class="timeline-feed min-h-0 min-w-0 overflow-y-auto bg-panel" aria-label="Recorded activity">
     <!-- Panic alert: a recent un-attributed group deleted multiple files -->
-    <PanicBanner v-if="!state.timelineLoading" />
+    <PanicBanner v-if="!state.timelineLoading" class="mx-4 mt-4" />
 
     <!-- Focus mode banner -->
     <div
       v-if="focusedItem"
-      class="mb-3 flex items-center gap-2.5 rounded-xl border border-accent/25 bg-accent/5 px-4 py-2.5"
+      class="mx-4 mt-4 mb-3 flex items-center gap-2.5 rounded-xl border border-accent/25 bg-accent/5 px-4 py-2.5"
     >
       <UiIcon name="bot" :size="13" class="shrink-0 text-accent" />
       <span class="min-w-0 flex-1 truncate text-[12.5px] text-mut">
@@ -58,7 +58,7 @@ const dayGroups = computed(() => {
     </div>
 
     <!-- Loading skeleton -->
-    <div v-if="state.timelineLoading" class="flex flex-col gap-3">
+    <div v-if="state.timelineLoading" class="flex flex-col gap-3 p-5">
       <div
         v-for="index in 4"
         :key="index"
@@ -69,7 +69,7 @@ const dayGroups = computed(() => {
     <!-- Empty state -->
     <div
       v-else-if="dayGroups.length === 0"
-      class="flex h-full flex-col items-center justify-center gap-3 text-center"
+      class="flex h-full min-h-64 flex-col items-center justify-center gap-3 p-5 text-center"
     >
       <span class="grid size-14 place-items-center rounded-2xl border border-edge bg-panel text-dim">
         <UiIcon name="clock" :size="22" />
@@ -84,13 +84,12 @@ const dayGroups = computed(() => {
     </div>
 
     <!-- Feed -->
-    <div v-else class="flex flex-col gap-3 pb-4">
+    <div v-else class="pb-4">
       <template v-for="group in dayGroups" :key="group.day">
-        <div class="mt-1 flex items-center gap-3 first:mt-0">
-          <span class="text-[11px] font-semibold uppercase tracking-widest text-dim">
+        <div class="px-5 pt-5 pb-1">
+          <span class="text-[11px] font-medium uppercase tracking-widest text-dim">
             {{ group.day }}
           </span>
-          <span class="h-px flex-1 bg-edge" />
         </div>
         <TimelineItemCard
           v-for="item in group.items"

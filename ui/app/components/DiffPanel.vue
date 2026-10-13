@@ -14,12 +14,10 @@ const item = computed(() =>
   state.timeline?.items.find((entry) => entry.id === state.diffTarget?.itemId),
 )
 
-const changeChip: Record<string, string> = {
-  created: 'border-add/30 bg-add/10 text-add',
-  deleted: 'border-del/30 bg-del/10 text-del',
-  modified: 'border-warn/30 bg-warn/10 text-warn',
-  renamed: 'border-accent/30 bg-accent/10 text-accent',
-}
+const selectedForRestore = computed(() => {
+  const target = state.diffTarget
+  return !!target && !!state.selections.get(target.itemId)?.has(target.file.path)
+})
 
 function restoreThisFile() {
   const target = state.diffTarget
@@ -34,7 +32,7 @@ function restoreThisFile() {
 </script>
 
 <template>
-  <section class="flex min-h-0 flex-col border-l border-edge bg-well/40">
+  <section class="diff-panel flex min-h-0 min-w-0 flex-col border-l border-edge bg-bg" aria-label="File changes">
     <!-- Empty state -->
     <div
       v-if="!state.diffTarget"
@@ -55,62 +53,44 @@ function restoreThisFile() {
     <template v-else>
       <!-- Diff header -->
       <div
-        class="flex shrink-0 items-center gap-2.5 border-b border-edge bg-bg/70 px-4 py-2.5 backdrop-blur"
+        class="flex shrink-0 flex-wrap items-start justify-between gap-x-4 gap-y-2 border-b border-edge px-5 py-4"
       >
-        <span class="min-w-0 flex-1 truncate font-mono text-[12.5px]">
-          <span class="text-dim">{{ splitPath(state.diffTarget.file.path).dir }}</span
-          ><span class="text-ink">{{ splitPath(state.diffTarget.file.path).name }}</span>
-        </span>
-        <span
-          class="shrink-0 rounded-full border px-2 py-px text-[10.5px] font-medium capitalize"
-          :class="changeChip[state.diffTarget.file.change]"
-        >
-          {{ state.diffTarget.file.change }}
-        </span>
-        <template v-if="state.diff && !state.diff.binary">
-          <span class="shrink-0 font-mono text-[11.5px] text-add">+{{ state.diff.inserted }}</span>
-          <span class="shrink-0 font-mono text-[11.5px] text-del">−{{ state.diff.deleted }}</span>
-        </template>
+        <div class="min-w-0 flex-1">
+          <p class="break-all text-[11px] text-mut">{{ splitPath(state.diffTarget.file.path).dir || 'Project root' }}</p>
+          <h2 class="mt-1 break-all font-mono text-[13px] font-medium text-ink">{{ splitPath(state.diffTarget.file.path).name }}</h2>
+        </div>
+        <div class="flex shrink-0 items-center gap-2.5 text-[11px]">
+          <span v-if="state.diffTarget.file.change !== 'modified'" class="capitalize text-mut">{{ state.diffTarget.file.change }}</span>
+          <template v-if="state.diff && !state.diff.binary">
+            <span class="font-mono tabular-nums text-add">+{{ state.diff.inserted }}</span>
+            <span class="font-mono tabular-nums text-del">−{{ state.diff.deleted }}</span>
+          </template>
+        </div>
         <span
           v-if="pierrePreview"
           class="shrink-0 rounded-full border border-accent/30 bg-accent/10 px-2 py-px text-[10.5px] font-medium text-accent"
         >
           Pierre preview
         </span>
-        <button
-          v-if="item && item.status !== 'active'"
-          class="flex shrink-0 items-center gap-1.5 rounded-lg border border-edge px-2.5 py-1 text-[11.5px] font-medium text-mut transition-colors hover:border-edge-strong hover:text-ink disabled:opacity-40"
-          :disabled="state.recoveryBusy"
-          title="Preview restoring this file to its state before this item"
-          @click="restoreThisFile"
-        >
-          <!-- <UiIcon name="undo" :size="11" /> -->
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="size-3">
-            <path fill-rule="evenodd" d="M7.793 2.232a.75.75 0 0 1-.025 1.06L3.622 7.25h10.003a5.375 5.375 0 0 1 0 10.75H10.75a.75.75 0 0 1 0-1.5h2.875a3.875 3.875 0 0 0 0-7.75H3.622l4.146 3.957a.75.75 0 0 1-1.036 1.085l-5.5-5.25a.75.75 0 0 1 0-1.085l5.5-5.25a.75.75 0 0 1 1.06.025Z" clip-rule="evenodd" />
-          </svg>
-
-
-          Preview file restore
-        </button>
       </div>
 
       <!-- Version labels -->
       <div
         v-if="state.diff"
-        class="flex shrink-0 items-center justify-between border-b border-edge px-4 py-1.5 font-mono text-[10.5px] text-dim"
+        class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-edge px-5 py-2.5 text-[11px] tabular-nums text-mut"
       >
         <span>
-          before ·
+          Before ·
           {{ state.diff.old_timestamp ? fmtClock(state.diff.old_timestamp) : '—' }}
         </span>
         <span>
-          after ·
+          After ·
           {{ state.diff.new_timestamp ? fmtClock(state.diff.new_timestamp) : '—' }}
         </span>
       </div>
 
       <!-- Diff body -->
-      <div class="min-h-0 flex-1 overflow-auto">
+      <div class="diff-body min-h-0 flex-1 overflow-auto">
         <div v-if="state.diffLoading" class="flex h-full items-center justify-center">
           <span class="text-[12px] text-dim">Computing diff…</span>
         </div>
@@ -138,13 +118,14 @@ function restoreThisFile() {
           :diff="state.diff"
         />
 
-        <table v-else-if="state.diff" class="w-full border-collapse font-mono text-[12px]">
+        <table v-else-if="state.diff" class="w-full table-fixed border-collapse font-mono text-[12.5px]" aria-label="Recorded line changes">
+          <colgroup><col class="w-9" /><col class="w-9" /><col /></colgroup>
           <tbody>
             <template v-for="(hunk, hunkIndex) in state.diff.hunks" :key="hunkIndex">
-              <tr class="bg-panel">
+              <tr class="border-y border-edge bg-well">
                 <td
                   colspan="3"
-                  class="select-none px-4 py-1.5 text-[10.5px] tracking-wide text-dim"
+                  class="select-none px-5 py-2 text-[11px] text-dim"
                 >
                   {{ hunk.header }}
                 </td>
@@ -158,16 +139,16 @@ function restoreThisFile() {
                 }"
               >
                 <td
-                  class="w-11 select-none border-r border-edge/60 px-2 text-right align-top text-[10.5px] leading-[1.7] text-dim"
+                  class="select-none pr-2 text-right align-top text-[11px] leading-[2.1] text-dim"
                 >
                   {{ line.old_line ?? '' }}
                 </td>
                 <td
-                  class="w-11 select-none border-r border-edge/60 px-2 text-right align-top text-[10.5px] leading-[1.7] text-dim"
+                  class="select-none pr-2 text-right align-top text-[11px] leading-[2.1] text-dim"
                 >
                   {{ line.new_line ?? '' }}
                 </td>
-                <td class="whitespace-pre-wrap break-all px-3 leading-[1.7]">
+                <td class="whitespace-pre-wrap break-words py-px pr-5 leading-[1.85] [overflow-wrap:anywhere]">
                   <span
                     class="mr-2 inline-block w-2 select-none"
                     :class="{
@@ -176,19 +157,26 @@ function restoreThisFile() {
                       'text-transparent': line.kind === 'ctx',
                     }"
                     >{{ line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' ' }}</span
-                  ><span
-                    :class="{
-                      'text-add': line.kind === 'add',
-                      'text-del': line.kind === 'del',
-                      'text-mut': line.kind === 'ctx',
-                    }"
-                    >{{ line.text }}</span
+                  ><span class="text-ink">{{ line.text }}</span
                   >
                 </td>
               </tr>
             </template>
           </tbody>
         </table>
+      </div>
+      <div class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-edge px-5 py-3">
+        <span class="flex min-w-0 items-center gap-2 text-[11px] text-mut">
+          <UiIcon v-if="selectedForRestore" name="check" :size="13" class="shrink-0" />
+          {{ state.diffTarget.file.warning ?? (selectedForRestore ? 'Selected for run restore' : 'Recorded changes for this activity') }}
+        </span>
+        <button
+          v-if="item && item.status !== 'active' && state.diffTarget.file.recoverable"
+          class="ui-button"
+          :disabled="state.recoveryBusy"
+          title="Restore this file to before this activity"
+          @click="restoreThisFile"
+        >Preview file restore</button>
       </div>
     </template>
   </section>
