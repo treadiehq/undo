@@ -10,10 +10,13 @@ import type {
   PollPayload,
   ProjectSummary,
   RecoveryView,
+  RestorePreviewPayload,
   TimelineItem,
   TimelinePayload,
 } from '~/types'
 import { fmtClock } from '~/utils/format'
+import { createPreviewQueue } from '~/utils/previewQueue'
+import { affectedItems, nextRestoreTarget, sameDiffContent } from '~/utils/restoreView'
 
 interface Toast {
   id: number
@@ -35,6 +38,7 @@ interface UndoState {
   diffTarget: DiffTarget | null
   diff: DiffPayload | null
   diffLoading: boolean
+  diffRevision: number
   recovery: RecoveryView | null
   recoveryBusy: boolean
   applyResult: ApplyResult | null
@@ -43,6 +47,9 @@ interface UndoState {
   // Timestamp selected in the restore timeline. Shared so the feed can preview
   // which recorded activity falls after the restore point.
   restoreTimestamp: number | null
+  restorePreview: RestorePreviewPayload | null
+  restorePreviewLoading: boolean
+  restorePreviewError: string | null
   // Timeline item id to review in isolation (`undo ui r_421` deep link).
   focusId: string | null
   // Panic alert item ids the user dismissed this browser session.
@@ -63,12 +70,16 @@ const state = reactive<UndoState>({
   diffTarget: null,
   diff: null,
   diffLoading: false,
+  diffRevision: 0,
   recovery: null,
   recoveryBusy: false,
   applyResult: null,
   recording: false,
   activeRuns: [],
   restoreTimestamp: null,
+  restorePreview: null,
+  restorePreviewLoading: false,
+  restorePreviewError: null,
   focusId: null,
   dismissedAlerts: new Set(),
   toasts: [],
@@ -78,6 +89,99 @@ let token = ''
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let lastMaxEventId = -1
 let toastSeq = 0
+let diffGeneration = 0
+
+interface PreviewRequest {
+  projectId: number
+  timestamp: number
+  generation: number
+}
+
+function previewSourceItems() {
+  const items = state.timeline?.items ?? []
+  return state.focusId ? items.filter((item) => item.id === state.focusId) : items
+}
+
+const visibleTimelineItems = computed(() => {
+  const items = previewSourceItems()
+  if (state.restoreTimestamp === null) return items
+  return state.restorePreview ? affectedItems(items, state.restorePreview.entries) : []
+})
+
+const livePreviewQueue = createPreviewQueue<PreviewRequest>(async (request, signal) => {
+  const valid = () => !signal.aborted && request.generation === diffGeneration
+  async function fetchPreview(path?: string) {
+    const query = new URLSearchParams({ timestamp: String(request.timestamp) })
+    if (path) query.set('path', path)
+    return api<RestorePreviewPayload>(
+      `/projects/${request.projectId}/restore-preview?${query.toString()}`, { signal },
+    )
+  }
+  let preview = await fetchPreview(state.diffTarget?.file.path)
+  if (!valid()) return
+  let items = affectedItems(previewSourceItems(), preview.entries)
+  const target = nextRestoreTarget(items, state.diffTarget)
+  if (target && preview.diff?.path !== target.file.path) {
+    // Resolve the next affected file before committing, so a new filename
+    // never appears above the previous file's code.
+    preview = await fetchPreview(target.file.path)
+    if (!valid()) return
+    items = affectedItems(previewSourceItems(), preview.entries)
+  }
+  const resolved = nextRestoreTarget(items, target)
+  const diff = resolved && preview.diff?.path === resolved.file.path ? preview.diff : null
+  if (!sameDiffContent(state.diff, diff)) state.diffRevision += 1
+  state.restorePreview = preview
+  state.diffTarget = resolved
+  state.diff = diff
+  if (resolved) state.expanded.add(resolved.itemId)
+  // A hidden checkbox must never silently remain in a later restore.
+  state.selections = new Map(items.map((item) => [
+    item.id,
+    new Set(item.files.filter((file) => state.selections.get(item.id)?.has(file.path)).map((file) => file.path)),
+  ]))
+  state.restorePreviewError = null
+  state.restorePreviewLoading = request.timestamp !== state.restoreTimestamp
+  state.diffLoading = false
+}, (error, request) => {
+  if (request.generation !== diffGeneration || request.timestamp !== state.restoreTimestamp) return
+  state.restorePreviewError = error instanceof Error ? error.message : String(error)
+  state.restorePreviewLoading = false
+  state.diffLoading = false
+})
+
+function cancelLivePreview() {
+  diffGeneration += 1
+  livePreviewQueue.cancel()
+}
+
+function scheduleRestorePreview() {
+  const projectId = state.projectId
+  const timestamp = state.restoreTimestamp
+  state.restorePreviewError = null
+  if (projectId === null || timestamp === null) {
+    cancelLivePreview()
+    state.restorePreview = null
+    state.restorePreviewLoading = false
+    state.diffLoading = false
+    return
+  }
+  // Keep the last completed view on screen until its replacement is ready.
+  // The displayed diff retains its own time label while the thumb moves.
+  state.restorePreviewLoading = true
+  state.diffLoading = state.diff === null && state.diffTarget !== null
+  livePreviewQueue.schedule({ projectId, timestamp, generation: diffGeneration })
+}
+
+const restoreEntries = computed(() => state.restorePreview === null ? null : new Map(
+  state.restorePreview.entries.map((entry) => [entry.path, entry.action]),
+))
+
+function fileRestoreAction(file: FileChange): 'WRITE' | 'DELETE' | null {
+  const entries = restoreEntries.value
+  if (!entries) return null
+  return entries.get(file.path) ?? null
+}
 
 function resolveToken(): string {
   const params = new URLSearchParams(window.location.search)
@@ -158,12 +262,14 @@ async function boot() {
 }
 
 async function refreshTimeline() {
-  if (state.projectId === null) return
+  const projectId = state.projectId
+  if (projectId === null) return
   state.timelineLoading = state.timeline === null
   try {
     const payload = await api<TimelinePayload>(
-      `/projects/${state.projectId}/timeline?limit=600`,
+      `/projects/${projectId}/timeline?limit=600`,
     )
+    if (state.projectId !== projectId) return
     state.timeline = payload
     state.recording = payload.project.recording
     state.activeRuns = payload.items
@@ -187,10 +293,13 @@ async function refreshTimeline() {
     if (state.expanded.size === 0 && payload.items.length > 0) {
       state.expanded.add(payload.items[0]!.id)
     }
+    cancelLivePreview()
+    scheduleRestorePreview()
   } catch (error) {
+    if (state.projectId !== projectId) return
     toast('error', error instanceof Error ? error.message : String(error))
   } finally {
-    state.timelineLoading = false
+    if (state.projectId === projectId) state.timelineLoading = false
   }
 }
 
@@ -204,6 +313,7 @@ async function selectProject(id: number) {
   state.diff = null
   state.activeRuns = []
   state.restoreTimestamp = null
+  scheduleRestorePreview()
   lastMaxEventId = -1
   await refreshTimeline()
   startPolling()
@@ -212,9 +322,11 @@ async function selectProject(id: number) {
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer)
   pollTimer = setInterval(async () => {
-    if (state.projectId === null || document.hidden) return
+    const projectId = state.projectId
+    if (projectId === null || document.hidden) return
     try {
-      const poll = await api<PollPayload>(`/projects/${state.projectId}/poll`)
+      const poll = await api<PollPayload>(`/projects/${projectId}/poll`)
+      if (state.projectId !== projectId) return
       state.recording = poll.recording
       state.activeRuns = poll.active_runs
       if (state.timeline) {
@@ -258,8 +370,16 @@ function setSelection(itemId: string, paths: string[]) {
 }
 
 async function openDiff(itemId: string, file: FileChange) {
+  cancelLivePreview()
   state.diffTarget = { itemId, file }
   state.diff = null
+  if (state.restoreTimestamp !== null) {
+    scheduleRestorePreview()
+    return
+  }
+  cancelLivePreview()
+  const generation = diffGeneration
+  state.diffLoading = false
   if (file.binary) return
   state.diffLoading = true
   try {
@@ -268,14 +388,16 @@ async function openDiff(itemId: string, file: FileChange) {
       first: String(file.first_event_id),
       last: String(file.last_event_id),
     })
-    state.diff = await api<DiffPayload>(
+    const diff = await api<DiffPayload>(
       `/projects/${state.projectId}/diff?${query.toString()}`,
     )
+    if (generation === diffGeneration) state.diff = diff
   } catch (error) {
+    if (generation !== diffGeneration) return
     toast('error', error instanceof Error ? error.message : String(error))
     state.diffTarget = null
   } finally {
-    state.diffLoading = false
+    if (generation === diffGeneration) state.diffLoading = false
   }
 }
 
@@ -313,12 +435,14 @@ interface TimestampPreviewRequest {
   timestamp: number
   description: string
   path?: string
+  paths?: string[]
 }
 
 async function previewTimestamp({
   timestamp,
   description,
   path = '.',
+  paths,
 }: TimestampPreviewRequest) {
   if (state.projectId === null) return
   state.recoveryBusy = true
@@ -331,6 +455,7 @@ async function previewTimestamp({
         body: JSON.stringify({
           timestamp,
           path,
+          paths,
           request: description,
         }),
       },
@@ -344,6 +469,8 @@ async function previewTimestamp({
 
 function clearFocus() {
   state.focusId = null
+  cancelLivePreview()
+  scheduleRestorePreview()
   if (window.location.hash) {
     window.history.replaceState(
       null,
@@ -403,7 +530,9 @@ function dismissRecovery() {
 }
 
 function setRestoreTimestamp(timestamp: number | null) {
+  if (state.restoreTimestamp === timestamp) return
   state.restoreTimestamp = timestamp
+  scheduleRestorePreview()
 }
 
 const currentProject = computed(
@@ -442,6 +571,8 @@ export function useUndo() {
     previewUndo,
     previewTimestamp,
     setRestoreTimestamp,
+    fileRestoreAction,
+    visibleTimelineItems,
     previewRestoreBefore,
     clearFocus,
     dismissAlert,

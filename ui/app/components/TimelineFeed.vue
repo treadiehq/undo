@@ -3,26 +3,13 @@ import { computed } from 'vue'
 import type { TimelineItem } from '~/types'
 import { fmtDay } from '~/utils/format'
 
-const { state, focusedItem, clearFocus } = useUndo()
-
-type RestoreImpact = 'undo' | 'partial' | 'keep' | null
-
-function restoreImpact(item: TimelineItem): RestoreImpact {
-  const target = state.restoreTimestamp
-  if (target === null) return null
-  const end = item.ended_at ?? state.timeline?.now ?? item.started_at
-  if (item.started_at > target) return 'undo'
-  if (end > target) return 'partial'
-  return 'keep'
-}
+const { state, focusedItem, clearFocus, visibleTimelineItems } = useUndo()
 
 // Items grouped under day separators (newest first, matching payload order).
 // In focus mode (`undo ui r_421`) the feed shows only the reviewed Run; the
 // full timeline is one click away.
 const dayGroups = computed(() => {
-  const source = focusedItem.value
-    ? [focusedItem.value]
-    : (state.timeline?.items ?? [])
+  const source = visibleTimelineItems.value
   const groups: Array<{ day: string; items: TimelineItem[] }> = []
   for (const item of source) {
     const day = fmtDay(item.started_at)
@@ -32,10 +19,14 @@ const dayGroups = computed(() => {
   }
   return groups
 })
+const feedRows = computed(() => dayGroups.value.flatMap((group) => [
+  { key: `day-${group.day}`, day: group.day, item: null as TimelineItem | null },
+  ...group.items.map((item) => ({ key: item.id, day: group.day, item })),
+]))
 </script>
 
 <template>
-  <section class="timeline-feed min-h-0 min-w-0 overflow-y-auto bg-panel" aria-label="Recorded activity">
+  <section class="timeline-feed min-h-0 min-w-0 overflow-y-auto bg-panel" aria-label="Recorded activity" :aria-busy="state.restorePreviewLoading">
     <!-- Panic alert: a recent un-attributed group deleted multiple files -->
     <PanicBanner v-if="!state.timelineLoading" class="mx-4 mt-4" />
 
@@ -58,7 +49,7 @@ const dayGroups = computed(() => {
     </div>
 
     <!-- Loading skeleton -->
-    <div v-if="state.timelineLoading" class="flex flex-col gap-3 p-5">
+    <div v-if="state.timelineLoading || (state.restorePreviewLoading && !state.restorePreview)" class="flex flex-col gap-3 p-5">
       <div
         v-for="index in 4"
         :key="index"
@@ -66,38 +57,31 @@ const dayGroups = computed(() => {
       />
     </div>
 
-    <!-- Empty state -->
-    <div
-      v-else-if="dayGroups.length === 0"
-      class="flex h-full min-h-64 flex-col items-center justify-center gap-3 p-5 text-center"
-    >
-      <span class="grid size-14 place-items-center rounded-2xl border border-edge bg-panel text-dim">
-        <UiIcon name="clock" :size="22" />
-      </span>
-      <p class="text-[13.5px] font-medium text-mut">No recorded changes yet</p>
-      <p class="max-w-72 text-[12.5px] leading-relaxed text-dim">
-        Undo records every file change while it protects a folder. Start an agent
-        with
-        <code class="rounded border border-edge bg-well px-1.5 py-0.5 font-mono text-[11px] text-mut">undo run claude</code>
-        or just edit files — everything shows up here.
-      </p>
+    <div v-if="state.restorePreviewError" class="px-5 py-4 text-[12px] text-warn" role="status">
+      {{ state.restorePreviewError }}
     </div>
 
     <!-- Feed -->
-    <div v-else class="pb-4">
-      <template v-for="group in dayGroups" :key="group.day">
-        <div class="px-5 pt-5 pb-1">
-          <span class="text-[11px] font-medium uppercase tracking-widest text-dim">
-            {{ group.day }}
-          </span>
+    <AnimatedList class="pb-4">
+      <div v-for="row in feedRows" :key="row.key">
+        <div v-if="!row.item" class="px-5 pt-5 pb-1">
+          <span class="text-[11px] font-medium uppercase tracking-widest text-dim">{{ row.day }}</span>
         </div>
         <TimelineItemCard
-          v-for="item in group.items"
-          :key="item.id"
-          :item="item"
-          :restore-impact="restoreImpact(item)"
+          v-else
+          :item="row.item"
+          :time-preview="state.restoreTimestamp !== null"
         />
-      </template>
-    </div>
+      </div>
+      <div
+        v-if="dayGroups.length === 0 && !state.timelineLoading && !state.restorePreviewLoading && !state.restorePreviewError"
+        key="empty"
+      >
+        <div class="flex min-h-64 flex-col items-center justify-center gap-2 px-6 text-center">
+          <p class="text-[13px] font-medium text-mut">{{ state.restorePreview ? 'No affected files here' : 'No recorded changes yet' }}</p>
+          <p class="max-w-60 text-[12px] leading-relaxed text-dim">{{ state.restorePreview ? 'Choose another restore point to see its changes.' : 'Recorded file changes will appear here.' }}</p>
+        </div>
+      </div>
+    </AnimatedList>
   </section>
 </template>

@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "nuxt dev",
     "build": "nuxt generate && rm -rf dist && cp -R .output/public dist",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
     "postinstall": "nuxt prepare"
   },
   "devDependencies": {

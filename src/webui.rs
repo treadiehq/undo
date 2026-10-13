@@ -256,6 +256,19 @@ fn api_response(
                 &db, &project, &rel_path, first, last,
             )?)?
         }
+        (Method::Get, ["projects", id, "restore-preview"]) => {
+            let project = require_project(&db, id)?;
+            let params = QueryParams::parse(query);
+            let timestamp = params
+                .i64("timestamp")
+                .ok_or_else(|| anyhow::anyhow!("missing 'timestamp' parameter"))?;
+            serde_json::to_value(webui_data::restore_preview_payload(
+                &db,
+                &project,
+                timestamp,
+                params.string("path").as_deref(),
+            )?)?
+        }
         (Method::Post, ["projects", id, "recoveries"]) => {
             let project = require_project(&db, id)?;
             let spec: CreateRecoverySpec =
@@ -355,7 +368,18 @@ fn create_recovery(
         let label = spec
             .request
             .unwrap_or_else(|| format!("web: restore {path} to an earlier time"));
-        recoveries::create_timestamp_recovery_in(db, project, base, path, timestamp, &label, "web")?
+        if let Some(paths) = &spec.paths {
+            if paths.is_empty() {
+                anyhow::bail!("select at least one file to restore");
+            }
+            recoveries::create_selected_timestamp_recovery_in(
+                db, project, timestamp, paths, &label,
+            )?
+        } else {
+            recoveries::create_timestamp_recovery_in(
+                db, project, base, path, timestamp, &label, "web",
+            )?
+        }
     } else {
         anyhow::bail!("provide run_id, boundary_event_id, or timestamp");
     };

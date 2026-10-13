@@ -10,6 +10,16 @@ describe the headline changes of each tag rather than an exhaustive list.
 
 ## [Unreleased]
 
+## [0.2.15] — 2026-10-13
+
+- Moving the restore slider filters out unaffected files with smooth row
+  transitions, preserves the preview while loading, and shows the selected
+  file's current-to-restored diff. Live previews use the
+  restore planner without saving a recovery or changing project files.
+- Label all unattributed timeline groups "Unattributed changes" so recording
+  speed is not mistaken for evidence of rapid editing. A brief tooltip on
+  hover or keyboard focus explains that these can include initial snapshots.
+
 ## [0.2.14] — 2026-10-13
 
 - Refined the local UI with a wider diff pane, clearer text contrast, compact
@@ -388,7 +398,8 @@ For recorders older than v0.1.9, follow the manual shutdown guidance in
 - Initial release (originally "Backtrack"): filesystem history for your working
   directory — watch, snapshot, diff, and restore.
 
-[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.14...HEAD
+[Unreleased]: https://github.com/treadiehq/undo/compare/v0.2.15...HEAD
+[0.2.15]: https://github.com/treadiehq/undo/compare/v0.2.14...v0.2.15
 [0.2.14]: https://github.com/treadiehq/undo/compare/v0.2.13...v0.2.14
 [0.2.13]: https://github.com/treadiehq/undo/compare/v0.2.12...v0.2.13
 [0.2.12]: https://github.com/treadiehq/undo/compare/v0.2.11...v0.2.12

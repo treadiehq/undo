@@ -2,8 +2,11 @@
 import { computed, onMounted, ref } from 'vue'
 import { fmtClock, splitPath } from '~/utils/format'
 
-const { state, previewUndo } = useUndo()
+const { state, previewUndo, previewTimestamp } = useUndo()
 const pierrePreview = ref(false)
+const timePreview = computed(() => state.restoreTimestamp !== null)
+const emptyRestore = computed(() => state.restorePreview?.entries.length === 0)
+const displayedChange = computed(() => timePreview.value ? state.diff?.change : state.diffTarget?.file.change)
 
 onMounted(() => {
   pierrePreview.value =
@@ -23,6 +26,14 @@ function restoreThisFile() {
   const target = state.diffTarget
   const owner = item.value
   if (!target || !owner) return
+  if (state.restoreTimestamp !== null) {
+    void previewTimestamp({
+      timestamp: state.restoreTimestamp,
+      paths: [target.file.path],
+      description: `Restore ${target.file.path} to ${fmtClock(state.restoreTimestamp)}`,
+    })
+    return
+  }
   void previewUndo({
     item: owner,
     paths: [target.file.path],
@@ -43,11 +54,14 @@ function restoreThisFile() {
       >
         <UiIcon name="file" :size="22" />
       </span>
-      <p class="text-[13px] font-medium text-mut">Select a file to review its changes</p>
+      <p class="text-[13px] font-medium text-mut">{{ emptyRestore ? 'No files would change' : state.restorePreviewLoading ? 'Reading changes…' : 'Select a file to review' }}</p>
       <p class="max-w-60 text-[12px] leading-relaxed text-dim">
-        Every version is saved locally. Pick any file from the timeline to see
+        <template v-if="timePreview">{{ emptyRestore ? 'Move the slider to explore another restore point.' : 'Only affected files appear in the list.' }}</template>
+        <template v-else>Every version is saved locally. Pick any file from the timeline to see
         exactly what changed.
+        </template>
       </p>
+      <p v-if="state.restorePreviewError" class="max-w-96 text-[12px] text-warn">{{ state.restorePreviewError }}</p>
     </div>
 
     <template v-else>
@@ -60,7 +74,7 @@ function restoreThisFile() {
           <h2 class="mt-1 break-all font-mono text-[13px] font-medium text-ink">{{ splitPath(state.diffTarget.file.path).name }}</h2>
         </div>
         <div class="flex shrink-0 items-center gap-2.5 text-[11px]">
-          <span v-if="state.diffTarget.file.change !== 'modified'" class="capitalize text-mut">{{ state.diffTarget.file.change }}</span>
+          <span v-if="displayedChange && displayedChange !== 'modified' && displayedChange !== 'unchanged'" class="text-mut">{{ timePreview ? (displayedChange === 'deleted' ? 'Would delete' : 'Would recreate') : displayedChange }}</span>
           <template v-if="state.diff && !state.diff.binary">
             <span class="font-mono tabular-nums text-add">+{{ state.diff.inserted }}</span>
             <span class="font-mono tabular-nums text-del">−{{ state.diff.deleted }}</span>
@@ -80,23 +94,37 @@ function restoreThisFile() {
         class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-edge px-5 py-2.5 text-[11px] tabular-nums text-mut"
       >
         <span>
-          Before ·
-          {{ state.diff.old_timestamp ? fmtClock(state.diff.old_timestamp) : '—' }}
+          {{ timePreview ? 'Current' : `Before · ${state.diff.old_timestamp ? fmtClock(state.diff.old_timestamp) : '—'}` }}
         </span>
         <span>
-          After ·
-          {{ state.diff.new_timestamp ? fmtClock(state.diff.new_timestamp) : '—' }}
+          {{ timePreview ? 'Restore to' : 'After' }} · {{ state.diff.new_timestamp !== null ? fmtClock(state.diff.new_timestamp) : '—' }}
         </span>
       </div>
 
       <!-- Diff body -->
-      <div class="diff-body min-h-0 flex-1 overflow-auto">
-        <div v-if="state.diffLoading" class="flex h-full items-center justify-center">
+      <div class="diff-body grid min-h-0 flex-1 content-start overflow-auto" :aria-busy="state.restorePreviewLoading">
+        <Transition name="diff-swap" @before-leave="(element) => element.setAttribute('aria-hidden', 'true')">
+        <div :key="state.diffRevision" class="diff-stage">
+        <div v-if="state.diffLoading && !state.diff" class="flex h-full items-center justify-center">
           <span class="text-[12px] text-dim">Computing diff…</span>
         </div>
 
         <div
-          v-else-if="state.diffTarget.file.binary || state.diff?.binary"
+          v-else-if="timePreview && state.restorePreviewError"
+          class="flex h-full items-center justify-center p-8 text-center"
+        >
+          <p class="max-w-96 text-[12px] text-warn">{{ state.restorePreviewError }}</p>
+        </div>
+
+        <div
+          v-else-if="state.diff?.change === 'unchanged'"
+          class="flex h-full items-center justify-center p-8 text-center"
+        >
+          <p class="text-[12px] text-mut">This file would not change at the selected restore point.</p>
+        </div>
+
+        <div
+          v-else-if="state.diff?.binary || (!timePreview && state.diffTarget.file.binary)"
           class="flex h-full flex-col items-center justify-center gap-2 text-center"
         >
           <p class="text-[13px] text-mut">Binary file</p>
@@ -118,7 +146,7 @@ function restoreThisFile() {
           :diff="state.diff"
         />
 
-        <table v-else-if="state.diff" class="w-full table-fixed border-collapse font-mono text-[12.5px]" aria-label="Recorded line changes">
+        <table v-else-if="state.diff" class="w-full table-fixed border-collapse font-mono text-[12.5px]" :aria-label="timePreview ? 'Proposed restore changes' : 'Recorded line changes'">
           <colgroup><col class="w-9" /><col class="w-9" /><col /></colgroup>
           <tbody>
             <template v-for="(hunk, hunkIndex) in state.diff.hunks" :key="hunkIndex">
@@ -164,17 +192,19 @@ function restoreThisFile() {
             </template>
           </tbody>
         </table>
+        </div>
+        </Transition>
       </div>
       <div class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-edge px-5 py-3">
         <span class="flex min-w-0 items-center gap-2 text-[11px] text-mut">
-          <UiIcon v-if="selectedForRestore" name="check" :size="13" class="shrink-0" />
-          {{ state.diffTarget.file.warning ?? (selectedForRestore ? 'Selected for run restore' : 'Recorded changes for this activity') }}
+          <UiIcon v-if="selectedForRestore && !timePreview" name="check" :size="13" class="shrink-0" />
+          {{ timePreview ? (state.restorePreviewLoading ? 'Updating preview…' : 'Preview only · files are unchanged') : state.diffTarget.file.warning ?? (selectedForRestore ? 'Selected for run restore' : 'Recorded changes for this activity') }}
         </span>
         <button
-          v-if="item && item.status !== 'active' && state.diffTarget.file.recoverable"
+          v-if="timePreview ? state.diff && state.diff.change !== 'unchanged' : item && item.status !== 'active' && state.diffTarget.file.recoverable"
           class="ui-button"
-          :disabled="state.recoveryBusy"
-          title="Restore this file to before this activity"
+          :disabled="state.recoveryBusy || state.diffLoading || state.restorePreviewLoading || !!state.restorePreviewError"
+          :title="timePreview ? 'Restore this file to the selected time' : 'Restore this file to before this activity'"
           @click="restoreThisFile"
         >Preview file restore</button>
       </div>
