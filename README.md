@@ -45,6 +45,8 @@ conversation ID and a valid session ID. See the [hook behavior](docs/cli.md#inst
 undo ui
 ```
 
+![Undo's local UI showing the restore timeline, changed files, and a selected file's diff](docs/images/undo-ui.png)
+
 The restore-first interface lets you:
 
 - preview a 10-minute rewind or choose an exact restore time
