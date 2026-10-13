@@ -9,7 +9,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="flex h-full flex-col overflow-hidden">
+  <div class="app-shell flex h-full flex-col overflow-hidden">
     <!-- Fatal error (bad/missing token, server unreachable) -->
     <div
       v-if="state.fatal"
@@ -50,10 +50,14 @@ onMounted(() => {
     <template v-else>
       <AppHeader />
       <TimeScrubber />
-      <main class="grid min-h-0 flex-1 grid-cols-[minmax(24rem,5fr)_minmax(20rem,6fr)]">
+      <main class="app-workspace min-h-0 flex-1">
         <TimelineFeed />
         <DiffPanel />
       </main>
+      <footer class="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t border-edge bg-well px-5 py-2 text-[11px] text-mut">
+        <span>History stored locally</span>
+        <span>Files change only after you confirm a restore</span>
+      </footer>
     </template>
 
     <RecoveryModal />

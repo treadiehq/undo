@@ -52,11 +52,6 @@ const datetimeValue = computed({
 })
 
 const hasHistory = computed(() => historyStart.value < serverNow.value)
-const selectedPercent = computed(() => {
-  const duration = serverNow.value - historyStart.value
-  if (duration <= 0) return 0
-  return ((selected.value - historyStart.value) / duration) * 100
-})
 const activityBuckets = computed(() => {
   const start = historyStart.value
   const duration = Math.max(1, serverNow.value - start)
@@ -82,20 +77,18 @@ const maxBucketCount = computed(() =>
 )
 const impact = computed(() => {
   const paths = new Set<string>()
-  let changes = 0
   for (const item of state.timeline?.items ?? []) {
     for (const file of item.files) {
       if (file.last_timestamp <= selected.value) continue
       paths.add(file.path)
-      changes += file.event_count
     }
   }
-  return { files: paths.size, changes }
+  return { files: paths.size }
 })
 
 function bucketHeight(count: number): string {
   if (count === 0) return '3px'
-  return `${6 + Math.round((count / maxBucketCount.value) * 28)}px`
+  return `${3 + Math.round((count / maxBucketCount.value) * 19)}px`
 }
 
 function toLocalDatetime(timestamp: number): string {
@@ -117,67 +110,51 @@ function previewSelected() {
 </script>
 
 <template>
-  <section class="shrink-0 border-b border-edge bg-panel/60 px-5 py-3 backdrop-blur">
-    <div class="mb-2 flex items-end gap-4">
-      <div class="min-w-0 flex-1">
-        <p class="text-[10.5px] text-dim">Restore point</p>
-        <p class="text-[13px] font-semibold text-ink">
-          {{ fmtDay(selected) }} at {{ fmtClock(selected) }}
+  <section class="shrink-0 border-b border-edge bg-well px-5 pt-4 pb-3 sm:px-6" aria-label="Restore point">
+    <div class="flex flex-wrap items-center justify-between gap-x-5 gap-y-3">
+      <details class="relative z-30">
+        <summary class="list-none rounded-sm [&::-webkit-details-marker]:hidden" aria-label="Set exact restore time">
+          <span class="block text-[12px] text-mut">Restore to</span>
+          <span class="mt-0.5 flex items-center gap-2 text-[18px] font-medium tracking-tight text-ink">
+            {{ fmtDay(selected) }}, {{ fmtClock(selected) }}
+            <UiIcon name="chevron" :size="12" class="text-mut" />
+          </span>
+        </summary>
+        <label class="absolute left-0 top-full mt-2 block rounded-lg border border-edge-strong bg-panel p-3 shadow-xl shadow-black/30">
+          <span class="mb-2 block text-[12px] text-mut">Exact restore time</span>
+          <input
+            v-model="datetimeValue"
+            type="datetime-local"
+            :min="toLocalDatetime(historyStart)"
+            :max="toLocalDatetime(serverNow)"
+            :disabled="!hasHistory"
+            class="max-w-[75vw] rounded border border-edge-strong bg-well px-2 py-2 text-[13px] text-ink disabled:opacity-40"
+          />
+        </label>
+      </details>
+      <div class="flex items-center gap-5">
+        <p class="text-right text-[12px] text-mut">
+          <span class="text-ink">{{ impact.files }} file{{ impact.files === 1 ? '' : 's' }}</span> after this point
+          <span class="mt-0.5 block text-[11px]">Review before restoring</span>
         </p>
+        <button class="ui-button ui-button-primary" :disabled="!hasHistory || state.recoveryBusy" aria-label="Preview time-based restore" @click="previewSelected">
+          Preview
+          <UiIcon name="chevron" :size="13" class="-rotate-90" />
+        </button>
       </div>
-      <p class="shrink-0 text-right text-[11px] text-mut">
-        <span class="font-semibold text-ink">{{ impact.changes }}</span> recorded
-        change{{ impact.changes === 1 ? '' : 's' }} across
-        <span class="font-semibold text-ink">{{ impact.files }}</span>
-        file{{ impact.files === 1 ? '' : 's' }}
-      </p>
-      <label class="shrink-0">
-        <span class="sr-only">Exact restore time</span>
-        <input
-          v-model="datetimeValue"
-          type="datetime-local"
-          :min="toLocalDatetime(historyStart)"
-          :max="toLocalDatetime(serverNow)"
-          :disabled="!hasHistory"
-          class="rounded-lg border border-edge bg-well px-3 py-1.5 font-mono text-[11.5px] text-ink outline-none transition-colors focus:border-edge-strong disabled:opacity-40"
-        />
-      </label>
-      <button
-        class="flex shrink-0 items-center gap-2 rounded-lg bg-ink px-4 py-2 text-[12.5px] font-semibold text-bg transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-40"
-        :disabled="!hasHistory || state.recoveryBusy"
-        @click="previewSelected"
-      >
-        <!-- <UiIcon name="undo" :size="13" /> -->
-        Preview
-      </button>
     </div>
 
-    <div class="relative h-15.5">
-      <div class="absolute inset-x-0 bottom-4 top-2 flex items-end gap-1 overflow-hidden">
+    <div class="relative mt-3 h-8">
+      <div class="absolute inset-x-1 bottom-2 flex h-6 items-end gap-1 overflow-hidden" aria-hidden="true">
         <span
           v-for="(bucket, index) in activityBuckets"
           :key="index"
-          class="min-w-0 flex-1 rounded-t-sm transition-colors"
-          :class="bucket.timestamp > selected ? 'bg-accent/75' : 'bg-edge-strong'"
+          class="min-w-0 flex-1 rounded-t-[1px]"
+          :class="bucket.timestamp > selected ? 'bg-accent/45' : 'bg-edge-strong/60'"
           :style="{ height: bucketHeight(bucket.count) }"
           :title="`${bucket.count} recorded change${bucket.count === 1 ? '' : 's'}`"
         />
       </div>
-
-      <span
-        class="pointer-events-none absolute bottom-4 right-0 top-2 border-l border-accent/60 bg-accent/5"
-        :style="{ left: `${selectedPercent}%` }"
-      />
-
-      <span
-        class="pointer-events-none absolute top-0 z-20 -translate-x-1/2 whitespace-nowrap rounded-md border border-edge-strong bg-panel px-2 py-1 text-[10.5px] font-semibold text-ink"
-        :style="{
-          left: `clamp(3rem, ${selectedPercent}%, calc(100% - 3rem))`,
-        }"
-      >
-        {{ impact.files }} file{{ impact.files === 1 ? '' : 's' }}
-      </span>
-
       <input
         v-model.number="selected"
         type="range"
@@ -185,55 +162,30 @@ function previewSelected() {
         :max="serverNow"
         :step="60"
         :disabled="!hasHistory"
-        class="restore-range absolute inset-x-0 bottom-2.25 z-10 h-4 w-full cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
+        :aria-valuetext="`${fmtDay(selected)} at ${fmtClock(selected)}`"
+        class="restore-range absolute inset-x-0 bottom-0 z-10 h-4 w-full disabled:cursor-not-allowed disabled:opacity-40"
         aria-label="Choose restore time"
       />
-
-      <div class="absolute inset-x-0 bottom-0 flex justify-between text-[10px] text-dim">
-        <span>{{ fmtDay(historyStart) }} {{ fmtClock(historyStart) }}</span>
-        <span>Changes to undo</span>
-        <span>Now · {{ fmtClock(serverNow) }}</span>
-      </div>
     </div>
-
-    <p class="mt-1 text-right text-[10.5px] text-dim">
-      Dragging previews impact in the timeline below. Files change only after
-      reviewing and applying the plan.
-    </p>
+    <div class="mt-0.5 flex items-center justify-between gap-3 text-[11px] tabular-nums text-dim">
+      <span>{{ fmtDay(historyStart) }} {{ fmtClock(historyStart) }}</span>
+      <span class="hidden sm:inline">Changes after this point</span>
+      <span>Now · {{ fmtClock(serverNow) }}</span>
+    </div>
   </section>
 </template>
 
 <style scoped>
-.restore-range {
-  appearance: none;
-  background: transparent;
-}
-
-.restore-range::-webkit-slider-runnable-track {
-  height: 2px;
-  background: var(--color-edge-strong);
-}
-
+.restore-range { appearance: none; background: transparent; }
+.restore-range::-webkit-slider-runnable-track { height: 2px; background: var(--color-edge-strong); }
 .restore-range::-webkit-slider-thumb {
-  width: 14px;
-  height: 14px;
-  margin-top: -6px;
-  appearance: none;
-  border: 2px solid var(--color-panel);
-  border-radius: 999px;
-  background: var(--color-ink);
+  width: 12px; height: 12px; margin-top: -5px; appearance: none;
+  border: 2px solid var(--color-accent); border-radius: 50%;
+  background: var(--color-well); box-shadow: 0 0 0 3px var(--color-well); cursor: ew-resize;
 }
-
-.restore-range::-moz-range-track {
-  height: 2px;
-  background: var(--color-edge-strong);
-}
-
+.restore-range::-moz-range-track { height: 2px; background: var(--color-edge-strong); }
 .restore-range::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  border: 2px solid var(--color-panel);
-  border-radius: 999px;
-  background: var(--color-ink);
+  width: 9px; height: 9px; border: 2px solid var(--color-accent); border-radius: 50%;
+  background: var(--color-well); box-shadow: 0 0 0 3px var(--color-well); cursor: ew-resize;
 }
 </style>

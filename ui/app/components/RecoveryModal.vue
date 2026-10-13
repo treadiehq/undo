@@ -1,17 +1,39 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import { splitPath } from '~/utils/format'
 
 const { state, applyRecovery, dismissRecovery } = useUndo()
 
 const recovery = computed(() => state.recovery)
+const dialog = ref<HTMLDialogElement | null>(null)
 const selectedPaths = ref<Set<string>>(new Set())
+let returnFocus: HTMLElement | null = null
+
+watch(
+  () => state.recoveryBusy,
+  (busy) => {
+    if (busy && !recovery.value && typeof document !== 'undefined') {
+      returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    }
+  },
+)
 
 watch(
   () => recovery.value?.id,
-  () => {
+  (id, previousId) => {
+    if (id && !previousId && !returnFocus && typeof document !== 'undefined') {
+      returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    }
     selectedPaths.value = new Set(
       recovery.value?.entries.map((entry) => entry.path) ?? [],
     )
+    void nextTick(() => {
+      if (recovery.value && dialog.value && !dialog.value.open) dialog.value.showModal()
+      if (!recovery.value) {
+        if (returnFocus?.isConnected) returnFocus.focus()
+        returnFocus = null
+      }
+    })
   },
   { immediate: true },
 )
@@ -67,144 +89,83 @@ function applySelected() {
 
 <template>
   <Teleport to="body">
-    <div
+    <dialog
       v-if="recovery"
-      class="fixed inset-0 z-50 grid place-items-center bg-black/60 p-6 backdrop-blur-sm"
-      @click.self="dismissRecovery"
+      ref="dialog"
+      class="recovery-dialog m-auto max-h-[85dvh] w-[calc(100%-2rem)] max-w-xl flex-col overflow-hidden rounded-xl border border-edge-strong bg-bg p-0 text-ink shadow-2xl shadow-black/40 open:flex"
+      aria-labelledby="recovery-heading"
+      aria-describedby="recovery-request"
+      @cancel.prevent="!state.recoveryBusy && dismissRecovery()"
     >
-      <div
-        class="rise-in flex max-h-[80vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-edge bg-panel shadow-2xl shadow-black/60"
-      >
-        <!-- Header -->
-        <div class="flex items-center gap-3 border-b border-edge px-5 py-4">
-          <span class="grid size-9 place-items-center rounded-xl border border-edge bg-well text-ink">
-            <UiIcon name="undo" :size="16" />
-          </span>
-          <div class="min-w-0 flex-1">
-            <h2 class="text-[14px] font-semibold text-ink">Review recovery plan</h2>
-            <p class="truncate text-[12px] text-dim">
-              {{ recovery.request }}
-            </p>
-          </div>
-          <button
-            class="grid size-7 place-items-center rounded-lg text-dim transition-colors hover:bg-well hover:text-ink"
-            @click="dismissRecovery"
-          >
-            <UiIcon name="x" :size="14" />
-          </button>
+      <div class="flex items-start gap-4 px-6 pt-6 pb-5">
+        <div class="min-w-0 flex-1">
+          <h2 id="recovery-heading" class="text-[19px] font-medium tracking-tight">Review restore</h2>
+          <p id="recovery-request" class="mt-1.5 break-words text-[12px] leading-relaxed text-mut">{{ recovery.request }}</p>
         </div>
+        <button class="rounded p-1 text-mut hover:text-ink disabled:opacity-40" aria-label="Close restore preview" :disabled="state.recoveryBusy" @click="dismissRecovery">
+          <UiIcon name="x" :size="17" />
+        </button>
+      </div>
 
-        <!-- Summary -->
-        <div class="flex gap-4 border-b border-edge bg-well/50 px-5 py-3 text-[12px]">
-          <span class="text-mut">
-            <span class="font-semibold text-ink">{{ selectedWrites }}</span>
-            restore{{ selectedWrites === 1 ? '' : 's' }} selected
-          </span>
-          <span class="text-mut">
-            <span class="font-semibold" :class="selectedDeletes > 0 ? 'text-del' : 'text-ink'">{{
-              selectedDeletes
-            }}</span>
-            delete{{ selectedDeletes === 1 ? '' : 's' }} selected
-          </span>
-          <span class="flex-1" />
-          <span class="text-dim">{{ confidenceLabel[recovery.confidence] ?? recovery.confidence }}</span>
-        </div>
+      <div class="flex flex-wrap gap-x-5 gap-y-1 border-y border-edge px-6 py-3 text-[12px] text-mut" :title="confidenceLabel[recovery.confidence] ?? recovery.confidence">
+        <span><span class="font-medium text-ink">{{ selectedWrites }}</span> saved version{{ selectedWrites === 1 ? '' : 's' }} to restore</span>
+        <span v-if="selectedDeletes > 0" class="text-del">{{ selectedDeletes }} file{{ selectedDeletes === 1 ? '' : 's' }} to delete</span>
+      </div>
 
-        <!-- Ambiguity warning -->
-        <div
-          v-if="recovery.ambiguity"
-          class="flex items-start gap-2.5 border-b border-warn/20 bg-warn/8 px-5 py-3"
-        >
-          <UiIcon name="warning" :size="14" class="mt-0.5 shrink-0 text-warn" />
-          <p class="text-[12px] leading-relaxed text-warn">
-            Overlapping changes need review — this plan will not be applied:
-            {{ recovery.ambiguity }}
-          </p>
-        </div>
+      <div v-if="recovery.ambiguity" class="flex items-start gap-2.5 border-b border-warn/20 bg-warn/8 px-6 py-3" role="alert">
+        <UiIcon name="warning" :size="14" class="mt-0.5 shrink-0 text-warn" />
+        <p class="text-[12px] leading-relaxed text-warn">Overlapping changes need review. This plan cannot be applied: {{ recovery.ambiguity }}</p>
+      </div>
 
-        <!-- Plan entries -->
-        <div class="flex items-center gap-3 border-b border-edge px-5 py-2 text-[11.5px]">
-          <button
-            class="font-medium text-mut transition-colors hover:text-ink"
-            @click="selectAll"
-          >
-            Select all
-          </button>
-          <button
-            class="font-medium text-mut transition-colors hover:text-ink"
-            @click="clearAll"
-          >
-            Clear all
-          </button>
-          <span class="text-dim">
-            {{ selectedEntries.length }} of {{ recovery.entries.length }} selected
-          </span>
-        </div>
-        <div class="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-          <p
-            v-if="recovery.entries.length === 0"
-            class="px-3 py-6 text-center text-[12.5px] text-dim"
-          >
-            This plan would not change any files — everything already matches the
-            target state.
-          </p>
-          <div
-            v-for="entry in recovery.entries"
-            :key="entry.path"
-            class="flex items-center gap-2.5 rounded-lg px-2.5 py-1.75 hover:bg-well/70"
-          >
-            <button
-              class="grid size-3.75 shrink-0 place-items-center rounded border transition-colors"
-              :class="
-                selectedPaths.has(entry.path)
-                  ? 'border-ink bg-ink text-bg'
-                  : 'border-edge-strong bg-transparent text-transparent hover:border-dim'
-              "
-              :title="selectedPaths.has(entry.path) ? 'Exclude from restore' : 'Include in restore'"
-              @click="togglePath(entry.path)"
-            >
-              <UiIcon name="check" :size="10" />
-            </button>
-            <span
-              class="grid size-6 shrink-0 place-items-center rounded-md border border-edge bg-well"
-              :class="entry.action === 'DELETE' ? 'text-del' : 'text-add'"
-            >
-              <UiIcon :name="entry.action === 'DELETE' ? 'trash' : 'undo'" :size="11" />
+      <div class="flex flex-wrap items-center justify-between gap-3 px-6 py-3 text-[11px] text-mut">
+        <label class="flex items-center gap-3">
+          <input
+            type="checkbox"
+            class="ui-checkbox"
+            aria-label="Select all files in restore preview"
+            :checked="recovery.entries.length > 0 && selectedEntries.length === recovery.entries.length"
+            :indeterminate="selectedEntries.length > 0 && selectedEntries.length < recovery.entries.length"
+            :disabled="state.recoveryBusy || recovery.entries.length === 0"
+            @change="selectedEntries.length === recovery.entries.length ? clearAll() : selectAll()"
+          />
+          Select all
+        </label>
+        <span>{{ selectedEntries.length }} of {{ recovery.entries.length }} selected</span>
+      </div>
+      <div class="min-h-0 flex-1 overflow-y-auto px-6 pb-3">
+        <p v-if="recovery.entries.length === 0" class="py-6 text-[13px] leading-relaxed text-mut">Everything already matches the restore point. No files need to change.</p>
+        <label v-for="entry in recovery.entries" :key="entry.path" class="flex items-start gap-3 border-t border-edge py-3">
+          <input
+            type="checkbox"
+            class="ui-checkbox mt-1"
+            :checked="selectedPaths.has(entry.path)"
+            :disabled="state.recoveryBusy"
+            :aria-label="`Include ${entry.path} in restore`"
+            @change="togglePath(entry.path)"
+          />
+          <span class="min-w-0 flex-1">
+            <span class="block break-words text-[12.5px] font-medium" :title="entry.path">{{ splitPath(entry.path).name }}</span>
+            <span v-if="splitPath(entry.path).dir" class="block break-all text-[11px] text-mut">{{ splitPath(entry.path).dir }}</span>
+            <span class="mt-0.5 block text-[11px]" :class="entry.action === 'DELETE' ? 'text-del' : 'text-mut'">
+              {{ entry.action === 'DELETE' ? 'Delete · did not exist at the restore point' : 'Restore saved version' }}
             </span>
-            <span class="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">{{
-              entry.path
-            }}</span>
-            <span class="shrink-0 text-[11px] text-dim">
-              {{
-                entry.action === 'DELETE'
-                  ? 'delete — file did not exist at the restore point'
-                  : 'restore saved version'
-              }}
-            </span>
-          </div>
-        </div>
+          </span>
+        </label>
+      </div>
 
-        <!-- Footer -->
-        <div class="flex items-center gap-3 border-t border-edge bg-well/50 px-5 py-3.5">
-          <p class="flex-1 text-[11.5px] leading-relaxed text-dim">
-            Only selected files will be changed. Undo backs up their current
-            versions first, so this restore can itself be undone.
-          </p>
-          <button
-            class="rounded-lg border border-edge px-4 py-2 text-[12.5px] font-medium text-mut transition-colors hover:border-edge-strong hover:text-ink"
-            @click="dismissRecovery"
-          >
-            Cancel
-          </button>
-          <button
-            class="rounded-lg bg-ink px-4 py-2 text-[12.5px] font-semibold text-bg transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-40"
-            :disabled="!canApply"
-            @click="applySelected"
-          >
-            {{ state.recoveryBusy ? 'Applying…' : `Apply selected · ${selectedEntries.length} file${selectedEntries.length === 1 ? '' : 's'}` }}
+      <div class="border-t border-edge px-6 py-5">
+        <p class="text-[12px] leading-relaxed text-mut">Other files will stay as they are. Undo backs up the selected files first, so this restore can itself be undone.</p>
+        <div class="mt-5 flex justify-end gap-2.5">
+          <button class="ui-button" :disabled="state.recoveryBusy" @click="dismissRecovery">Cancel</button>
+          <button class="ui-button ui-button-primary" :disabled="!canApply" @click="applySelected">
+            {{ state.recoveryBusy ? 'Restoring…' : `Restore ${selectedEntries.length} file${selectedEntries.length === 1 ? '' : 's'}` }}
           </button>
         </div>
       </div>
-    </div>
+    </dialog>
   </Teleport>
 </template>
+
+<style scoped>
+.recovery-dialog::backdrop { background: color-mix(in srgb, var(--color-bg) 65%, transparent); }
+</style>
