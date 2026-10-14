@@ -33,6 +33,7 @@ and is embedded into the binary at compile time from `ui/dist`:
 ```bash
 cd ui
 npm install
+npm test          # UI tests (also run in CI)
 npm run build     # writes ui/dist
 cd ..
 cargo build       # embeds ui/dist into the binary
@@ -59,7 +60,7 @@ echo hello > /tmp/undo-test-proj/a.txt
 
 ## Tests and lints
 
-CI runs Rust checks, installer regressions, and the web UI build (see
+CI runs Rust checks, installer regressions, and the web UI tests and build (see
 `.github/workflows/ci.yml`). Run the relevant checks locally before opening a PR:
 
 ```bash
