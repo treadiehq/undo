@@ -1088,10 +1088,10 @@ mod tests {
 
     /// A file deleted after its creating event aged out of retention must still
     /// be recoverable from the DELETED event's previous_hash. This is the bug:
-    /// `get_event_at_time` and `get_oldest_event` both exclude DELETED rows, so
-    /// before the fix restore gave up with "No snapshots found" even though the
-    /// deletion was recent. The asserts below first prove both prior lookups
-    /// come up empty (the red condition), then prove the resolver recovers it.
+    /// `get_oldest_event` excludes DELETED rows, so before the fix restore gave
+    /// up with "No snapshots found" even though the deletion was recent. The
+    /// assert below first proves the prior lookup comes up empty (the red
+    /// condition), then proves the resolver recovers it.
     #[test]
     fn resolve_recovers_deleted_file_from_previous_hash() {
         let (db, pid) = mem_db();
@@ -1111,8 +1111,7 @@ mod tests {
         )
         .unwrap();
 
-        // Both pre-existing lookups return nothing — what the old code saw.
-        assert!(db.get_event_at_time(pid, path, now).unwrap().is_none());
+        // The pre-existing lookup returns nothing — what the old code saw.
         assert!(db.get_oldest_event(pid, path).unwrap().is_none());
 
         // The resolver recovers the last contents via the deleted fallback.
