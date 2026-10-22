@@ -693,34 +693,9 @@ impl Database {
             .context("failed to query latest event")
     }
 
-    /// Find the most recent restorable event at or before `before_ts`.
-    pub fn get_event_at_time(
-        &self,
-        project_id: i64,
-        path: &str,
-        before_ts: i64,
-    ) -> Result<Option<FileEvent>> {
-        self.conn
-            .query_row(
-                "SELECT id, project_id, timestamp, path, event_type,
-                        current_hash, previous_hash, snapshot_path, old_path, file_size
-                 FROM file_events
-                 WHERE project_id = ?1
-                   AND path = ?2
-                   AND timestamp <= ?3
-                   AND event_type != 'DELETED'
-                 ORDER BY timestamp DESC, id DESC
-                 LIMIT 1",
-                params![project_id, path, before_ts],
-                row_to_event,
-            )
-            .optional()
-            .context("failed to query event at time")
-    }
-
     /// Return the latest event that determines whether `path` existed at a
-    /// point in time. Unlike `get_event_at_time`, deletion and rename-away
-    /// events are included because absence is a real recoverable state.
+    /// point in time. Deletion and rename-away events are included because
+    /// absence is a real recoverable state.
     pub fn get_path_state_event_at_time(
         &self,
         project_id: i64,
@@ -1532,30 +1507,6 @@ impl Database {
             )?;
             db.get_run_boundary_by_id(boundary.id)?
                 .ok_or_else(|| anyhow::anyhow!("failed to read closed change boundary"))
-        })
-    }
-
-    pub fn abort_run_boundary(&self, run_id: i64, external_change_id: &str) -> Result<RunBoundary> {
-        self.immediate_transaction(|db| {
-            let boundary = db
-                .get_run_boundary_by_external_id(run_id, external_change_id)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "change '{}' was not opened for Run r_{}",
-                        external_change_id,
-                        run_id
-                    )
-                })?;
-            if boundary.status == "open" {
-                db.conn.execute(
-                    "UPDATE run_boundaries
-                     SET status = 'aborted', ended_at = ?1, updated_at = ?1
-                     WHERE id = ?2",
-                    params![Utc::now().timestamp(), boundary.id],
-                )?;
-            }
-            db.get_run_boundary_by_id(boundary.id)?
-                .ok_or_else(|| anyhow::anyhow!("failed to read aborted change boundary"))
         })
     }
 
@@ -2765,31 +2716,6 @@ mod tests {
             3
         );
         assert_eq!(db.get_events_since_limited(p.id, 100, 3).unwrap().len(), 3);
-    }
-
-    /// Same-second events must resolve deterministically to the newest inserted
-    /// row, otherwise preview and restore can disagree during rapid edits.
-    #[test]
-    fn get_event_at_time_breaks_timestamp_ties_by_id() {
-        let db = db();
-        let p = project(&db);
-        let ts = chrono::Utc::now().timestamp();
-        for hash in ["first", "second"] {
-            db.conn
-                .execute(
-                    "INSERT INTO file_events
-                     (project_id, timestamp, path, event_type, current_hash)
-                     VALUES (?1, ?2, ?3, 'MODIFIED', ?4)",
-                    params![p.id, ts, "/home/user/project/a.rs", hash],
-                )
-                .unwrap();
-        }
-
-        let event = db
-            .get_event_at_time(p.id, "/home/user/project/a.rs", ts)
-            .unwrap()
-            .unwrap();
-        assert_eq!(event.current_hash.as_deref(), Some("second"));
     }
 
     /// Deleted files with a previous hash are listed as recoverable in newest-first order.
@@ -4357,34 +4283,6 @@ mod tests {
         let event = db.get_latest_event(p.id, path).unwrap().unwrap();
         assert_eq!(event.event_type, "RENAMED");
         assert_eq!(event.current_hash.as_deref(), Some("new_hash"));
-    }
-
-    /// DELETED events are never returned as restorable; only non-delete events at or before the
-    /// given timestamp are considered.
-    #[test]
-    fn get_event_at_time_excludes_deleted_and_respects_cutoff() {
-        let db = db();
-        let p = project(&db);
-        let path = "/home/user/project/bar.rs";
-        let now = chrono::Utc::now().timestamp();
-        // Seed: CREATED long ago, MODIFIED in the middle, DELETED recently.
-        db.insert_event_at(p.id, path, "CREATED", now - 300)
-            .unwrap();
-        db.insert_event_at(p.id, path, "MODIFIED", now - 200)
-            .unwrap();
-        db.insert_event_at(p.id, path, "DELETED", now - 100)
-            .unwrap();
-
-        // Querying at now-150 should return MODIFIED (newest non-DELETE at or before that point).
-        let event = db
-            .get_event_at_time(p.id, path, now - 150)
-            .unwrap()
-            .unwrap();
-        assert_eq!(event.event_type, "MODIFIED");
-
-        // Querying before any event returns None.
-        let none = db.get_event_at_time(p.id, path, now - 1000).unwrap();
-        assert!(none.is_none());
     }
 
     /// After mark_deleted the file's exists_now flag is false, signalling it is gone from disk.
